@@ -2563,7 +2563,91 @@ pub struct Limit {
         help = "Fail disk-cache initialization when tmp and cache directories have different device IDs. False only logs the error and preserves legacy rename behavior."
     )]
     pub file_download_same_device_required: bool,
-    #[env_config(name = "ZO_FILE_DOWNLOAD_THREAD_NUM", default = 0)]
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_IN_FLIGHT_BUDGET",
+        default = true,
+        help = "Charge disk payload buffers and use FIFO byte admission. False restores object-byte admission."
+    )]
+    pub file_download_in_flight_budget: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_MAX_OBJECT_BYTES",
+        default = 0,
+        help = "Separate object size ceiling with in-flight admission. Zero is unlimited; memory and peer buffers still fit the byte budget."
+    )]
+    pub file_download_max_object_bytes: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_SCHEDULER_ENABLED",
+        default = false,
+        help = "Enable four bounded FIFO classes with dedicated worker shares. False restores normal FIFO and recent LIFO."
+    )]
+    pub file_download_scheduler_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_CLASS_QUEUE_CAPACITY",
+        default = 2500,
+        help = "Queue capacity per download class, clamped to 1..10000."
+    )]
+    pub file_download_class_queue_capacity: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_DEMAND_WORKERS",
+        default = 4,
+        help = "Dedicated demand-small workers with the class scheduler, clamped to 1..32."
+    )]
+    pub file_download_demand_workers: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_SIDECAR_WORKERS",
+        default = 4,
+        help = "Dedicated used-sidecar workers with the class scheduler, clamped to 1..32."
+    )]
+    pub file_download_sidecar_workers: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_BROADCAST_WORKERS",
+        default = 8,
+        help = "Dedicated latest-broadcast workers with the class scheduler, clamped to 1..32."
+    )]
+    pub file_download_broadcast_workers: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_SMALL_OBJECT_BYTES",
+        default = 8388608,
+        help = "Maximum query object size for the demand-small class."
+    )]
+    pub file_download_small_object_bytes: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_QUERY_MAX_FILES",
+        default = 0,
+        help = "Maximum newly accepted whole files per cache_files call. Zero (default) disables the file limit so repeated large scans still warm the whole window; the byte limit bounds a single query."
+    )]
+    pub file_download_query_max_files: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_QUERY_MAX_BYTES",
+        default = 2147483648,
+        help = "Maximum newly accepted whole-file bytes per cache_files call. Zero disables the byte limit."
+    )]
+    pub file_download_query_max_bytes: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_LEDGER_ENABLED",
+        default = true,
+        help = "Export fixed-class admission and completion counters, bytes, wait time, and queued/active gauges."
+    )]
+    pub file_download_ledger_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RATE_ENABLED",
+        default = false,
+        help = "Enable the background body-byte governor. Keep disabled until foreground signal coverage is validated."
+    )]
+    pub file_download_rate_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RATE_BYTES_PER_SEC",
+        default = 734003200,
+        help = "Background payload byte rate; minimum one byte per second."
+    )]
+    pub file_download_rate_bytes_per_sec: u64,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_QUERY_RATE_BYTES_PER_SEC",
+        default = 209715200,
+        help = "Background payload byte rate during recent foreground query admission; never exceeds the idle rate."
+    )]
+    pub file_download_query_rate_bytes_per_sec: u64,
+    #[env_config(name = "ZO_FILE_DOWNLOAD_THREAD_NUM", default = 32)]
     pub file_download_thread_num: usize,
     #[env_config(name = "ZO_FILE_DOWNLOAD_MIN_RECORDS", default = 100)]
     pub file_download_min_records: i64,
@@ -4091,9 +4175,14 @@ fn check_limit_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.limit.file_download_thread_num = std::cmp::max(1, cpu_num / 2);
     }
 
+    cfg.limit.file_download_thread_num = cfg.limit.file_download_thread_num.clamp(1, 128);
     if cfg.limit.file_download_priority_queue_thread_num == 0 {
         cfg.limit.file_download_priority_queue_thread_num = std::cmp::max(1, cpu_num / 2);
     }
+    cfg.limit.file_download_priority_queue_thread_num = cfg
+        .limit
+        .file_download_priority_queue_thread_num
+        .clamp(1, 128);
 
     // Co-located CPU-heavy role count (ingester + querier + compactor) — the
     // roles whose large default pools stack on a combined node. Parsed from
@@ -5268,6 +5357,22 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_scheduler_defaults_and_rollback_limits() {
+        let limit = Config::init().unwrap().limit;
+        assert_eq!(limit.file_download_thread_num, 32);
+        assert!(limit.file_download_in_flight_budget);
+        assert_eq!(limit.file_download_max_object_bytes, 0);
+        assert!(!limit.file_download_scheduler_enabled);
+        assert!(!limit.file_download_rate_enabled);
+        assert_eq!(limit.file_download_class_queue_capacity, 2500);
+        assert_eq!(limit.file_download_query_max_files, 0);
+        assert_eq!(limit.file_download_query_max_bytes, 2 * 1024 * 1024 * 1024);
+        assert!(
+            limit.file_download_query_rate_bytes_per_sec < limit.file_download_rate_bytes_per_sec
+        );
+    }
 
     #[test]
     fn download_io_defaults_bound_resources_and_keep_device_failure_nonfatal() {

@@ -15,7 +15,10 @@
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, LazyLock as Lazy},
+    sync::{
+        Arc, LazyLock as Lazy,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use config::{
@@ -26,8 +29,15 @@ use config::{
     utils::time::{day_micros, now_micros},
 };
 use futures::StreamExt;
-use hashbrown::HashSet;
+use hashbrown::HashMap;
+
+#[cfg(test)]
+mod budget_tests;
+mod governor;
+mod scheduler;
+pub(crate) use governor::throttle;
 use proto::cluster_rpc::{SimpleFileList, event_client::EventClient};
+pub use scheduler::DownloadClass;
 use tokio::sync::{
     Mutex,
     mpsc::{Receiver, Sender},
@@ -57,10 +67,9 @@ pub enum DownloadRejection {
 #[derive(Default)]
 struct AdmissionState {
     /// Queued and active keys: the dedupe identity and the count bound.
-    files: HashSet<Arc<str>>,
-    /// Object bytes of downloads a worker currently OWNS. Queued items hold
-    /// no object bytes (disk fills stream to a temp file; a memory fill
-    /// buffers only while active), so only active work is byte-bounded.
+    files: HashMap<Arc<str>, Arc<AtomicUsize>>,
+    /// Payload buffer charges of active workers. Queued metadata is count-bounded;
+    /// memory and peer downloads retain conservative whole-object charges.
     active_bytes: usize,
 }
 
@@ -70,15 +79,24 @@ struct DownloadAdmission {
     released: tokio::sync::Notify,
     max_bytes: usize,
     max_files: usize,
+    fair: bool,
+    permits: Arc<tokio::sync::Semaphore>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl DownloadAdmission {
     fn new(max_bytes: usize, max_files: usize) -> Self {
+        let max_bytes = max_bytes.min(u32::MAX as usize);
         Self {
             state: parking_lot::Mutex::new(AdmissionState::default()),
             released: tokio::sync::Notify::new(),
             max_bytes,
             max_files,
+            fair: false,
+            permits: Arc::new(tokio::sync::Semaphore::new(
+                max_bytes.min(u32::MAX as usize),
+            )),
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -88,13 +106,29 @@ impl DownloadAdmission {
     /// broadcast burst used to drop every fill past ~4 objects of a 1 GiB
     /// budget, and dropped fills were never retried, so those sidecars
     /// stayed remote for every later query.
+    #[cfg(test)]
     fn reserve(
         self: &Arc<Self>,
         file: &str,
         bytes: usize,
     ) -> Result<DownloadReservation, QueueDownloadOutcome> {
+        self.reserve_charged(file, bytes, bytes, DownloadClass::QueryBulk, 0)
+    }
+
+    fn reserve_charged(
+        self: &Arc<Self>,
+        file: &str,
+        bytes: usize,
+        charge: usize,
+        class: DownloadClass,
+        max_object: usize,
+    ) -> Result<DownloadReservation, QueueDownloadOutcome> {
         let mut state = self.state.lock();
-        if state.files.contains(file) {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(QueueDownloadOutcome::Rejected(DownloadRejection::Closed));
+        }
+        if let Some(requested) = state.files.get(file) {
+            requested.fetch_min(class as usize, Ordering::AcqRel);
             return Err(QueueDownloadOutcome::Deduplicated);
         }
         if bytes == 0 {
@@ -102,7 +136,7 @@ impl DownloadAdmission {
                 DownloadRejection::InvalidSize,
             ));
         }
-        if bytes > self.max_bytes {
+        if charge > self.max_bytes || (max_object > 0 && bytes > max_object) {
             return Err(QueueDownloadOutcome::Rejected(DownloadRejection::TooLarge));
         }
         if state.files.len() >= self.max_files {
@@ -111,14 +145,25 @@ impl DownloadAdmission {
         // Clone a key only after admission. A single reservation covers cache
         // probing, queueing and the actual worker, without a dedupe gap.
         let file: Arc<str> = file.into();
-        state.files.insert(file.clone());
+        let requested_class = Arc::new(AtomicUsize::new(class as usize));
+        state.files.insert(file.clone(), requested_class.clone());
         Ok(DownloadReservation {
             admission: self.clone(),
             file,
             bytes,
+            charge,
+            requested_class,
+            permit: parking_lot::Mutex::new(None),
+            activation: Mutex::new(()),
             active: std::sync::atomic::AtomicBool::new(false),
             priority_metric: None,
         })
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        self.permits.close();
+        self.released.notify_waiters();
     }
 
     fn try_activate(&self, bytes: usize) -> bool {
@@ -135,6 +180,10 @@ struct DownloadReservation {
     admission: Arc<DownloadAdmission>,
     file: Arc<str>,
     bytes: usize,
+    charge: usize,
+    requested_class: Arc<AtomicUsize>,
+    permit: parking_lot::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    activation: Mutex<()>,
     /// Set once a worker owns the download and its bytes are charged.
     active: std::sync::atomic::AtomicBool,
     priority_metric: Option<bool>,
@@ -143,18 +192,39 @@ struct DownloadReservation {
 impl DownloadReservation {
     /// Charge this download's bytes against the active budget, waiting for
     /// headroom released by finishing downloads. Idempotent.
-    async fn activate(&self) {
-        if self.active.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+    async fn activate(&self) -> Result<(), DownloadRejection> {
+        let _activation = self.activation.lock().await;
+        if self.active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if self.admission.fair {
+            // Tokio's weighted semaphore is FIFO: small arrivals cannot bypass
+            // an earlier large waiter. Cancelling acquire removes its ticket.
+            let permit = self
+                .admission
+                .permits
+                .clone()
+                .acquire_many_owned(self.charge as u32)
+                .await
+                .map_err(|_| DownloadRejection::Closed)?;
+            self.admission.state.lock().active_bytes += self.charge;
+            *self.permit.lock() = Some(permit);
+            self.active.store(true, Ordering::Release);
+            return Ok(());
         }
         loop {
             // register before checking so a release between the check and
             // the await cannot be missed
             let released = self.admission.released.notified();
-            if self.admission.try_activate(self.bytes) {
+            tokio::pin!(released);
+            released.as_mut().enable();
+            if self.admission.closed.load(Ordering::Acquire) {
+                return Err(DownloadRejection::Closed);
+            }
+            if self.admission.try_activate(self.charge) {
                 self.active
                     .store(true, std::sync::atomic::Ordering::Release);
-                return;
+                return Ok(());
             }
             released.await;
         }
@@ -180,7 +250,7 @@ impl Drop for DownloadReservation {
             let mut state = self.admission.state.lock();
             state.files.remove(self.file.as_ref());
             if self.active.load(std::sync::atomic::Ordering::Acquire) {
-                state.active_bytes -= self.bytes;
+                state.active_bytes -= self.charge;
             }
         }
         self.admission.released.notify_waiters();
@@ -204,6 +274,9 @@ struct FileInfo {
     account: String,
     cache: file_data::CacheType,
     reservation: Arc<DownloadReservation>,
+    class: DownloadClass,
+    queued_at: std::time::Instant,
+    queued_ledger: scheduler::QueuedLedger,
 }
 
 struct DownloadQueue {
@@ -228,6 +301,7 @@ struct PriorityDownloadQueue {
     stack: parking_lot::Mutex<VecDeque<FileInfo>>,
     notify: tokio::sync::Notify,
     max_size: usize,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl PriorityDownloadQueue {
@@ -236,13 +310,14 @@ impl PriorityDownloadQueue {
             stack: parking_lot::Mutex::new(VecDeque::with_capacity(max_size)),
             notify: tokio::sync::Notify::new(),
             max_size,
+            closed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
     // New arrivals are rejected at capacity; accepted recent work remains LIFO.
     fn push(&self, file_info: FileInfo) -> bool {
         let mut stack = self.stack.lock();
-        if stack.len() >= self.max_size {
+        if self.closed.load(Ordering::Acquire) || stack.len() >= self.max_size {
             return false;
         }
         stack.push_back(file_info);
@@ -251,19 +326,31 @@ impl PriorityDownloadQueue {
         true
     }
 
+    fn close(&self) {
+        let mut stack = self.stack.lock();
+        self.closed.store(true, Ordering::Release);
+        stack.clear();
+        self.notify.notify_waiters();
+    }
+
     // Blocks until an item is available. LIFO via pop_back.
     // notified() is created before the lock check to avoid missed-wakeup race.
     // Chains notify_one() so all workers drain the queue under burst load.
-    async fn pop(&self) -> FileInfo {
+    async fn pop(&self) -> Option<FileInfo> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let mut stack = self.stack.lock();
+                if self.closed.load(Ordering::Acquire) {
+                    return None;
+                }
                 if let Some(item) = stack.pop_back() {
                     if !stack.is_empty() {
                         self.notify.notify_one();
                     }
-                    return item;
+                    return Some(item);
                 }
             }
             notified.await;
@@ -281,37 +368,90 @@ static PRIORITY_FILE_DOWNLOAD_CHANNEL: Lazy<PriorityDownloadQueue> =
     Lazy::new(|| PriorityDownloadQueue::new(FILE_DOWNLOAD_QUEUE_SIZE));
 
 static DOWNLOAD_ADMISSION: Lazy<Arc<DownloadAdmission>> = Lazy::new(|| {
-    Arc::new(DownloadAdmission::new(
-        get_config().common.cache_latest_files_download_max_bytes,
+    let cfg = get_config();
+    let mut admission = DownloadAdmission::new(
+        cfg.common
+            .cache_latest_files_download_max_bytes
+            .min(u32::MAX as usize),
         FILE_DOWNLOAD_QUEUE_SIZE * 2,
-    ))
+    );
+    admission.fair = cfg.limit.file_download_in_flight_budget;
+    Arc::new(admission)
 });
 
+static RUN_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub async fn run() -> Result<(), anyhow::Error> {
+    if RUN_STARTED.swap(true, Ordering::AcqRel) {
+        return Ok(());
+    }
     let cfg = get_config();
-    // Separate fixed worker pools preserve normal FIFO and recent-file LIFO
-    // service. Both pools share one queued + active object-byte budget.
-    for thread in 0..cfg.limit.file_download_thread_num {
-        let rx = FILE_DOWNLOAD_CHANNEL.receiver.clone();
-        tokio::spawn(async move {
-            loop {
-                let ret = rx.lock().await.recv().await;
-                let Some(file) = ret else {
-                    log::debug!("[FILE_CACHE_DOWNLOAD:JOB:NORMAL] Receiving channel is closed");
-                    break;
-                };
-                process_download(thread, file).await;
-            }
-        });
+    if cfg.limit.file_download_scheduler_enabled {
+        scheduler::run();
+    } else {
+        // Separate fixed worker pools preserve normal FIFO and recent-file LIFO
+        // service. Both pools share one queued + active object-byte budget.
+        for thread in 0..cfg.limit.file_download_thread_num {
+            let rx = FILE_DOWNLOAD_CHANNEL.receiver.clone();
+            tokio::spawn(async move {
+                until_shutdown(async move {
+                    loop {
+                        let ret = rx.lock().await.recv().await;
+                        let Some(file) = ret else {
+                            log::debug!(
+                                "[FILE_CACHE_DOWNLOAD:JOB:NORMAL] Receiving channel is closed"
+                            );
+                            break;
+                        };
+                        process_download(thread, file).await;
+                    }
+                })
+                .await;
+            });
+        }
+        for thread in 0..cfg.limit.file_download_priority_queue_thread_num {
+            tokio::spawn(async move {
+                until_shutdown(async move {
+                    loop {
+                        let Some(file) = PRIORITY_FILE_DOWNLOAD_CHANNEL.pop().await else {
+                            break;
+                        };
+                        process_download(thread, file).await;
+                    }
+                })
+                .await;
+            });
+        }
     }
-    for thread in 0..cfg.limit.file_download_priority_queue_thread_num {
-        tokio::spawn(async move {
-            loop {
-                process_download(thread, PRIORITY_FILE_DOWNLOAD_CHANNEL.pop().await).await;
-            }
-        });
-    }
+    // This watcher also cancels idle workers and drains queued reservations.
+    tokio::spawn(async {
+        while !config::cluster::is_offline() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        shutdown().await;
+    });
     Ok(())
+}
+
+static STOP: Lazy<tokio::sync::watch::Sender<bool>> =
+    Lazy::new(|| tokio::sync::watch::channel(false).0);
+
+pub async fn shutdown() {
+    STOP.send_replace(true);
+    DOWNLOAD_ADMISSION.close();
+    scheduler::QUEUE.close();
+    let mut rx = FILE_DOWNLOAD_CHANNEL.receiver.lock().await;
+    rx.close();
+    while rx.try_recv().is_ok() {}
+    PRIORITY_FILE_DOWNLOAD_CHANNEL.close();
+}
+
+async fn until_shutdown(future: impl Future<Output = ()>) {
+    let mut stop = STOP.subscribe();
+    if *stop.borrow() {
+        return;
+    }
+    tokio::select! { _ = future => {}, _ = stop.changed() => {} }
 }
 
 async fn process_download(thread: usize, file: FileInfo) {
@@ -321,34 +461,63 @@ async fn process_download(thread: usize, file: FileInfo) {
         account,
         cache,
         reservation,
+        class,
+        queued_at,
+        queued_ledger,
     } = file;
+    queued_ledger.start();
+    let mut ledger = scheduler::ActiveLedger::new(class, queued_at.elapsed());
     let name = reservation.file.as_ref();
     let size = reservation.bytes;
     // Queued items hold no object bytes; the byte budget bounds what workers
     // hold. Wait here (behind earlier activations) instead of rejecting.
-    reservation.activate().await;
-    match download_file(
-        thread,
-        &trace_id,
-        id,
-        &account,
-        name,
-        size,
-        cache,
-        reservation.clone(),
-    )
-    .await
+    let budget_wait = std::time::Instant::now();
+    if reservation.activate().await.is_err() {
+        return;
+    }
+    scheduler::time(class, "budget", budget_wait.elapsed());
+    let started = std::time::Instant::now();
+    match governor::BACKGROUND
+        .scope(
+            true,
+            download_file(
+                thread,
+                &trace_id,
+                id,
+                &account,
+                name,
+                size,
+                cache,
+                reservation.clone(),
+            ),
+        )
+        .await
     {
         Ok(data_len) => {
+            ledger.finish();
+            scheduler::record_completion(
+                class,
+                if data_len == 0 {
+                    "already_cached"
+                } else {
+                    "completed"
+                },
+                data_len,
+                started.elapsed(),
+            );
             if data_len > 0 && data_len != size {
                 log::warn!(
                     "[FILE_CACHE_DOWNLOAD:JOB] download file {name} found size mismatch, expected: {size}, actual: {data_len}"
                 );
             }
         }
-        Err(e) => log::error!(
-            "[FILE_CACHE_DOWNLOAD:JOB] download file {name} to cache {cache:?} err: {e}"
-        ),
+        Err(e) => {
+            ledger.finish();
+            scheduler::record_completion(class, "failed", 0, started.elapsed());
+            log::error!(
+                "[FILE_CACHE_DOWNLOAD:JOB] download file {name} to cache {cache:?} err: {e}"
+            );
+        }
     }
     // Explicitly retain the byte charge and dedupe identity until IO finishes.
     drop(reservation);
@@ -498,6 +667,7 @@ async fn download_from_node(
                     reservation.bytes
                 ));
             }
+            throttle(content.content.len()).await;
             data.extend_from_slice(&content.content);
         }
     }
@@ -534,16 +704,75 @@ pub async fn queue_download(
     ts: i64,
     cache_type: file_data::CacheType,
 ) -> QueueDownloadOutcome {
+    let class = if trace_id == file_data::TRACE_ID_FOR_CACHE_LATEST_FILE {
+        if should_prioritize_file(
+            ts,
+            get_config().limit.file_download_priority_queue_window_secs,
+        ) {
+            DownloadClass::BroadcastLatest
+        } else {
+            DownloadClass::QueryBulk
+        }
+    } else {
+        DownloadClass::QueryBulk
+    };
+    queue_download_class(trace_id, id, account, file, size, ts, cache_type, class).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn queue_download_class(
+    trace_id: &str,
+    id: i64,
+    account: &str,
+    file: &str,
+    size: i64,
+    ts: i64,
+    cache_type: file_data::CacheType,
+    class: DownloadClass,
+) -> QueueDownloadOutcome {
+    let outcome =
+        queue_download_inner(trace_id, id, account, file, size, ts, cache_type, class).await;
+    scheduler::record_admission(class, outcome, size.max(0) as u64);
+    if outcome == QueueDownloadOutcome::Deduplicated {
+        scheduler::QUEUE.wake();
+    }
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn queue_download_inner(
+    trace_id: &str,
+    id: i64,
+    account: &str,
+    file: &str,
+    size: i64,
+    ts: i64,
+    cache_type: file_data::CacheType,
+    class: DownloadClass,
+) -> QueueDownloadOutcome {
     if cache_type == file_data::CacheType::None || exceeds_cache_max_age(ts, cache_type) {
         return QueueDownloadOutcome::Skipped;
     }
     let Ok(size) = usize::try_from(size) else {
         return QueueDownloadOutcome::Rejected(DownloadRejection::InvalidSize);
     };
-    let mut reservation = match DOWNLOAD_ADMISSION.reserve(file, size) {
-        Ok(reservation) => reservation,
-        Err(outcome) => return outcome,
+    let cfg = get_config();
+    let charge = admission_charge(
+        size,
+        cache_type,
+        cfg.limit.file_download_in_flight_budget,
+        cfg.cache_latest_files.download_from_node,
+    );
+    let max_object = if cfg.limit.file_download_in_flight_budget {
+        cfg.limit.file_download_max_object_bytes
+    } else {
+        0
     };
+    let mut reservation =
+        match DOWNLOAD_ADMISSION.reserve_charged(file, size, charge, class, max_object) {
+            Ok(reservation) => reservation,
+            Err(outcome) => return outcome,
+        };
     let cfg = get_config();
     let cached = match cache_type {
         file_data::CacheType::Memory => {
@@ -565,8 +794,15 @@ pub async fn queue_download(
         account: account.to_owned(),
         cache: cache_type,
         reservation: Arc::new(reservation),
+        class,
+        queued_at: std::time::Instant::now(),
+        queued_ledger: scheduler::QueuedLedger::new(class),
     };
-    if priority {
+    if cfg.limit.file_download_scheduler_enabled {
+        if let Err(reason) = scheduler::QUEUE.push(item) {
+            return QueueDownloadOutcome::Rejected(reason);
+        }
+    } else if priority {
         if !PRIORITY_FILE_DOWNLOAD_CHANNEL.push(item) {
             return QueueDownloadOutcome::Rejected(DownloadRejection::Full);
         }
@@ -574,6 +810,24 @@ pub async fn queue_download(
         return QueueDownloadOutcome::Rejected(reason);
     }
     QueueDownloadOutcome::Accepted { bytes: size }
+}
+
+fn admission_charge(
+    size: usize,
+    cache: file_data::CacheType,
+    in_flight: bool,
+    peer: bool,
+) -> usize {
+    if in_flight && cache == file_data::CacheType::Disk && !peer {
+        crate::cache::disk_download_in_flight_bytes(size as u64) as usize
+    } else {
+        size
+    }
+}
+
+/// Mark an admission-time foreground signal without storing query identities.
+pub fn note_query_activity() {
+    governor::note_query_activity();
 }
 
 /// Returns true when the record count is unknown or the file contains enough
@@ -658,13 +912,20 @@ mod tests {
         assert!(exceeds_max_age(thirty_days_ago, 3));
     }
 
-    fn queued_item(admission: &Arc<DownloadAdmission>, file: &str, bytes: usize) -> FileInfo {
+    pub(super) fn queued_item(
+        admission: &Arc<DownloadAdmission>,
+        file: &str,
+        bytes: usize,
+    ) -> FileInfo {
         FileInfo {
             trace_id: "queue-regression".into(),
             id: 1,
             account: "org".into(),
             cache: file_data::CacheType::Disk,
             reservation: Arc::new(admission.reserve(file, bytes).unwrap()),
+            class: super::DownloadClass::QueryBulk,
+            queued_at: std::time::Instant::now(),
+            queued_ledger: super::scheduler::QueuedLedger::new(super::DownloadClass::QueryBulk),
         }
     }
 
@@ -690,7 +951,7 @@ mod tests {
         // Receiving is not completion: bytes stay charged while a worker owns
         // the item even though the queue now has capacity — but that only
         // gates ACTIVATION of later work, never its admission to the queue.
-        active.reservation.activate().await;
+        active.reservation.activate().await.unwrap();
         let later = admission.reserve("too-much-active-work", 61).unwrap();
         assert!(!admission.try_activate(later.bytes));
         drop(active);
@@ -714,16 +975,16 @@ mod tests {
         for _ in 0..1000 {
             assert!(!queue.push(queued_item(&admission, "rejected", 30)));
         }
-        let newer = queue.pop().await;
+        let newer = queue.pop().await.unwrap();
         assert_eq!(newer.reservation.file.as_ref(), "newer");
-        newer.reservation.activate().await;
+        newer.reservation.activate().await.unwrap();
         // a queued 71-byte fill waits for the 30 active bytes, and wakes on
         // their release without polling
         let waiting = queued_item(&admission, "over-budget", 71);
         assert!(!admission.try_activate(waiting.reservation.bytes));
         let waiter = {
             let reservation = Arc::clone(&waiting.reservation);
-            tokio::spawn(async move { reservation.activate().await })
+            tokio::spawn(async move { reservation.activate().await.unwrap() })
         };
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
@@ -738,11 +999,41 @@ mod tests {
                 .active
                 .load(std::sync::atomic::Ordering::Acquire)
         );
-        let older = queue.pop().await;
+        let older = queue.pop().await.unwrap();
         assert_eq!(older.reservation.file.as_ref(), "older");
         drop(older);
         drop(waiting);
         drop(admission.reserve("rejected", 100).unwrap());
+    }
+
+    /// Shutdown must not strand an idle priority worker or leave queued
+    /// reservations holding dedupe keys, and late producers must be refused.
+    #[tokio::test]
+    async fn priority_queue_close_wakes_idle_workers_and_refuses_pushes() {
+        let admission = Arc::new(DownloadAdmission::new(100, 10));
+        let queue = Arc::new(PriorityDownloadQueue::new(4));
+        let idle = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.pop().await.is_none() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!idle.is_finished());
+        assert!(queue.push(queued_item(&admission, "queued", 10)));
+        let first = queue.pop().await.unwrap();
+        drop(first);
+        assert!(queue.push(queued_item(&admission, "stranded", 10)));
+        queue.close();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+                .await
+                .expect("close wakes idle pop")
+                .unwrap()
+        );
+        // The queued item was dropped by close, so its key is free again.
+        drop(admission.reserve("stranded", 10).unwrap());
+        assert!(!queue.push(queued_item(&admission, "late", 10)));
+        drop(admission.reserve("late", 10).unwrap());
+        assert!(queue.pop().await.is_none());
     }
 
     /// Queue admission never rejects on byte headroom: a burst larger than
@@ -756,7 +1047,7 @@ mod tests {
             .collect();
         assert_eq!(admission.state.lock().files.len(), 8);
         assert_eq!(admission.state.lock().active_bytes, 0);
-        burst[0].reservation.activate().await;
+        burst[0].reservation.activate().await.unwrap();
         assert!(!admission.try_activate(60));
         drop(burst);
         assert_eq!(admission.state.lock().active_bytes, 0);

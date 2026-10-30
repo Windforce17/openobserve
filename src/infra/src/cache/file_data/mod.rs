@@ -700,6 +700,7 @@ where
                 break;
             };
             let chunk = chunk?;
+            super::file_downloader::throttle(chunk.len()).await;
             metrics.chunk(chunk.len());
             if size_policy == ExpectedSizePolicy::Exact
                 && chunk.len() as u64 > expected_blob_size.saturating_sub(sink.len())

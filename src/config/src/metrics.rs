@@ -1511,6 +1511,54 @@ pub static FILE_DOWNLOAD_RANGE_RETRIES: Lazy<IntCounterVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+pub static FILE_DOWNLOAD_LEDGER_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "file_download_ledger_events_total",
+            "Download admission attempts, outcomes, upgrades and completions",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class", "outcome"],
+    )
+    .expect("Metric created")
+});
+pub static FILE_DOWNLOAD_LEDGER_BYTES: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "file_download_ledger_bytes_total",
+            "Logical object bytes at admission and completed payload bytes",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class", "outcome"],
+    )
+    .expect("Metric created")
+});
+pub static FILE_DOWNLOAD_LEDGER_ITEMS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "file_download_ledger_items",
+            "Download queued and worker-owned items, not a memory byte gauge",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class", "state"],
+    )
+    .expect("Metric created")
+});
+pub static FILE_DOWNLOAD_LEDGER_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "file_download_ledger_seconds",
+            "Download queue, budget and service seconds",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class", "phase"],
+    )
+    .expect("Metric created")
+});
 pub static FILE_DOWNLOADER_NORMAL_QUEUE_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -2810,6 +2858,18 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(QUERY_DISK_CACHE_MISS_COUNT.clone()))
         .expect("Metric registered");
     // file downloader metrics
+    registry
+        .register(Box::new(FILE_DOWNLOAD_LEDGER_EVENTS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_LEDGER_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_LEDGER_ITEMS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_LEDGER_SECONDS.clone()))
+        .expect("Metric registered");
     registry
         .register(Box::new(FILE_DOWNLOAD_DEVICE_CHECK_ERRORS.clone()))
         .expect("Metric registered");
