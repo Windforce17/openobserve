@@ -76,7 +76,8 @@ pub(crate) async fn warm_used_sidecar(
     let Some(key) = config::vix_sidecar_key(&file.key, file.meta.index_generation) else {
         return;
     };
-    let outcome = file_downloader::queue_download(
+    file_downloader::note_query_activity();
+    let outcome = file_downloader::queue_download_class(
         trace_id,
         file.id,
         &file.account,
@@ -84,6 +85,7 @@ pub(crate) async fn warm_used_sidecar(
         file.meta.index_size,
         file.meta.max_ts,
         cache_type,
+        file_downloader::DownloadClass::UsedSidecar,
     )
     .await;
     log::debug!(
@@ -115,6 +117,7 @@ pub(crate) async fn cache_files_with_policy(
     file_type: &str,
     miss_policy: CacheMissPolicy,
 ) -> (file_data::CacheType, u64, u64) {
+    file_downloader::note_query_activity();
     let mut cached_files = HashSet::with_capacity(files.len());
     let (mut cache_hits, mut cache_misses) = (0, 0);
 
@@ -179,6 +182,11 @@ pub(crate) async fn cache_files_with_policy(
         return (file_data::CacheType::None, cache_hits, cache_misses);
     };
 
+    let cfg = get_config();
+    let mut admission = QueryAdmission::new(
+        cfg.limit.file_download_query_max_files,
+        cfg.limit.file_download_query_max_bytes,
+    );
     let mut accepted = 0usize;
     let mut accepted_bytes = 0u64;
     let mut deduplicated = 0usize;
@@ -195,12 +203,33 @@ pub(crate) async fn cache_files_with_policy(
             skipped += 1;
             continue;
         }
+        if !admission.allows((*size).max(0) as usize) {
+            skipped += 1;
+            if cfg.limit.file_download_ledger_enabled {
+                config::metrics::FILE_DOWNLOAD_LEDGER_EVENTS
+                    .with_label_values(&["query_bulk", "query_limit"])
+                    .inc();
+                config::metrics::FILE_DOWNLOAD_LEDGER_BYTES
+                    .with_label_values(&["query_bulk", "query_limit"])
+                    .inc_by((*size).max(0) as u64);
+            }
+            continue;
+        }
+        let class =
+            if *size > 0 && (*size as u64) <= cfg.limit.file_download_small_object_bytes as u64 {
+                file_downloader::DownloadClass::DemandSmall
+            } else {
+                file_downloader::DownloadClass::QueryBulk
+            };
         // Borrow candidates directly: no detached producer or unsent Vec can
         // survive this query. Only admitted workers have an independent lifetime.
-        match file_downloader::queue_download(trace_id, *id, account, file, *size, *ts, cache_type)
-            .await
+        match file_downloader::queue_download_class(
+            trace_id, *id, account, file, *size, *ts, cache_type, class,
+        )
+        .await
         {
             file_downloader::QueueDownloadOutcome::Accepted { bytes } => {
+                admission.accept(bytes);
                 accepted += 1;
                 accepted_bytes = accepted_bytes.saturating_add(bytes as u64);
             }
@@ -228,9 +257,65 @@ pub(crate) async fn cache_files_with_policy(
     }
 }
 
+/// Quotas bound newly accepted optional work, not query correctness. Cache hits,
+/// duplicates and rejected reservations do not consume the cohort budget.
+struct QueryAdmission {
+    files: usize,
+    bytes: usize,
+    max_files: usize,
+    max_bytes: usize,
+}
+impl QueryAdmission {
+    fn new(max_files: usize, max_bytes: usize) -> Self {
+        Self {
+            files: 0,
+            bytes: 0,
+            max_files,
+            max_bytes,
+        }
+    }
+    fn allows(&self, size: usize) -> bool {
+        (self.max_files == 0 || self.files < self.max_files)
+            && (self.max_bytes == 0 || size <= self.max_bytes.saturating_sub(self.bytes))
+    }
+    fn accept(&mut self, bytes: usize) {
+        self.files = self.files.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::calc_target_partitions;
+    use super::{QueryAdmission, calc_target_partitions};
+
+    #[test]
+    fn query_admission_file_and_byte_limits_count_only_accepted() {
+        let mut admission = QueryAdmission::new(2, 100);
+        for _ in 0..100 {
+            assert!(admission.allows(60));
+        }
+        admission.accept(60);
+        assert!(!admission.allows(41));
+        assert!(admission.allows(40));
+        admission.accept(40);
+        assert!(!admission.allows(1));
+        assert!(!admission.allows(0));
+    }
+
+    #[test]
+    fn query_admission_rollback_and_overflow_are_explicit() {
+        let mut disabled = QueryAdmission::new(0, 0);
+        disabled.accept(usize::MAX);
+        assert!(disabled.allows(usize::MAX));
+        let mut bytes_only = QueryAdmission::new(0, 100);
+        bytes_only.accept(99);
+        assert!(!bytes_only.allows(usize::MAX));
+        assert!(bytes_only.allows(1));
+        let mut files_only = QueryAdmission::new(1, 0);
+        assert!(files_only.allows(usize::MAX));
+        files_only.accept(usize::MAX);
+        assert!(!files_only.allows(1));
+    }
 
     #[test]
     fn target_partitions_interpolates_cache_ratio() {

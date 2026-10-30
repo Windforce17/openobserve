@@ -355,6 +355,7 @@ where
                 let range = start as u64..end as u64;
                 let mut data = None;
                 for attempt in 0..2 {
+                    crate::cache::file_downloader::throttle(end - start).await;
                     let read = async {
                         let response = fetch(GetOptions {
                             range: Some(GetRange::Bounded(range.clone())),
