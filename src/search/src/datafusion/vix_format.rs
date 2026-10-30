@@ -4922,15 +4922,52 @@ mod m4_pruning_tests {
 pub fn inject_vix_scan_pruning(
     plan: Arc<dyn ExecutionPlan>,
 ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-    inject_vix_scan_pruning_with_late_source(
+    let cfg = config::get_config();
+    inject_vix_scan_pruning_with_all(
         plan,
-        config::get_config().common.search_late_source_materialize,
+        cfg.common.search_late_source_materialize,
+        cfg.common.vix_equal_or_pruning_enabled,
+        cfg.common.vix_like_prefix_pruning_enabled,
     )
 }
 
+/// Test entry for the late `_source` materialization switch. The OR and
+/// LIKE-prefix pruning switches follow the process config.
+#[cfg(test)]
 fn inject_vix_scan_pruning_with_late_source(
     plan: Arc<dyn ExecutionPlan>,
     late_source_enabled: bool,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    let cfg = config::get_config();
+    inject_vix_scan_pruning_with_all(
+        plan,
+        late_source_enabled,
+        cfg.common.vix_equal_or_pruning_enabled,
+        cfg.common.vix_like_prefix_pruning_enabled,
+    )
+}
+
+/// Test entry for the OR and LIKE-prefix pruning switches. Late `_source`
+/// materialization follows the process config.
+#[cfg(test)]
+fn inject_vix_scan_pruning_with_options(
+    plan: Arc<dyn ExecutionPlan>,
+    equal_or_enabled: bool,
+    like_prefix_enabled: bool,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    inject_vix_scan_pruning_with_all(
+        plan,
+        config::get_config().common.search_late_source_materialize,
+        equal_or_enabled,
+        like_prefix_enabled,
+    )
+}
+
+fn inject_vix_scan_pruning_with_all(
+    plan: Arc<dyn ExecutionPlan>,
+    late_source_enabled: bool,
+    equal_or_enabled: bool,
+    like_prefix_enabled: bool,
 ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
@@ -5029,17 +5066,58 @@ fn inject_vix_scan_pruning_with_late_source(
         }
         // leaves share the AND-conjunct analysis, bounds discarded
         let mut leaf = Extracted::default();
-        extract(predicate, &Schema::empty(), &mut leaf);
+        extract(predicate, &Schema::empty(), &mut leaf, false, false);
         for column in leaf.null_rejected {
             out.reject_null(&column);
         }
     }
 
-    fn extract(predicate: &Arc<dyn PhysicalExpr>, schema: &Schema, out: &mut Extracted) {
+    fn extract(
+        predicate: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        out: &mut Extracted,
+        equal_or_enabled: bool,
+        like_prefix_enabled: bool,
+    ) {
+        use crate::index::pruning;
+
         if let Some(binary) = predicate.downcast_ref::<phys::BinaryExpr>() {
             if matches!(binary.op(), Operator::And) {
-                extract(binary.left(), schema, out);
-                extract(binary.right(), schema, out);
+                extract(
+                    binary.left(),
+                    schema,
+                    out,
+                    equal_or_enabled,
+                    like_prefix_enabled,
+                );
+                extract(
+                    binary.right(),
+                    schema,
+                    out,
+                    equal_or_enabled,
+                    like_prefix_enabled,
+                );
+                return;
+            }
+            if equal_or_enabled && *binary.op() == Operator::Or {
+                if let Some((column, literals)) = pruning::equal_or_literals(predicate)
+                    && let Ok(field) = schema.field_with_name(column.name())
+                    // Restrict this new path to string semantics. Numeric
+                    // coercion, NaN ordering and drift retain the old path.
+                    && pruning::string_type(field.data_type())
+                    && literals.iter().all(|v| pruning::string_literal(v).is_some())
+                    && let (Some(min), Some(max)) = (
+                        literals.iter().filter_map(|v| pruning::string_literal(v)).min(),
+                        literals.iter().filter_map(|v| pruning::string_literal(v)).max(),
+                    )
+                {
+                    out.reject_null(column.name());
+                    out.bounds.push(ColumnBound {
+                        column: column.name().to_string(),
+                        min: Some((BoundValue::Str(min.to_string()), true)),
+                        max: Some((BoundValue::Str(max.to_string()), true)),
+                    });
+                }
                 return;
             }
             let (column, literal, op) = match (
@@ -5130,6 +5208,22 @@ fn inject_vix_scan_pruning_with_late_source(
                 && non_null_literal(literal)
             {
                 out.reject_null(column.name());
+                if like_prefix_enabled
+                    && !like.negated()
+                    && !like.case_insensitive()
+                    && let Ok(field) = schema.field_with_name(column.name())
+                    && pruning::string_type(field.data_type())
+                    && let Some(pattern) = pruning::string_literal(literal.value())
+                    && let Some(prefix) = pruning::like_prefix(pattern)
+                {
+                    let max = pruning::prefix_upper_bound(&prefix)
+                        .map(|upper| (BoundValue::Str(upper), false));
+                    out.bounds.push(ColumnBound {
+                        column: column.name().to_string(),
+                        min: Some((BoundValue::Str(prefix), true)),
+                        max,
+                    });
+                }
             }
             return;
         }
@@ -5297,7 +5391,13 @@ fn inject_vix_scan_pruning_with_late_source(
             return Ok(Transformed::no(node));
         };
         let mut extracted = Extracted::default();
-        extract(filter.predicate(), &filter.input().schema(), &mut extracted);
+        extract(
+            filter.predicate(),
+            &filter.input().schema(),
+            &mut extracted,
+            equal_or_enabled,
+            like_prefix_enabled,
+        );
         if late_source_enabled {
             extracted.late_source =
                 LateSourcePredicate::try_new(filter.predicate(), &filter.input().schema())?;
@@ -5341,3 +5441,6 @@ fn inject_vix_scan_pruning_with_late_source(
     })
     .map(|t| t.data)
 }
+
+#[cfg(test)]
+mod rc6_tests;

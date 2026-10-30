@@ -718,6 +718,7 @@ fn footer_shortfall(suffix: &[u8], total: u64) -> Option<u64> {
 /// equality/non-empty IN on the same field.
 fn decidable_field(condition: &Condition) -> Option<&str> {
     match condition {
+        Condition::NormalizedOr(inner) => decidable_field(inner),
         Condition::Equal(field, _) => Some(field),
         Condition::In(field, values, false) if !values.is_empty() => Some(field),
         Condition::Or(items) => {
@@ -849,6 +850,7 @@ fn composite_fallback_allowed(
 /// `Or` whose leaves don't all fold or don't share a field.
 fn try_predicate(cond: &Condition) -> Option<Predicate> {
     match cond {
+        Condition::NormalizedOr(inner) => try_predicate(inner),
         Condition::Equal(field, value) => Some(Predicate {
             field: field.clone(),
             values: vec![value.clone()],

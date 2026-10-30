@@ -2325,6 +2325,14 @@ fn evaluate_vix_index(
         return Ok(RawVixResult::PartialFields);
     }
 
+    // New OR/LIKE candidates require stored-type and writer-coverage proof.
+    // Keep legacy equality/IN behavior unchanged and fail open before evaluation.
+    if !crate::index::pruning::file_candidates_safe(condition, reader)
+        .map_err(|e| e.context(format!("[trace_id {trace_id}] OR/LIKE coverage check")))?
+    {
+        return Ok(RawVixResult::PartialFields);
+    }
+
     // build the per-file query. Fields the file carries without raw-value
     // term capability skip their condition (has_skipped => add filter
     // back); fields NO document carries evaluate to the exact empty result
@@ -9856,3 +9864,6 @@ mod ui_histogram_differential_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod rc6_tests;
