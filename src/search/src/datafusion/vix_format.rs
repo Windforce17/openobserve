@@ -93,6 +93,12 @@ use vortex_index::{
 use super::vortex_support::VORTEX_RUNTIME;
 use crate::vix::source::{FetchStats, ReadOperation, StoreRangeSource, VixReadMode, vix_read_mode};
 
+mod late_source;
+use late_source::LateSourcePredicate;
+
+#[cfg(test)]
+mod selective_tests;
+
 /// File extension (without the dot) of core files.
 const VIX_EXT: &str = "vix";
 
@@ -592,6 +598,8 @@ pub struct VixCoreSource {
     column_bounds: Vec<ColumnBound>,
     /// See [`VixCoreFormat::null_rejected_columns`].
     null_rejected_columns: Vec<String>,
+    late_source_predicate: Option<LateSourcePredicate>,
+    selective_source_range_prepass: bool,
     /// See [`VixCoreFormat::emit_ts_desc`].
     emit_ts_desc: bool,
     /// Session memory pool (injected by `create_physical_plan`); the opener
@@ -610,6 +618,10 @@ impl VixCoreSource {
             timestamp_filter,
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
+            late_source_predicate: None,
+            selective_source_range_prepass: config::get_config()
+                .common
+                .vix_selective_source_range_prepass,
             emit_ts_desc: false,
             memory_pool: None,
             scan_file_count: None,
@@ -687,6 +699,8 @@ impl FileSource for VixCoreSource {
         let opener = Arc::new(VixCoreOpener {
             column_bounds: self.column_bounds.clone(),
             null_rejected_columns: self.null_rejected_columns.clone(),
+            late_source_predicate: self.late_source_predicate.clone(),
+            selective_source_range_prepass: self.selective_source_range_prepass,
             emit_ts_desc: self.emit_ts_desc,
             batch_size: self.batch_size.unwrap_or(usize::MAX).max(1),
             object_store,
@@ -748,6 +762,8 @@ struct VixCoreOpener {
     column_bounds: Vec<ColumnBound>,
     /// Columns whose conjuncts are null-rejecting (field-presence skips).
     null_rejected_columns: Vec<String>,
+    late_source_predicate: Option<LateSourcePredicate>,
+    selective_source_range_prepass: bool,
     /// §6.2: the table declares `_timestamp DESC` — concat files must
     /// stream through the k-way region merge.
     emit_ts_desc: bool,
@@ -1084,6 +1100,18 @@ fn should_use_ranged_scan(
         || (large_file_threshold > 0 && file_size >= large_file_threshold)
 }
 
+/// Equality bounds activate the existing dictionary-aware BoundedPrepass.
+/// IN and full-text predicates use the separately gated predicate-first pass.
+fn has_string_equality(bounds: &[ColumnBound]) -> bool {
+    bounds.iter().any(|bound| {
+        matches!(
+            (&bound.min, &bound.max),
+            (Some((BoundValue::Str(min), true)), Some((BoundValue::Str(max), true)))
+                if min == max
+        )
+    })
+}
+
 impl FileOpener for VixCoreOpener {
     fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
@@ -1091,6 +1119,11 @@ impl FileOpener for VixCoreOpener {
         let timestamp_filter = self.timestamp_filter;
         let column_bounds = self.column_bounds.clone();
         let null_rejected_columns = self.null_rejected_columns.clone();
+        let late_source_predicate = self
+            .late_source_predicate
+            .clone()
+            .filter(|_| projected_schema.field_with_name(SOURCE_COL_NAME).is_ok());
+        let selective_source_range_prepass = self.selective_source_range_prepass;
         let emit_ts_desc = self.emit_ts_desc;
         let memory_pool = self.memory_pool.clone();
         let batch_size = self.batch_size;
@@ -1115,7 +1148,11 @@ impl FileOpener for VixCoreOpener {
             // use chunk-granular reads regardless of object size. Large
             // wide scans also go ranged to bound their pool reservation.
             let force_ranged_size = config::get_config().common.vix_full_scan_ranged_min_bytes;
-            let ranged_wanted = should_use_ranged_scan(
+            let equality_prepass = selective_source_range_prepass
+                && predicate == vortex_index::NativePredicateStrategy::BoundedPrepass
+                && has_string_equality(&column_bounds);
+            let late_source_predicate = late_source_predicate.filter(|_| selection.is_none());
+            let ranged_wanted = equality_prepass || late_source_predicate.is_some() || should_use_ranged_scan(
                 &projected_schema,
                 selection.is_some(),
                 usize::try_from(file.object_meta.size).unwrap_or(usize::MAX),
@@ -1155,6 +1192,9 @@ impl FileOpener for VixCoreOpener {
                         ))
                         .register(pool);
                         reservation.try_grow(estimate)?;
+                        if late_source_predicate.is_some() {
+                            reservation.try_grow(late_source::SELECTION_RESERVATION)?;
+                        }
                         Some(reservation)
                     }
                     None => None,
@@ -1263,6 +1303,21 @@ impl FileOpener for VixCoreOpener {
                             log::debug!("vix scan: skipped {location} ({tier})");
                             return Ok(());
                         }
+                        // Do not duplicate the existing dictionary-aware equality pass.
+                        let late_selection = if predicate == vortex_index::NativePredicateStrategy::BoundedPrepass
+                            && has_string_equality(&column_bounds)
+                            && (!emit_ts_desc || docs.row_order().is_ts_desc())
+                        {
+                            None
+                        } else {
+                            late_source_predicate.as_ref()
+                                .map(|predicate| predicate.select(&docs))
+                                .transpose()?.flatten()
+                        };
+                        let selection = selection.as_deref().or(late_selection.as_ref());
+                        if selection.is_some_and(RowIdBitmap::is_empty) {
+                            return Ok(());
+                        }
                         let pure_native_projection = !projected_schema.fields().is_empty()
                             && projected_schema.fields().iter().all(|field| {
                                 docs.schema().field_with_name(field.name())
@@ -1296,7 +1351,7 @@ impl FileOpener for VixCoreOpener {
                             return scan_core_docs_merged(
                                 docs,
                                 &projected_schema,
-                                selection.as_deref(),
+                                selection,
                                 timestamp_filter,
                                 &column_bounds,
                                 batch_size,
@@ -1316,7 +1371,7 @@ impl FileOpener for VixCoreOpener {
                         scan_core_docs(
                             docs,
                             &projected_schema,
-                            selection.as_deref(),
+                            selection,
                             timestamp_filter,
                             &column_bounds,
                             batch_size,
@@ -3676,6 +3731,8 @@ mod review_tests {
         let opener = VixCoreOpener {
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
+            late_source_predicate: None,
+            selective_source_range_prepass: true,
             emit_ts_desc: false,
             batch_size: usize::MAX,
             object_store: Arc::clone(&store),
@@ -4010,6 +4067,8 @@ mod ranged_tests {
         let opener = VixCoreOpener {
             column_bounds: Vec::new(),
             null_rejected_columns: Vec::new(),
+            late_source_predicate: None,
+            selective_source_range_prepass: true,
             emit_ts_desc: false,
             batch_size: usize::MAX,
             object_store: Arc::clone(&store),
@@ -4863,6 +4922,16 @@ mod m4_pruning_tests {
 pub fn inject_vix_scan_pruning(
     plan: Arc<dyn ExecutionPlan>,
 ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+    inject_vix_scan_pruning_with_late_source(
+        plan,
+        config::get_config().common.search_late_source_materialize,
+    )
+}
+
+fn inject_vix_scan_pruning_with_late_source(
+    plan: Arc<dyn ExecutionPlan>,
+    late_source_enabled: bool,
+) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
         logical_expr::Operator,
@@ -4918,6 +4987,7 @@ pub fn inject_vix_scan_pruning(
     struct Extracted {
         bounds: Vec<ColumnBound>,
         null_rejected: Vec<String>,
+        late_source: Option<LateSourcePredicate>,
     }
 
     impl Extracted {
@@ -5176,6 +5246,18 @@ pub fn inject_vix_scan_pruning(
                 let mut merged = source.column_bounds.clone();
                 merged.extend(extracted.bounds.iter().cloned());
                 source.column_bounds = merged;
+                // Filtering before an existing scan LIMIT changes its row domain.
+                if extracted.late_source.is_some()
+                    && conf.limit.is_none()
+                    && source.projection.source.iter().all(|projection| {
+                        projection
+                            .expr
+                            .downcast_ref::<Column>()
+                            .is_some_and(|column| column.name() == projection.alias)
+                    })
+                {
+                    source.late_source_predicate = extracted.late_source.clone();
+                }
                 for column in &extracted.null_rejected {
                     if !source.null_rejected_columns.iter().any(|c| c == column) {
                         source.null_rejected_columns.push(column.clone());
@@ -5216,6 +5298,10 @@ pub fn inject_vix_scan_pruning(
         };
         let mut extracted = Extracted::default();
         extract(filter.predicate(), &filter.input().schema(), &mut extracted);
+        if late_source_enabled {
+            extracted.late_source =
+                LateSourcePredicate::try_new(filter.predicate(), &filter.input().schema())?;
+        }
         // the null-rejection walk also crosses OR (intersection semantics),
         // catching the IN-list shapes the planner rewrites to `=` OR-chains
         let mut or_aware = Extracted::default();
@@ -5223,7 +5309,10 @@ pub fn inject_vix_scan_pruning(
         for column in or_aware.null_rejected {
             extracted.reject_null(&column);
         }
-        if extracted.bounds.is_empty() && extracted.null_rejected.is_empty() {
+        if extracted.bounds.is_empty()
+            && extracted.null_rejected.is_empty()
+            && extracted.late_source.is_none()
+        {
             return Ok(Transformed::no(node));
         }
         let injected = inject(Arc::clone(filter.input()), &extracted)?;
