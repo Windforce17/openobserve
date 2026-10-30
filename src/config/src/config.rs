@@ -1741,6 +1741,27 @@ pub struct Common {
     )]
     pub vix_full_scan_ranged_min_bytes: usize,
     #[env_config(
+        name = "ZO_VIX_SELECTIVE_SOURCE_RANGE_PREPASS",
+        default = true,
+        help = "Use ranged reads for _source scans with a bounded string-equality prepass, \
+                including bloom-only fallbacks, regardless of object size. Broad matches \
+                retain the existing streaming fallback. Requires ZO_VIX_READ_MODE=ranged. \
+                Set false to restore the size-based whole-object read policy."
+    )]
+    pub vix_selective_source_range_prepass: bool,
+    #[env_config(
+        name = "ZO_SEARCH_LATE_SOURCE_MATERIALIZE",
+        default = false,
+        help = "For core-file _source scans, evaluate supported deterministic predicates \
+                on native columns before reading matching source rows. Includes IN and \
+                full-text LIKE fallbacks. Retains at most 2 percent of rows, capped at \
+                65536 row ids; broad matches and source-dependent predicates use the \
+                existing scan. Reserves 16 MiB per eligible file for selection state. \
+                Disabled pending variable-width predicate memory qualification. \
+                Set false to disable this predicate-first pass."
+    )]
+    pub search_late_source_materialize: bool,
+    #[env_config(
         name = "ZO_VIX_EVAL_BAIL_BYTES",
         default = 536870912,
         help = "Give up an index-optimizer evaluation when its PROJECTED total fetch volume \
@@ -5208,6 +5229,13 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc3_selective_source_defaults() {
+        let cfg = Config::init().unwrap();
+        assert!(cfg.common.vix_selective_source_range_prepass);
+        assert!(!cfg.common.search_late_source_materialize);
+    }
 
     #[test]
     fn invalid_datafusion_memory_pool_fails_config_check() {
