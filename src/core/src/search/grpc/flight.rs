@@ -116,6 +116,10 @@ pub async fn search(
     let trace_id = Arc::new(trace_id.to_string());
     log::info!("[trace_id {trace_id}] flight->search: start");
 
+    // Setup registrations also outlive the branches while the union is planned.
+    // Transfer cleanup to the executor only after the complete plan succeeds.
+    let mut cleanup = QueryFilesCleanup(Some(&trace_id));
+
     // create datafusion context, just used for decode plan, the params can use default
     let mut ctx = DataFusionContextBuilder::new()
         .trace_id(&trace_id)
@@ -252,8 +256,6 @@ pub async fn search(
         .collect::<Vec<_>>();
 
     // get all tables
-    let mut tables = Vec::new();
-    let mut scan_stats = ScanStats::new();
     let file_stats_cache = ctx.runtime_env().cache_manager.get_file_statistic_cache();
 
     // optimize physical plan, currently for the vix index optimize
@@ -336,369 +338,401 @@ pub async fn search(
     let (parquet_file_ids, segment_ids) =
         super::segments_scan::split_pseudo_ids(&req.search_info.file_id_list);
 
-    // search in object storage
-    let mut metadata_count_file_list = Vec::new();
-    let mut index_file_list = Vec::new();
-    // the precomputed aggregate fast-path result over index_file_list
-    let mut index_result: Option<MultiResult> = None;
-    // set when ZO_STORAGE_SCAN_MAX_BYTES truncated the storage scan branch
-    let mut storage_shortfall: Option<String> = None;
-    if !parquet_file_ids.is_empty() {
-        let (mut file_list, file_list_took) = get_file_list_by_ids(
-            &trace_id,
-            &org_id,
-            stream_type,
-            &stream_name,
-            Some(query_params.time_range),
-            &search_partition_keys,
-            &parquet_file_ids,
-        )
-        .await?;
-        let refreshed = refresh_cached_bloom_vers(
-            &mut file_list,
-            &req.search_info.file_id_list,
-            &req.search_info.file_bloom_ver_list,
-        );
-        if refreshed > 0 {
-            log::info!(
-                "[trace_id {trace_id}] flight->search in: part_id: {}, refreshed stale cached \
-                 bloom_ver on {refreshed} of {} files from the leader's file list",
-                req.query_identifier.partition,
-                file_list.len(),
-            );
-        }
-        log::info!(
-            "{}",
-            search_inspector_fields(
-                format!(
-                    "[trace_id {trace_id}] flight->search in: part_id: {}, get file_list by ids, files: {}, took: {file_list_took} ms",
-                    req.query_identifier.partition,
-                    file_list.len(),
-                ),
-                SearchInspectorFieldsBuilder::new()
-                    .trace_id(trace_id.to_string())
-                    .node_name(LOCAL_NODE.name.clone())
-                    .component("flight:do_get::search get file_list by ids".to_string())
-                    .search_role("follower".to_string())
-                    .duration(file_list_took)
-                    .build()
-            )
-        );
-
-        // Prune the hydrated persisted snapshot once, before any metadata,
-        // eager aggregate, or residual storage branch takes ownership.
-        if query_params.use_inverted_index
-            && !index_condition
-                .as_ref()
-                .is_some_and(IndexCondition::is_condition_all)
-        {
-            let before = file_list.len();
-            let (bloom_took, applied) = super::storage::check_bloom_filter(
-                query_params.clone(),
-                &mut file_list,
-                index_condition.as_ref(),
-                bloom_indexed_fields,
+    // Both branches use only the ticket's frozen id sets above. Neither may
+    // re-query a time window while the builder moves segments into L0 files.
+    // Own results inside the futures, including completed tables. A sibling
+    // failure must release those tables before clearing their registrations.
+    let persisted_setup = async {
+        let mut tables = Vec::new();
+        let mut scan_stats = ScanStats::new();
+        let mut metadata_count_file_list = Vec::new();
+        let mut index_file_list = Vec::new();
+        let mut index_result = None;
+        let mut storage_shortfall = None;
+        if !parquet_file_ids.is_empty() {
+            let (mut file_list, file_list_took) = get_file_list_by_ids(
+                &trace_id,
+                &org_id,
+                stream_type,
+                &stream_name,
+                Some(query_params.time_range),
+                &search_partition_keys,
+                &parquet_file_ids,
             )
             .await?;
-            if applied {
+            let refreshed = refresh_cached_bloom_vers(
+                &mut file_list,
+                &req.search_info.file_id_list,
+                &req.search_info.file_bloom_ver_list,
+            );
+            if refreshed > 0 {
+                log::info!(
+                    "[trace_id {trace_id}] flight->search in: part_id: {}, refreshed stale cached \
+                     bloom_ver on {refreshed} of {} files from the leader's file list",
+                    req.query_identifier.partition,
+                    file_list.len(),
+                );
+            }
+            log::info!(
+                "{}",
+                search_inspector_fields(
+                    format!(
+                        "[trace_id {trace_id}] flight->search in: part_id: {}, get file_list by ids, files: {}, took: {file_list_took} ms",
+                        req.query_identifier.partition,
+                        file_list.len(),
+                    ),
+                    SearchInspectorFieldsBuilder::new()
+                        .trace_id(trace_id.to_string())
+                        .node_name(LOCAL_NODE.name.clone())
+                        .component("flight:do_get::search get file_list by ids".to_string())
+                        .search_role("follower".to_string())
+                        .duration(file_list_took)
+                        .build()
+                )
+            );
+
+            // Prune the hydrated persisted snapshot once, before any metadata,
+            // eager aggregate, or residual storage branch takes ownership.
+            if query_params.use_inverted_index
+                && !index_condition
+                    .as_ref()
+                    .is_some_and(IndexCondition::is_condition_all)
+            {
+                let before = file_list.len();
+                let (bloom_took, applied) = super::storage::check_bloom_filter(
+                    query_params.clone(),
+                    &mut file_list,
+                    index_condition.as_ref(),
+                    bloom_indexed_fields,
+                )
+                .await?;
+                if applied {
+                    log::info!(
+                        "{}",
+                        search_inspector_fields(
+                            format!(
+                                "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, bloom filter reduced file_list from {before} to {} in {bloom_took} ms",
+                                file_list.len()
+                            ),
+                            SearchInspectorFieldsBuilder::new()
+                                .trace_id(trace_id.to_string())
+                                .node_name(LOCAL_NODE.name.clone())
+                                .component("flight persisted bloom filter".to_string())
+                                .search_role("follower".to_string())
+                                .duration(bloom_took)
+                                .build()
+                        )
+                    );
+                }
+            }
+
+            if use_metadata_count {
+                let (metadata_files, scan_files) =
+                    split_metadata_count_files(file_list, query_params.time_range);
+                if !metadata_files.is_empty() {
+                    log::info!(
+                        "[trace_id {trace_id}] flight->search: metadata count files: {}, remaining storage files: {}",
+                        metadata_files.len(),
+                        scan_files.len()
+                    );
+                }
+                metadata_count_file_list.extend(metadata_files);
+                file_list = scan_files;
+            }
+
+            let index_optimize_start = std::time::Instant::now();
+            let mut storage_idx_optimize_rule = idx_optimize_rule.clone();
+            // Index-off stream types (#40) never route files to the index-only
+            // aggregate fast paths: their files carry no term index (and old
+            // indexed files must not be probed against policy either) — the
+            // whole list stays on the scan branch.
+            (index_file_list, file_list) = if config::is_vix_index_disabled(stream_type) {
+                (Vec::new(), file_list)
+            } else {
+                handle_index_optimize(
+                    &mut storage_idx_optimize_rule,
+                    file_list,
+                    query_params.time_range,
+                    &column_store_fields,
+                    index_condition.as_ref(),
+                )
+                .await?
+            };
+
+            // Evaluate the aggregate fast path EAGERLY over the index files.
+            // vix_search leaves every file it could NOT answer (missing docs
+            // column, partial fields, IO errors after one retry, per-file
+            // skipped conditions) in the list: those move to the DataFusion
+            // scan branch below, where storage::search re-applies the filter —
+            // per-file degradation instead of failing the whole query. Every
+            // file is answered exactly once (index result XOR scan), so partial
+            // aggregates remain impossible; IndexOptimizeExec later just adapts
+            // this precomputed result.
+            if !index_file_list.is_empty() {
+                match idx_optimize_rule.clone() {
+                    Some(agg_mode) => {
+                        let all_index_files = index_file_list.clone();
+                        let (idx_took, _add_filter_back, result) = super::storage::vix_search(
+                            query_params.clone(),
+                            &mut index_file_list,
+                            index_condition.clone(),
+                            Some(agg_mode),
+                        )
+                        .await?;
+                        scan_stats.idx_took = std::cmp::max(scan_stats.idx_took, idx_took as i64);
+                        if !index_file_list.is_empty() {
+                            log::warn!(
+                                "[trace_id {trace_id}] flight->search: {} of {} index files could not be answered by the aggregate fast path, moving them to the scan branch",
+                                index_file_list.len(),
+                                all_index_files.len(),
+                            );
+                            let unanswered: HashSet<String> =
+                                index_file_list.iter().map(|f| f.key.clone()).collect();
+                            file_list.append(&mut index_file_list);
+                            // keep only the ANSWERED files on the index side
+                            // (plan display + scan stats)
+                            index_file_list = all_index_files
+                                .into_iter()
+                                .filter(|f| !unanswered.contains(&f.key))
+                                .collect();
+                        } else {
+                            index_file_list = all_index_files;
+                        }
+                        index_result = Some(result);
+                    }
+                    None => {
+                        // defensive: routing produced index files without a mode
+                        // — scan them all instead
+                        log::warn!(
+                            "[trace_id {trace_id}] flight->search: index files routed without an optimize mode, moving {} files to the scan branch",
+                            index_file_list.len(),
+                        );
+                        file_list.append(&mut index_file_list);
+                    }
+                }
+            }
+            log::info!(
+                "{}",
+                search_inspector_fields(
+                    format!(
+                        "[trace_id {trace_id}] flight->search: handle index optimize, index files answered: {}, datafusion files: {}",
+                        index_file_list.len(),
+                        file_list.len()
+                    ),
+                    SearchInspectorFieldsBuilder::new()
+                        .trace_id(trace_id.to_string())
+                        .node_name(LOCAL_NODE.name.clone())
+                        .component("flight:do_get::search handle index optimize".to_string())
+                        .search_role("follower".to_string())
+                        .duration(index_optimize_start.elapsed().as_millis() as usize)
+                        .build()
+                )
+            );
+
+            // Apply sampling if configured (enterprise feature)
+            #[cfg(feature = "enterprise")]
+            if let Some(sampling_config) = &req.search_info.sampling_config {
+                apply_sampling_to_files(
+                    &mut file_list,
+                    sampling_config,
+                    Some(query_params.time_range),
+                    req.search_info.histogram_interval,
+                    &trace_id,
+                )
+                .await;
+            }
+
+            // An unsorted ALL histogram neither orders nor prunes residual files
+            // from footer statistics. Avoid reopening every fallback object
+            // during planning solely to rediscover bounds already in FileKey.
+            let collect_file_stats = !(index_condition
+                .as_ref()
+                .is_some_and(IndexCondition::is_condition_all)
+                && matches!(
+                    &idx_optimize_rule,
+                    Some(IndexOptimizeMode::SimpleHistogram(..))
+                ));
+            let storage_search_start = std::time::Instant::now();
+            let (tbls, stats, shortfall) = match super::storage::search(
+                query_params.clone(),
+                latest_schema.clone(),
+                &file_list,
+                empty_exec.sorted_by_time(),
+                collect_file_stats,
+                file_stats_cache.clone(),
+                index_condition.clone(),
+                fst_fields.clone(),
+                storage_idx_optimize_rule,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    log::error!(
+                        "[trace_id {trace_id}] flight->search: search storage parquet error: {e}"
+                    );
+                    return Err(e);
+                }
+            };
+            log::info!(
+                "{}",
+                search_inspector_fields(
+                    format!(
+                        "[trace_id {trace_id}] flight->search: storage search completed, {} files",
+                        file_list.len()
+                    ),
+                    SearchInspectorFieldsBuilder::new()
+                        .trace_id(trace_id.to_string())
+                        .node_name(LOCAL_NODE.name.clone())
+                        .component("flight:do_get::search storage search".to_string())
+                        .search_role("follower".to_string())
+                        .duration(storage_search_start.elapsed().as_millis() as usize)
+                        .build()
+                )
+            );
+            tables.extend(tbls);
+            scan_stats.add(&stats);
+            storage_shortfall = shortfall.map(|s| s.message());
+        }
+        Ok::<_, Error>(PersistedSetup {
+            tables,
+            scan_stats,
+            metadata_count_file_list,
+            index_file_list,
+            index_result,
+            storage_shortfall,
+        })
+    };
+    let segment_setup = async {
+        let mut segment_tables = Vec::new();
+        let mut segment_stats = ScanStats::new();
+        let mut segment_histogram = None;
+        // Scan assigned segment-WAL objects (negative ticket ids). Errors MUST
+        // fail the query: a silently missing segment is silent partial data.
+        if !segment_ids.is_empty() {
+            let segments_scan_start = std::time::Instant::now();
+            let all_histogram = match (&idx_optimize_rule, index_condition.as_ref()) {
+                (
+                    Some(IndexOptimizeMode::SimpleHistogram(
+                        min_value,
+                        bucket_width,
+                        num_buckets,
+                        ts_offset,
+                    )),
+                    Some(condition),
+                ) if condition.is_condition_all() && !has_noncanonical_filter => {
+                    Some((*min_value, *bucket_width, *num_buckets, *ts_offset))
+                }
+                _ => None,
+            };
+
+            if let Some((min_value, bucket_width, num_buckets, ts_offset)) = all_histogram {
+                let (histogram, stats) = match super::segments_scan::search_histogram(
+                    query_params.clone(),
+                    &segment_ids,
+                    min_value,
+                    bucket_width,
+                    num_buckets,
+                    ts_offset,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!(
+                            "[trace_id {trace_id}] flight->search: segment histogram failed: {e}"
+                        );
+                        return Err(e);
+                    }
+                };
+                segment_histogram = Some(histogram);
+                segment_stats.add(&stats);
                 log::info!(
                     "{}",
                     search_inspector_fields(
                         format!(
-                            "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, bloom filter reduced file_list from {before} to {} in {bloom_took} ms",
-                            file_list.len()
+                            "[trace_id {trace_id}] flight->search: segment histogram completed, {} segments",
+                            segment_ids.len()
                         ),
                         SearchInspectorFieldsBuilder::new()
                             .trace_id(trace_id.to_string())
                             .node_name(LOCAL_NODE.name.clone())
-                            .component("flight persisted bloom filter".to_string())
+                            .component("flight:do_get::search segment histogram".to_string())
                             .search_role("follower".to_string())
-                            .duration(bloom_took)
+                            .duration(segments_scan_start.elapsed().as_millis() as usize)
+                            .build()
+                    )
+                );
+            } else {
+                let segment_top_n = segment_top_n_plan(
+                    &idx_optimize_rule,
+                    empty_exec.sorted_by_time(),
+                    has_noncanonical_filter,
+                    has_row_dropping_limit,
+                    has_transformed_timestamp,
+                    empty_exec.limit(),
+                );
+                let (tbls, stats) = match super::segments_scan::search(
+                    query_params.clone(),
+                    latest_schema.clone(),
+                    empty_exec.schema().clone(),
+                    &segment_ids,
+                    empty_exec.sorted_by_time(),
+                    segment_top_n,
+                    index_condition.clone(),
+                    fst_fields.clone(),
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) => {
+                        log::error!(
+                            "[trace_id {trace_id}] flight->search: search segments error: {e}"
+                        );
+                        return Err(e);
+                    }
+                };
+                segment_tables.extend(tbls);
+                segment_stats.add(&stats);
+                log::info!(
+                    "{}",
+                    search_inspector_fields(
+                        format!(
+                            "[trace_id {trace_id}] flight->search: segments scan completed, {} segments",
+                            segment_ids.len()
+                        ),
+                        SearchInspectorFieldsBuilder::new()
+                            .trace_id(trace_id.to_string())
+                            .node_name(LOCAL_NODE.name.clone())
+                            .component("flight:do_get::search segments scan".to_string())
+                            .search_role("follower".to_string())
+                            .duration(segments_scan_start.elapsed().as_millis() as usize)
                             .build()
                     )
                 );
             }
         }
-
-        if use_metadata_count {
-            let (metadata_files, scan_files) =
-                split_metadata_count_files(file_list, query_params.time_range);
-            if !metadata_files.is_empty() {
-                log::info!(
-                    "[trace_id {trace_id}] flight->search: metadata count files: {}, remaining storage files: {}",
-                    metadata_files.len(),
-                    scan_files.len()
-                );
-            }
-            metadata_count_file_list.extend(metadata_files);
-            file_list = scan_files;
-        }
-
-        let index_optimize_start = std::time::Instant::now();
-        let mut storage_idx_optimize_rule = idx_optimize_rule.clone();
-        // Index-off stream types (#40) never route files to the index-only
-        // aggregate fast paths: their files carry no term index (and old
-        // indexed files must not be probed against policy either) — the
-        // whole list stays on the scan branch.
-        (index_file_list, file_list) = if config::is_vix_index_disabled(stream_type) {
-            (Vec::new(), file_list)
-        } else {
-            handle_index_optimize(
-                &mut storage_idx_optimize_rule,
-                file_list,
-                query_params.time_range,
-                &column_store_fields,
-                index_condition.as_ref(),
-            )
-            .await?
-        };
-
-        // Evaluate the aggregate fast path EAGERLY over the index files.
-        // vix_search leaves every file it could NOT answer (missing docs
-        // column, partial fields, IO errors after one retry, per-file
-        // skipped conditions) in the list: those move to the DataFusion
-        // scan branch below, where storage::search re-applies the filter —
-        // per-file degradation instead of failing the whole query. Every
-        // file is answered exactly once (index result XOR scan), so partial
-        // aggregates remain impossible; IndexOptimizeExec later just adapts
-        // this precomputed result.
-        if !index_file_list.is_empty() {
-            match idx_optimize_rule.clone() {
-                Some(agg_mode) => {
-                    let all_index_files = index_file_list.clone();
-                    let (idx_took, _add_filter_back, result) = super::storage::vix_search(
-                        query_params.clone(),
-                        &mut index_file_list,
-                        index_condition.clone(),
-                        Some(agg_mode),
-                    )
-                    .await?;
-                    scan_stats.idx_took = std::cmp::max(scan_stats.idx_took, idx_took as i64);
-                    if !index_file_list.is_empty() {
-                        log::warn!(
-                            "[trace_id {trace_id}] flight->search: {} of {} index files could not be answered by the aggregate fast path, moving them to the scan branch",
-                            index_file_list.len(),
-                            all_index_files.len(),
-                        );
-                        let unanswered: HashSet<String> =
-                            index_file_list.iter().map(|f| f.key.clone()).collect();
-                        file_list.append(&mut index_file_list);
-                        // keep only the ANSWERED files on the index side
-                        // (plan display + scan stats)
-                        index_file_list = all_index_files
-                            .into_iter()
-                            .filter(|f| !unanswered.contains(&f.key))
-                            .collect();
-                    } else {
-                        index_file_list = all_index_files;
-                    }
-                    index_result = Some(result);
-                }
-                None => {
-                    // defensive: routing produced index files without a mode
-                    // — scan them all instead
-                    log::warn!(
-                        "[trace_id {trace_id}] flight->search: index files routed without an optimize mode, moving {} files to the scan branch",
-                        index_file_list.len(),
-                    );
-                    file_list.append(&mut index_file_list);
-                }
-            }
-        }
-        log::info!(
-            "{}",
-            search_inspector_fields(
-                format!(
-                    "[trace_id {trace_id}] flight->search: handle index optimize, index files answered: {}, datafusion files: {}",
-                    index_file_list.len(),
-                    file_list.len()
-                ),
-                SearchInspectorFieldsBuilder::new()
-                    .trace_id(trace_id.to_string())
-                    .node_name(LOCAL_NODE.name.clone())
-                    .component("flight:do_get::search handle index optimize".to_string())
-                    .search_role("follower".to_string())
-                    .duration(index_optimize_start.elapsed().as_millis() as usize)
-                    .build()
-            )
-        );
-
-        // Apply sampling if configured (enterprise feature)
-        #[cfg(feature = "enterprise")]
-        if let Some(sampling_config) = &req.search_info.sampling_config {
-            apply_sampling_to_files(
-                &mut file_list,
-                sampling_config,
-                Some(query_params.time_range),
-                req.search_info.histogram_interval,
-                &trace_id,
-            )
-            .await;
-        }
-
-        // An unsorted ALL histogram neither orders nor prunes residual files
-        // from footer statistics. Avoid reopening every fallback object
-        // during planning solely to rediscover bounds already in FileKey.
-        let collect_file_stats = !(index_condition
-            .as_ref()
-            .is_some_and(IndexCondition::is_condition_all)
-            && matches!(
-                &idx_optimize_rule,
-                Some(IndexOptimizeMode::SimpleHistogram(..))
-            ));
-        let storage_search_start = std::time::Instant::now();
-        let (tbls, stats, shortfall) = match super::storage::search(
-            query_params.clone(),
-            latest_schema.clone(),
-            &file_list,
-            empty_exec.sorted_by_time(),
-            collect_file_stats,
-            file_stats_cache.clone(),
-            index_condition.clone(),
-            fst_fields.clone(),
-            storage_idx_optimize_rule,
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // clear session data
-                super::super::datafusion::storage::file_list::clear(&trace_id);
-                log::error!(
-                    "[trace_id {trace_id}] flight->search: search storage parquet error: {e}"
-                );
-                return Err(e);
-            }
-        };
-        log::info!(
-            "{}",
-            search_inspector_fields(
-                format!(
-                    "[trace_id {trace_id}] flight->search: storage search completed, {} files",
-                    file_list.len()
-                ),
-                SearchInspectorFieldsBuilder::new()
-                    .trace_id(trace_id.to_string())
-                    .node_name(LOCAL_NODE.name.clone())
-                    .component("flight:do_get::search storage search".to_string())
-                    .search_role("follower".to_string())
-                    .duration(storage_search_start.elapsed().as_millis() as usize)
-                    .build()
-            )
-        );
-        tables.extend(tbls);
-        scan_stats.add(&stats);
-        storage_shortfall = shortfall.map(|s| s.message());
-    }
-
-    // Scan assigned segment-WAL objects (negative ticket ids). Errors MUST
-    // fail the query: a silently missing segment is silent partial data.
-    if !segment_ids.is_empty() {
-        let segments_scan_start = std::time::Instant::now();
-        let all_histogram = match (&idx_optimize_rule, index_condition.as_ref()) {
-            (
-                Some(IndexOptimizeMode::SimpleHistogram(
-                    min_value,
-                    bucket_width,
-                    num_buckets,
-                    ts_offset,
-                )),
-                Some(condition),
-            ) if condition.is_condition_all() && !has_noncanonical_filter => {
-                Some((*min_value, *bucket_width, *num_buckets, *ts_offset))
-            }
-            _ => None,
-        };
-
-        if let Some((min_value, bucket_width, num_buckets, ts_offset)) = all_histogram {
-            let (histogram, stats) = match super::segments_scan::search_histogram(
-                query_params.clone(),
-                &segment_ids,
-                min_value,
-                bucket_width,
-                num_buckets,
-                ts_offset,
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    super::super::datafusion::storage::file_list::clear(&trace_id);
-                    log::error!(
-                        "[trace_id {trace_id}] flight->search: segment histogram failed: {e}"
-                    );
-                    return Err(e);
-                }
-            };
-            if let Err(e) = merge_histogram_result(&mut index_result, histogram) {
-                super::super::datafusion::storage::file_list::clear(&trace_id);
-                return Err(e);
-            }
-            scan_stats.add(&stats);
-            log::info!(
-                "{}",
-                search_inspector_fields(
-                    format!(
-                        "[trace_id {trace_id}] flight->search: segment histogram completed, {} segments",
-                        segment_ids.len()
-                    ),
-                    SearchInspectorFieldsBuilder::new()
-                        .trace_id(trace_id.to_string())
-                        .node_name(LOCAL_NODE.name.clone())
-                        .component("flight:do_get::search segment histogram".to_string())
-                        .search_role("follower".to_string())
-                        .duration(segments_scan_start.elapsed().as_millis() as usize)
-                        .build()
-                )
-            );
-        } else {
-            let segment_top_n = segment_top_n_plan(
-                &idx_optimize_rule,
-                empty_exec.sorted_by_time(),
-                has_noncanonical_filter,
-                has_row_dropping_limit,
-                has_transformed_timestamp,
-                empty_exec.limit(),
-            );
-            let (tbls, stats) = match super::segments_scan::search(
-                query_params.clone(),
-                latest_schema.clone(),
-                empty_exec.schema().clone(),
-                &segment_ids,
-                empty_exec.sorted_by_time(),
-                segment_top_n,
-                index_condition.clone(),
-                fst_fields.clone(),
-            )
-            .await
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    super::super::datafusion::storage::file_list::clear(&trace_id);
-                    log::error!("[trace_id {trace_id}] flight->search: search segments error: {e}");
-                    return Err(e);
-                }
-            };
-            tables.extend(tbls);
-            scan_stats.add(&stats);
-            log::info!(
-                "{}",
-                search_inspector_fields(
-                    format!(
-                        "[trace_id {trace_id}] flight->search: segments scan completed, {} segments",
-                        segment_ids.len()
-                    ),
-                    SearchInspectorFieldsBuilder::new()
-                        .trace_id(trace_id.to_string())
-                        .node_name(LOCAL_NODE.name.clone())
-                        .component("flight:do_get::search segments scan".to_string())
-                        .search_role("follower".to_string())
-                        .duration(segments_scan_start.elapsed().as_millis() as usize)
-                        .build()
-                )
-            );
-        }
-    }
+        Ok::<_, Error>(SegmentSetup {
+            tables: segment_tables,
+            scan_stats: segment_stats,
+            histogram: segment_histogram,
+        })
+    };
+    let (persisted, segments) = run_setup_branches(
+        &trace_id,
+        cfg.common.search_parallel_segment_setup,
+        persisted_setup,
+        segment_setup,
+    )
+    .await?;
+    let PersistedSetup {
+        mut tables,
+        mut scan_stats,
+        metadata_count_file_list,
+        index_file_list,
+        index_result,
+        storage_shortfall,
+    } = persisted.with_segments(segments)?;
 
     // search in WAL memory first to capture the snapshot_time
     // IMPORTANT: WAL data is NEVER sampled - it's always returned in full
@@ -744,8 +778,6 @@ pub async fn search(
         {
             Ok(v) => v,
             Err(e) => {
-                // clear session data
-                super::super::datafusion::storage::file_list::clear(&trace_id);
                 log::error!("[trace_id {trace_id}] flight->search: search wal parquet error: {e}");
                 return Err(e);
             }
@@ -863,7 +895,76 @@ pub async fn search(
         )
     );
 
+    cleanup.0 = None;
     Ok((ctx, physical_plan, scan_stats, storage_shortfall))
+}
+
+#[derive(Default)]
+struct PersistedSetup {
+    tables: Vec<Arc<dyn TableProvider>>,
+    scan_stats: ScanStats,
+    metadata_count_file_list: Vec<FileKey>,
+    index_file_list: Vec<FileKey>,
+    index_result: Option<MultiResult>,
+    storage_shortfall: Option<String>,
+}
+
+#[derive(Default)]
+struct SegmentSetup {
+    tables: Vec<Arc<dyn TableProvider>>,
+    scan_stats: ScanStats,
+    histogram: Option<Vec<u64>>,
+}
+
+impl PersistedSetup {
+    fn with_segments(mut self, segments: SegmentSetup) -> Result<Self, Error> {
+        // Completion order must not change union partition order or stats folding.
+        self.tables.extend(segments.tables);
+        self.scan_stats.add(&segments.scan_stats);
+        if let Some(histogram) = segments.histogram {
+            merge_histogram_result(&mut self.index_result, histogram)?;
+        }
+        Ok(self)
+    }
+}
+
+struct QueryFilesCleanup<'a>(Option<&'a str>);
+
+impl Drop for QueryFilesCleanup<'_> {
+    fn drop(&mut self) {
+        if let Some(trace_id) = self.0 {
+            super::super::datafusion::storage::file_list::clear(trace_id);
+        }
+    }
+}
+
+/// Run the two bounded setup pipelines without spawning a detached task.
+/// An error drops the sibling future before clearing its file registrations.
+/// Cancellation does the same through the guard, including after one side
+/// finished. Successful registrations remain owned by the query executor.
+async fn run_setup_branches<P, S, A, B>(
+    trace_id: &str,
+    parallel: bool,
+    persisted: P,
+    segments: S,
+) -> Result<(A, B), Error>
+where
+    P: std::future::Future<Output = Result<A, Error>>,
+    S: std::future::Future<Output = Result<B, Error>>,
+{
+    let mut cleanup = QueryFilesCleanup(Some(trace_id));
+    // Own both futures in a scope created AFTER the guard: cancellation must
+    // drop their resources before clearing request-owned listing entries.
+    let work = async move {
+        if parallel {
+            futures::try_join!(persisted, segments)
+        } else {
+            Ok((persisted.await?, segments.await?))
+        }
+    };
+    let result = work.await?;
+    cleanup.0 = None;
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2085,5 +2186,525 @@ mod tests {
         assert_eq!(refresh_cached_bloom_vers(&mut files, &[1, 2], &[600]), 0);
         let got: Vec<i64> = files.iter().map(|f| f.meta.bloom_ver).collect();
         assert_eq!(got, vec![0, 700]);
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use arrow_schema::Schema;
+    use config::meta::search::StorageType;
+    use tokio::sync::{Semaphore, oneshot};
+
+    use super::{Error, run_setup_branches};
+    use crate::service::search::datafusion::storage::file_list;
+
+    async fn register(trace: &str) {
+        for suffix in ["", "-storage", "-wal"] {
+            file_list::set(
+                &format!("{trace}{suffix}"),
+                trace,
+                "setup",
+                "vix",
+                vec![],
+                StorageType::Memory,
+                Arc::new(Schema::empty()),
+            )
+            .await;
+        }
+    }
+
+    fn registered(trace: &str) -> bool {
+        ["", "-storage", "-wal"].iter().any(|suffix| {
+            file_list::get(&format!("{trace}{suffix}/schema=setup/format=vix")).is_ok()
+        })
+    }
+
+    async fn pending_branch(
+        trace: &str,
+        permits: Arc<Semaphore>,
+        ready: oneshot::Sender<()>,
+    ) -> Result<(), Error> {
+        let _owned = lease(trace, permits).await;
+        ready.send(()).unwrap();
+        std::future::pending().await
+    }
+    #[tokio::test]
+    async fn setup_parallel_overlaps_both_branches() {
+        let barrier = tokio::sync::Barrier::new(2);
+        let run = run_setup_branches(
+            "setup-overlap",
+            true,
+            async {
+                barrier.wait().await;
+                Ok::<_, Error>(41)
+            },
+            async {
+                barrier.wait().await;
+                Ok::<_, Error>(42)
+            },
+        );
+        // A serial implementation deadlocks at the barrier, rather than
+        // passing because a noisy wall-clock measurement looked faster.
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .unwrap(),
+            (41, 42),
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_serial_rollback_preserves_order() {
+        let complete = AtomicBool::new(false);
+        let (first, second) = run_setup_branches(
+            "setup-serial",
+            false,
+            async {
+                tokio::task::yield_now().await;
+                complete.store(true, Ordering::Release);
+                Ok::<_, Error>(1)
+            },
+            async {
+                assert!(complete.load(Ordering::Acquire));
+                Ok::<_, Error>(2)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!((first, second), (1, 2));
+    }
+
+    #[tokio::test]
+    async fn setup_parallel_matches_serial_local_object_results() {
+        use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+
+        let store = InMemory::new();
+        let persisted = Path::from("persisted");
+        let segment = Path::from("segment");
+        store
+            .put(&persisted, bytes::Bytes::from_static(b"[3,0,7]").into())
+            .await
+            .unwrap();
+        store
+            .put(&segment, bytes::Bytes::from_static(b"[1,4,0]").into())
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        for parallel in [false, true] {
+            let (persisted, segment) = run_setup_branches(
+                "setup-local-results",
+                parallel,
+                async {
+                    Ok::<_, Error>(store.get(&persisted).await.unwrap().bytes().await.unwrap())
+                },
+                async { Ok::<_, Error>(store.get(&segment).await.unwrap().bytes().await.unwrap()) },
+            )
+            .await
+            .unwrap();
+            let persisted: Vec<u64> = serde_json::from_slice(&persisted).unwrap();
+            let segment: Vec<u64> = serde_json::from_slice(&segment).unwrap();
+            let setup = super::PersistedSetup {
+                index_result: Some(super::MultiResult::Histogram(persisted)),
+                scan_stats: super::ScanStats {
+                    files: 2,
+                    records: 10,
+                    idx_took: 9,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+            .with_segments(super::SegmentSetup {
+                histogram: Some(segment),
+                scan_stats: super::ScanStats {
+                    files: 3,
+                    records: 20,
+                    idx_took: 4,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(setup.scan_stats.files, 5);
+            assert_eq!(setup.scan_stats.records, 30);
+            assert_eq!(setup.scan_stats.idx_took, 9);
+            let Some(super::MultiResult::Histogram(counts)) = setup.index_result else {
+                panic!("missing histogram")
+            };
+            results.push(counts);
+        }
+        assert_eq!(results, vec![vec![4, 4, 7], vec![4, 4, 7]]);
+    }
+
+    #[tokio::test]
+    async fn setup_failure_drops_sibling_and_clears_registrations() {
+        for fail_persisted in [false, true] {
+            let trace = format!("setup-failure-{fail_persisted}");
+            let permits = Arc::new(Semaphore::new(1));
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let pending = pending_branch(&trace, permits.clone(), ready_tx);
+            let failing = async {
+                ready_rx.await.unwrap();
+                Err::<(), _>(Error::Message("injected setup failure".into()))
+            };
+            let result = if fail_persisted {
+                run_setup_branches(&trace, true, failing, pending).await
+            } else {
+                run_setup_branches(&trace, true, pending, failing).await
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected setup failure")
+            );
+            assert_eq!(permits.available_permits(), 1);
+            assert!(!registered(&trace));
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_serial_failure_never_starts_segments() {
+        let started = AtomicBool::new(false);
+        let result = run_setup_branches(
+            "setup-serial-failure",
+            false,
+            async { Err::<(), _>(Error::Message("persisted failed".into())) },
+            async {
+                started.store(true, Ordering::Relaxed);
+                Ok::<_, Error>(())
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!started.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn setup_cancellation_drops_both_active_branches() {
+        let trace = "setup-cancel-active";
+        let permits = Arc::new(Semaphore::new(2));
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let mut run = Box::pin(run_setup_branches(
+            trace,
+            true,
+            pending_branch(trace, permits.clone(), first_tx),
+            pending_branch(trace, permits.clone(), second_tx),
+        ));
+        tokio::select! {
+            result = &mut run => panic!("setup unexpectedly completed: {result:?}"),
+            _ = async { first_rx.await.unwrap(); second_rx.await.unwrap(); } => {}
+        }
+        assert_eq!(permits.available_permits(), 0);
+        assert!(registered(trace));
+        drop(run);
+        assert_eq!(permits.available_permits(), 2);
+        assert!(!registered(trace));
+    }
+
+    #[tokio::test]
+    async fn setup_cancellation_after_one_branch_completed_cleans_both() {
+        for parallel in [false, true] {
+            let trace = format!("setup-cancel-completed-{parallel}");
+            let permits = Arc::new(Semaphore::new(2));
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let completed = async { Ok::<_, Error>(lease(&trace, permits.clone()).await) };
+            let pending = pending_branch(&trace, permits.clone(), ready_tx);
+            let mut run = Box::pin(run_setup_branches(&trace, parallel, completed, pending));
+            tokio::select! {
+                result = &mut run => panic!("setup unexpectedly completed: {result:?}"),
+                _ = ready_rx => {}
+            }
+            assert_eq!(permits.available_permits(), 0);
+            drop(run);
+            assert_eq!(permits.available_permits(), 2);
+            assert!(!registered(&trace));
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_success_keeps_query_owned_registrations() {
+        for parallel in [false, true] {
+            let trace = format!("setup-success-{parallel}");
+            run_setup_branches(
+                &trace,
+                parallel,
+                async {
+                    register(&trace).await;
+                    Ok::<_, Error>(())
+                },
+                async { Ok::<_, Error>(()) },
+            )
+            .await
+            .unwrap();
+            assert!(registered(&trace));
+            file_list::clear(&trace);
+        }
+    }
+
+    #[derive(Debug)]
+    struct RegisteredLease {
+        trace: String,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    impl Drop for RegisteredLease {
+        fn drop(&mut self) {
+            assert!(
+                registered(&self.trace),
+                "cleanup preceded branch resource drop"
+            );
+        }
+    }
+
+    async fn lease(trace: &str, permits: Arc<Semaphore>) -> RegisteredLease {
+        register(trace).await;
+        RegisteredLease {
+            trace: trace.to_string(),
+            _permit: permits.acquire_owned().await.unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_completed_results_drop_before_failure_cleanup() {
+        for parallel in [false, true] {
+            let trace = format!("setup-completed-failure-{parallel}");
+            let permits = Arc::new(Semaphore::new(2));
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let completed = async {
+                let owned = lease(&trace, permits.clone()).await;
+                ready_tx.send(()).unwrap();
+                Ok::<_, Error>(owned)
+            };
+            let failing = async {
+                ready_rx.await.unwrap();
+                let _owned = lease(&trace, permits.clone()).await;
+                Err::<(), _>(Error::ResourceError(
+                    "injected segment budget failure".into(),
+                ))
+            };
+            let result = run_setup_branches(&trace, parallel, completed, failing).await;
+            assert!(matches!(result, Err(Error::ResourceError(_))));
+            assert_eq!(permits.available_permits(), 2);
+            assert!(!registered(&trace));
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_post_join_failure_and_cancellation_clear_owned_sessions_only() {
+        for cancel in [false, true] {
+            let trace = format!("setup-post-join-{cancel}");
+            let other = format!("{trace}-neighbor");
+            register(&other).await;
+            let permits = Arc::new(Semaphore::new(2));
+            let (ready_tx, ready_rx) = oneshot::channel();
+            let work = async {
+                // This is the same ownership boundary as search: the guard
+                // remains armed across all fallible union/planning operations.
+                let _cleanup = super::QueryFilesCleanup(Some(&trace));
+                let (_persisted, _segments) = run_setup_branches(
+                    &trace,
+                    true,
+                    async { Ok::<_, Error>(lease(&trace, permits.clone()).await) },
+                    async { Ok::<_, Error>(lease(&trace, permits.clone()).await) },
+                )
+                .await?;
+                ready_tx.send(()).unwrap();
+                if cancel {
+                    std::future::pending::<()>().await;
+                }
+                Err::<(), _>(Error::Message("injected union planning failure".into()))
+            };
+            let mut work = Box::pin(work);
+            if cancel {
+                tokio::select! {
+                    result = &mut work => panic!("unexpected completion: {result:?}"),
+                    result = ready_rx => result.unwrap(),
+                }
+                assert_eq!(permits.available_permits(), 0);
+                drop(work);
+            } else {
+                assert!(work.await.is_err());
+            }
+            assert_eq!(permits.available_permits(), 2);
+            assert!(!registered(&trace));
+            assert!(registered(&other));
+            file_list::clear(&other);
+        }
+    }
+
+    #[test]
+    fn setup_histogram_merge_rejects_overflow_and_shape_changes() {
+        for (persisted, segment) in [(vec![u64::MAX], vec![1]), (vec![1], vec![1, 2])] {
+            let setup = super::PersistedSetup {
+                index_result: Some(super::MultiResult::Histogram(persisted)),
+                ..Default::default()
+            };
+            assert!(
+                setup
+                    .with_segments(super::SegmentSetup {
+                        histogram: Some(segment),
+                        ..Default::default()
+                    })
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_parallel_union_matches_serial_and_exact_rows() {
+        use arrow::{
+            array::{Int64Array, StringArray},
+            record_batch::RecordBatch,
+        };
+        use arrow_schema::{DataType, Field};
+        use datafusion::{
+            datasource::{MemTable, TableProvider},
+            physical_plan::collect_partitioned,
+            prelude::SessionContext,
+        };
+        use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+
+        async fn read_batch(store: &InMemory, path: &Path, schema: Arc<Schema>) -> RecordBatch {
+            let bytes = store.get(path).await.unwrap().bytes().await.unwrap();
+            let rows: Vec<(i64, Option<String>, i64)> = serde_json::from_slice(&bytes).unwrap();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(StringArray::from_iter(rows.iter().map(|r| r.1.as_deref()))),
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn table(batch: RecordBatch) -> Arc<dyn TableProvider> {
+            Arc::new(MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap())
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let store = InMemory::new();
+        let persisted_path = Path::from("persisted");
+        let segment_path = Path::from("segment");
+        store
+            .put(
+                &persisted_path,
+                bytes::Bytes::from_static(br#"[[100,"api",3],[101,null,0],[102,"",7]]"#).into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &segment_path,
+                bytes::Bytes::from_static(br#"[[103,"api",1],[104,null,4],[105,"",0]]"#).into(),
+            )
+            .await
+            .unwrap();
+        let persisted_batch = read_batch(&store, &persisted_path, schema.clone()).await;
+        let segment_batch = read_batch(&store, &segment_path, schema.clone()).await;
+        let queries = [
+            "SELECT * FROM rt ORDER BY ts",
+            "SELECT service, count(*) AS n, sum(value) AS total FROM rt GROUP BY service ORDER BY service NULLS FIRST",
+            "SELECT ts, service FROM rt WHERE value > 0 ORDER BY ts DESC LIMIT 2 OFFSET 1",
+            "SELECT count(*) FROM rt WHERE ts >= 101 AND ts < 105",
+            "SELECT * FROM rt WHERE ts < 0",
+            "SELECT * FROM rt LIMIT 0",
+        ];
+        // Cover persisted-only, segment-only, empty, and mixed tickets.
+        for (has_persisted, has_segment) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let expected: Vec<_> = [
+                has_persisted.then_some(persisted_batch.clone()),
+                has_segment.then_some(segment_batch.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            let oracle = SessionContext::new();
+            oracle
+                .register_table(
+                    "rt",
+                    Arc::new(MemTable::try_new(schema.clone(), vec![expected.clone()]).unwrap()),
+                )
+                .unwrap();
+            let mut expected_results = Vec::new();
+            for sql in queries {
+                expected_results.push(oracle.sql(sql).await.unwrap().collect().await.unwrap());
+            }
+            for parallel in [false, true] {
+                let (ready_tx, ready_rx) = oneshot::channel();
+                let persisted = async {
+                    if parallel {
+                        ready_rx.await.unwrap();
+                    }
+                    let batch = read_batch(&store, &persisted_path, schema.clone()).await;
+                    Ok::<_, Error>(super::PersistedSetup {
+                        tables: if has_persisted {
+                            vec![table(batch)]
+                        } else {
+                            vec![]
+                        },
+                        storage_shortfall: Some("preserved truncation warning".into()),
+                        ..Default::default()
+                    })
+                };
+                let segments = async {
+                    let batch = read_batch(&store, &segment_path, schema.clone()).await;
+                    let result = super::SegmentSetup {
+                        tables: if has_segment {
+                            vec![table(batch)]
+                        } else {
+                            vec![]
+                        },
+                        ..Default::default()
+                    };
+                    // Force segment-first completion in parallel mode. Serial
+                    // execution has already dropped the unused receiver.
+                    let _ = ready_tx.send(());
+                    Ok::<_, Error>(result)
+                };
+                let (persisted, segments) =
+                    run_setup_branches("setup-union", parallel, persisted, segments)
+                        .await
+                        .unwrap();
+                let merged = persisted.with_segments(segments).unwrap();
+                assert_eq!(
+                    merged.storage_shortfall.as_deref(),
+                    Some("preserved truncation warning")
+                );
+                let union = Arc::new(super::NewUnionTable::new(schema.clone(), merged.tables));
+                let ctx = SessionContext::new();
+                let plan = union.scan(&ctx.state(), None, &[], None).await.unwrap();
+                let partitions = collect_partitioned(plan, ctx.task_ctx()).await.unwrap();
+                let batches: Vec<_> = partitions.into_iter().flatten().collect();
+                assert_eq!(
+                    batches, expected,
+                    "persisted must be the first union partition"
+                );
+                // Flight supplies an already-projected schema for an empty union.
+                // The physical empty result above covers that boundary; asking SQL
+                // to project this generic empty provider again is a different path.
+                if expected.is_empty() {
+                    continue;
+                }
+                ctx.register_table("rt", union).unwrap();
+                for (sql, expected) in queries.iter().zip(&expected_results) {
+                    let actual = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+                    assert_eq!(&actual, expected, "parallel={parallel}, sql={sql}");
+                }
+            }
+        }
     }
 }
