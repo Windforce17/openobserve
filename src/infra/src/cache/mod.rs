@@ -20,6 +20,8 @@ pub mod meta;
 pub mod stats;
 pub mod storage;
 
+pub use file_data::disk_download_in_flight_bytes;
+
 pub async fn init() -> Result<(), anyhow::Error> {
     file_data::init().await?;
     Ok(())

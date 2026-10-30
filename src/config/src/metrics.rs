@@ -1462,6 +1462,55 @@ pub static QUERY_DISK_CACHE_MISS_COUNT: Lazy<IntCounterVec> = Lazy::new(|| {
 });
 
 // file downloader metrics
+// No object, tenant or query labels: the IO phase label has four fixed values.
+pub static FILE_DOWNLOAD_DEVICE_CHECK_ERRORS: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "file_download_device_check_errors_total",
+            "Download tmp/cache device mismatches or failed device checks",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+pub static FILE_DOWNLOAD_BODY_CHUNK_BYTES: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "file_download_body_chunk_bytes",
+            "Download body chunk bytes; sample_count counts chunks",
+        )
+        .namespace(NAMESPACE)
+        .buckets(vec![
+            1024.0, 8192.0, 16384.0, 65536.0, 262144.0, 1048576.0, 8388608.0, 67108864.0,
+        ])
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+pub static FILE_DOWNLOAD_IO_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new("file_download_io_seconds", "Download IO time in seconds: body_wait excludes sink wait; tmp_write measures physical writes; publish includes cache lock wait")
+            .namespace(NAMESPACE)
+            .buckets(vec![0.00001, 0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 60.0])
+            .const_labels(create_const_labels()),
+        &["phase"],
+    ).expect("Metric created")
+});
+pub static FILE_DOWNLOAD_RANGE_RETRIES: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "file_download_range_retries_total",
+            "Range request/body retries, at most one per segment",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
 pub static FILE_DOWNLOADER_NORMAL_QUEUE_SIZE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -2761,6 +2810,18 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(QUERY_DISK_CACHE_MISS_COUNT.clone()))
         .expect("Metric registered");
     // file downloader metrics
+    registry
+        .register(Box::new(FILE_DOWNLOAD_DEVICE_CHECK_ERRORS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_BODY_CHUNK_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_IO_SECONDS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FILE_DOWNLOAD_RANGE_RETRIES.clone()))
+        .expect("Metric registered");
     registry
         .register(Box::new(FILE_DOWNLOADER_NORMAL_QUEUE_SIZE.clone()))
         .expect("Metric registered");

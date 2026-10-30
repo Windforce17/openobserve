@@ -16,6 +16,8 @@
 pub mod block;
 pub mod delete;
 pub mod disk;
+mod download_io;
+pub use download_io::disk_download_in_flight_bytes;
 pub mod memory;
 
 use std::{
@@ -354,6 +356,11 @@ enum DownloadSink {
         writer: Option<tokio::io::BufWriter<tokio::fs::File>>,
         written: u64,
     },
+    PipelinedFile {
+        path: PathBuf,
+        writer: download_io::PipelineWriter,
+        written: u64,
+    },
     ExactFile {
         path: PathBuf,
         writer: Option<ExactFileWriter>,
@@ -376,11 +383,25 @@ impl DownloadSink {
     }
 
     fn exact_file(path: PathBuf, lifetime: std::sync::Arc<dyn Send + Sync>) -> Self {
-        Self::ExactFile {
-            path,
-            writer: None,
-            written: 0,
-            lifetime,
+        let settings = download_io::Settings::configured();
+        if settings.pipeline {
+            Self::PipelinedFile {
+                writer: download_io::PipelineWriter::new(
+                    path.clone(),
+                    lifetime,
+                    settings.buffer,
+                    settings.metrics,
+                ),
+                path,
+                written: 0,
+            }
+        } else {
+            Self::ExactFile {
+                path,
+                writer: None,
+                written: 0,
+                lifetime,
+            }
         }
     }
 
@@ -389,6 +410,12 @@ impl DownloadSink {
     async fn reset(&mut self) -> Result<(), anyhow::Error> {
         match self {
             DownloadSink::Buffer(buf) => buf.clear(),
+            DownloadSink::PipelinedFile {
+                writer, written, ..
+            } => {
+                writer.reset().await?;
+                *written = 0;
+            }
             DownloadSink::File {
                 path,
                 writer,
@@ -435,6 +462,13 @@ impl DownloadSink {
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), anyhow::Error> {
         match self {
             DownloadSink::Buffer(buf) => buf.extend_from_slice(&chunk),
+            DownloadSink::PipelinedFile {
+                writer, written, ..
+            } => {
+                let len = chunk.len() as u64;
+                writer.write_chunk(chunk).await?;
+                *written += len;
+            }
             DownloadSink::File {
                 path,
                 writer,
@@ -456,7 +490,11 @@ impl DownloadSink {
                     .ok_or_else(|| anyhow::anyhow!("exact download sink used before reset"))?;
                 let len = chunk.len() as u64;
                 let (owned, result) = tokio::task::spawn_blocking(move || {
+                    let start = std::time::Instant::now();
                     let result = std::io::Write::write_all(&mut owned.file, &chunk);
+                    download_io::Settings::configured()
+                        .metrics
+                        .time("tmp_write", start.elapsed());
                     (owned, result)
                 })
                 .await?;
@@ -471,6 +509,9 @@ impl DownloadSink {
     /// Flush a file sink after the body ended (buffered bytes reach disk
     /// before the length check and any validation read).
     async fn finish_attempt(&mut self) -> Result<(), anyhow::Error> {
+        if let DownloadSink::PipelinedFile { writer, .. } = self {
+            writer.finish().await?;
+        }
         if let DownloadSink::File { path, writer, .. } = self
             && let Some(writer) = writer.as_mut()
         {
@@ -485,9 +526,9 @@ impl DownloadSink {
     fn len(&self) -> u64 {
         match self {
             DownloadSink::Buffer(buf) => buf.len() as u64,
-            DownloadSink::File { written, .. } | DownloadSink::ExactFile { written, .. } => {
-                *written
-            }
+            DownloadSink::File { written, .. }
+            | DownloadSink::ExactFile { written, .. }
+            | DownloadSink::PipelinedFile { written, .. } => *written,
         }
     }
 
@@ -497,9 +538,9 @@ impl DownloadSink {
     async fn validate(&self, ftype: FileType) -> Result<(), anyhow::Error> {
         match self {
             DownloadSink::Buffer(buf) => validate_file(buf, ftype).await,
-            DownloadSink::File { path, .. } | DownloadSink::ExactFile { path, .. } => {
-                validate_file_ranged(path, ftype).await
-            }
+            DownloadSink::File { path, .. }
+            | DownloadSink::ExactFile { path, .. }
+            | DownloadSink::PipelinedFile { path, .. } => validate_file_ranged(path, ftype).await,
         }
     }
 }
@@ -645,10 +686,21 @@ where
 
         // stream the body into the sink in bounded chunks (H3: never
         // materialize the object in RAM on the file-sink path)
+        if let DownloadSink::PipelinedFile { writer, .. } = sink {
+            writer.set_size(expected_blob_size);
+        }
         sink.reset().await?;
+        let metrics = download_io::Settings::configured().metrics;
         let mut body = res.into_stream();
-        while let Some(chunk) = body.next().await {
+        loop {
+            let started = std::time::Instant::now();
+            let next = body.next().await;
+            metrics.time("body_wait", started.elapsed());
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk?;
+            metrics.chunk(chunk.len());
             if size_policy == ExpectedSizePolicy::Exact
                 && chunk.len() as u64 > expected_blob_size.saturating_sub(sink.len())
             {
@@ -656,9 +708,15 @@ where
                     "file {file} body exceeds registered size {expected_blob_size}"
                 ));
             }
-            sink.write_chunk(chunk).await?;
+            let started = std::time::Instant::now();
+            let result = sink.write_chunk(chunk).await;
+            metrics.time("sink_wait", started.elapsed());
+            result?;
         }
-        sink.finish_attempt().await?;
+        let started = std::time::Instant::now();
+        let result = sink.finish_attempt().await;
+        metrics.time("sink_wait", started.elapsed());
+        result?;
         data_len = sink.len();
 
         // if the downloaded length is not equal to what the blog store
@@ -805,6 +863,38 @@ async fn download_from_storage_to_file_exact(
     tmp_path: &Path,
     lifetime: std::sync::Arc<dyn Send + Sync>,
 ) -> Result<usize, anyhow::Error> {
+    let settings = download_io::Settings::configured();
+    if settings.use_ranges(expected_size as u64) {
+        let result = download_io::download_ranges(
+            |options| crate::storage::get_opts(account, file, options),
+            tmp_path,
+            expected_size,
+            lifetime.clone(),
+            settings,
+        )
+        .await;
+        match result {
+            Ok(Some(size)) => return Ok(size),
+            Ok(None) => {} // No generation token: one single-stream attempt path.
+            Err(error) => {
+                // Preserve the existing missing-object reconciliation contract.
+                // Only typed store errors qualify; never delete rows for timeouts.
+                if is_file_list_tracked_data_file(file)
+                    && error.chain().any(|cause| {
+                        matches!(
+                            cause.downcast_ref::<object_store::Error>(),
+                            Some(object_store::Error::NotFound { .. })
+                        )
+                    })
+                {
+                    log::warn!("range download {file} not found; removing stale file_list entry");
+                    crate::file_list::remove(file).await?;
+                    crate::file_list::LOCAL_CACHE.remove(file).await?;
+                }
+                return Err(error.context(format!("range download {file}")));
+            }
+        }
+    }
     let mut sink = DownloadSink::exact_file(tmp_path.to_path_buf(), lifetime);
     download_with_retries_policy(
         || crate::storage::get(account, file),

@@ -147,6 +147,9 @@ impl ObjectStore for Remote {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let start = std::time::Instant::now();
         let file = location.to_string();
+        // Range downloads pin the generation with HEAD. Its metadata contains
+        // the full object size, but no body bytes were transferred.
+        let metadata_only = options.head && get_config().limit.file_download_io_metrics_enabled;
         let result = self
             .client
             .get_opts(&(self.format_key(&file).into()), options)
@@ -162,6 +165,9 @@ impl ObjectStore for Remote {
         let mut data_len = result.range.end - result.range.start;
         if data_len == 0 {
             data_len = result.meta.size;
+        }
+        if metadata_only {
+            data_len = 0;
         }
         let columns = file.split('/').collect::<Vec<&str>>();
         if columns[0] == "files" {
@@ -444,5 +450,56 @@ mod tests {
             r.format_key("my-bucket/files/foo.parquet"),
             "my-bucket/files/foo.parquet"
         );
+    }
+}
+
+#[cfg(test)]
+mod download_io_metrics_tests {
+    use object_store::{GetRange, ObjectStoreExt, memory::InMemory};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn range_generation_head_does_not_count_object_body_bytes() {
+        // Construct Remote around memory directly. Never initialize an S3 client.
+        let remote = Remote {
+            client: LimitStore::new(Box::new(InMemory::new()), 8),
+            bucket_prefix: String::new(),
+        };
+        let org = format!("download-head-test-{}", config::ider::generate());
+        let key = Path::from(format!("files/{org}/logs/test/object"));
+        remote
+            .put(&key, Bytes::from_static(b"0123456789").into())
+            .await
+            .unwrap();
+        let bytes = metrics::STORAGE_READ_BYTES.with_label_values(&[
+            org.as_str(),
+            "logs",
+            "get_opts",
+            "remote",
+        ]);
+        remote
+            .get_opts(
+                &key,
+                GetOptions {
+                    head: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.get(), 0);
+        let response = remote
+            .get_opts(
+                &key,
+                GetOptions {
+                    range: Some(GetRange::Bounded(2..7)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.bytes().await.unwrap(), b"23456".as_slice());
+        assert_eq!(bytes.get(), 5);
     }
 }

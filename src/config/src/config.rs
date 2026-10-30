@@ -2503,6 +2503,66 @@ pub struct Limit {
                 timeout."
     )]
     pub vix_fetch_timeout: u64,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_PIPELINED_WRITE",
+        default = true,
+        help = "Overlap network reads with bounded double-buffered disk writes. False restores per-chunk blocking writes."
+    )]
+    pub file_download_pipelined_write: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_WRITE_BUFFER_BYTES",
+        default = 8388608,
+        help = "Bytes per pipelined write buffer. Clamped to 64 KiB..64 MiB; at most two buffers per download."
+    )]
+    pub file_download_write_buffer_bytes: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RANGE_ENABLED",
+        default = true,
+        help = "Download large exact-size objects with ETag-pinned parallel ranges on Unix. False restores a single GET."
+    )]
+    pub file_download_range_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RANGE_MIN_OBJECT_BYTES",
+        default = 67108864,
+        help = "Minimum known object size for parallel ranges, in bytes. Values below one are treated as one."
+    )]
+    pub file_download_range_min_object_bytes: u64,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RANGE_SEGMENT_BYTES",
+        default = 8388608,
+        help = "Bytes per range GET. Clamped to 64 KiB..64 MiB."
+    )]
+    pub file_download_range_segment_bytes: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RANGE_CONCURRENCY",
+        default = 4,
+        help = "Maximum active ranges per object, including writes. Clamped to 1..8."
+    )]
+    pub file_download_range_concurrency: usize,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_RANGE_SEGMENT_TIMEOUT_SECS",
+        default = 30,
+        help = "Deadline for each range request and body, and the initial HEAD. Minimum one second. Retry each failed range once; never retry a physical write."
+    )]
+    pub file_download_range_segment_timeout_secs: u64,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_IO_METRICS_ENABLED",
+        default = true,
+        help = "Export bounded-label download chunk, body-wait, sink-wait, write, publish and range-retry metrics. Exclude HEAD metadata from storage body-byte counters."
+    )]
+    pub file_download_io_metrics_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_DEVICE_CHECK_ENABLED",
+        default = true,
+        help = "Check tmp and cache device IDs at initialization. False restores initialization without the check. Failures log an error and increment a counter."
+    )]
+    pub file_download_device_check_enabled: bool,
+    #[env_config(
+        name = "ZO_FILE_DOWNLOAD_SAME_DEVICE_REQUIRED",
+        default = false,
+        help = "Fail disk-cache initialization when tmp and cache directories have different device IDs. False only logs the error and preserves legacy rename behavior."
+    )]
+    pub file_download_same_device_required: bool,
     #[env_config(name = "ZO_FILE_DOWNLOAD_THREAD_NUM", default = 0)]
     pub file_download_thread_num: usize,
     #[env_config(name = "ZO_FILE_DOWNLOAD_MIN_RECORDS", default = 100)]
@@ -5208,6 +5268,22 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_io_defaults_bound_resources_and_keep_device_failure_nonfatal() {
+        let cfg = Config::init().unwrap();
+        let limit = cfg.limit;
+        assert!(limit.file_download_pipelined_write);
+        assert!(limit.file_download_range_enabled);
+        assert_eq!(limit.file_download_write_buffer_bytes, 8 * 1024 * 1024);
+        assert_eq!(limit.file_download_range_segment_bytes, 8 * 1024 * 1024);
+        assert_eq!(limit.file_download_range_min_object_bytes, 64 * 1024 * 1024);
+        assert_eq!(limit.file_download_range_concurrency, 4);
+        assert_eq!(limit.file_download_range_segment_timeout_secs, 30);
+        assert!(limit.file_download_io_metrics_enabled);
+        assert!(limit.file_download_device_check_enabled);
+        assert!(!limit.file_download_same_device_required);
+    }
 
     #[test]
     fn invalid_datafusion_memory_pool_fails_config_check() {
