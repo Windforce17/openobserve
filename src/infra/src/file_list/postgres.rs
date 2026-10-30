@@ -508,6 +508,17 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, inde
         Ok(FileMeta::from(&ret?))
     }
 
+    async fn get_index_coverage_file(&self, file: &FileKey) -> Result<Option<FileKey>> {
+        let (stream_key, date_key, file_name) = super::index_data_key_columns(file)?;
+        let record = sqlx::query_as::<_, super::FileRecord>(super::INDEX_COVERAGE_FILE_SQL)
+            .bind(stream_key)
+            .bind(date_key)
+            .bind(file_name)
+            .fetch_optional(&*CLIENT)
+            .await?;
+        Ok(record.as_ref().map(FileKey::from))
+    }
+
     async fn contains(&self, file: &str) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         let (stream_key, date_key, file_name) =

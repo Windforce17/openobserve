@@ -36,6 +36,11 @@ pub mod sqlite;
 static CLIENT: Lazy<Box<dyn FileList>> = Lazy::new(connect_default);
 pub static LOCAL_CACHE: Lazy<Box<dyn FileList>> = Lazy::new(connect_local_cache);
 
+// Match get/contains: date prunes PostgreSQL partitions, and the complete
+// tuple uses the existing unique (stream, date, file) index on both backends.
+const INDEX_COVERAGE_FILE_SQL: &str = "SELECT * FROM file_list \
+    WHERE stream = $1 AND date = $2 AND file = $3 AND deleted = false;";
+
 pub fn connect_default() -> Box<dyn FileList> {
     match get_config().common.meta_store.as_str().into() {
         MetaStore::Sqlite => Box::<sqlite::SqliteFileList>::default(),
@@ -97,6 +102,9 @@ pub trait FileList: Sync + Send + 'static {
     ) -> Result<()>;
     async fn batch_remove_deleted(&self, files: &[FileKey]) -> Result<()>;
     async fn get(&self, file: &str) -> Result<FileMeta>;
+    /// Read the current row from the writer database, not a replica or local cache.
+    /// Used only by opt-in index coverage probes; None means the input was retired.
+    async fn get_index_coverage_file(&self, file: &FileKey) -> Result<Option<FileKey>>;
     async fn contains(&self, file: &str) -> Result<bool>;
     async fn update_compressed_size(&self, file: &str, size: i64) -> Result<()>;
     /// Reserve a non-reusing positive generation in a staged cleanup intent.
@@ -447,6 +455,11 @@ pub async fn batch_remove_deleted(files: &[FileKey]) -> Result<()> {
 #[inline]
 pub async fn get(file: &str) -> Result<FileMeta> {
     CLIENT.get(file).await
+}
+
+/// Primary-database snapshot for the bounded index coverage probe.
+pub async fn get_index_coverage_file(file: &FileKey) -> Result<Option<FileKey>> {
+    CLIENT.get_index_coverage_file(file).await
 }
 
 #[inline]

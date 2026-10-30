@@ -482,6 +482,18 @@ SELECT min_ts, max_ts, records, original_size, compressed_size, index_size, inde
         Ok(FileMeta::from(&ret))
     }
 
+    async fn get_index_coverage_file(&self, file: &FileKey) -> Result<Option<FileKey>> {
+        let (stream_key, date_key, file_name) = super::index_data_key_columns(file)?;
+        let pool = CLIENT_RW.lock().await;
+        let record = sqlx::query_as::<_, super::FileRecord>(super::INDEX_COVERAGE_FILE_SQL)
+            .bind(stream_key)
+            .bind(date_key)
+            .bind(file_name)
+            .fetch_optional(&*pool)
+            .await?;
+        Ok(record.as_ref().map(FileKey::from))
+    }
+
     async fn contains(&self, file: &str) -> Result<bool> {
         let pool = CLIENT_RO.clone();
         let (stream_key, date_key, file_name) =
@@ -4899,6 +4911,125 @@ WHERE file_list_jobs.status = $5;"#;
             FileListJobStatus::Done as i64
         );
         raw_delete_jobs(&[id]).await;
+    }
+
+    #[tokio::test]
+    async fn test_index_coverage_partition_key_uses_existing_index() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let org = format!("coverage-plan-{}", now_micros());
+        let mut files = Vec::new();
+        // The same basename in different dates and streams must not alias.
+        for (stream, date) in [("source", "30/00"), ("source", "29/23"), ("other", "30/00")] {
+            let mut file = create_test_file_key(
+                "default",
+                &format!("files/{org}/logs/{stream}/2026/10/{date}/l0.vix"),
+                false,
+            );
+            file.id = list
+                .add(&file.account, &file.key, &file.meta)
+                .await
+                .unwrap();
+            files.push(file);
+        }
+        for file in &files {
+            let current = list.get_index_coverage_file(file).await.unwrap().unwrap();
+            assert_eq!(current.id, file.id);
+            assert_eq!(current.key, file.key);
+        }
+        {
+            let pool = CLIENT_RW.lock().await;
+            let (stream, date, name) = super::super::index_data_key_columns(&files[0]).unwrap();
+            let rows = sqlx::query(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::super::INDEX_COVERAGE_FILE_SQL
+            ))
+            .bind(&stream)
+            .bind(&date)
+            .bind(&name)
+            .fetch_all(&*pool)
+            .await
+            .unwrap();
+            let details: Vec<String> = rows.iter().map(|row| row.get("detail")).collect();
+            assert!(
+                details.iter().any(|detail| {
+                    detail.contains("file_list_stream_file_idx")
+                        && detail.contains("stream=? AND date=? AND file=?")
+                }),
+                "expected composite index lookup, got {details:?}"
+            );
+            assert!(
+                !details
+                    .iter()
+                    .any(|detail| detail.contains("SCAN file_list"))
+            );
+            sqlx::query(
+                "UPDATE file_list SET deleted = true WHERE stream = $1 AND date = $2 AND file = $3",
+            )
+            .bind(stream)
+            .bind(date)
+            .bind(name)
+            .execute(&*pool)
+            .await
+            .unwrap();
+        }
+        assert!(
+            list.get_index_coverage_file(&files[0])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut invalid = files[0].clone();
+        invalid.key = "invalid.vix".into();
+        assert!(list.get_index_coverage_file(&invalid).await.is_err());
+        for file in files {
+            list.remove(&file.key).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_index_coverage_reads_published_generation_not_staged_candidate() {
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let mut file = create_test_file_key(
+            "default",
+            &format!(
+                "files/coverage-{}/logs/source/2026/10/30/00/l0.vix",
+                now_micros()
+            ),
+            false,
+        );
+        file.meta.index_size = 0;
+        file.id = list
+            .add(&file.account, &file.key, &file.meta)
+            .await
+            .unwrap();
+        let generation = list.stage_index_generation(&file, 1).await.unwrap();
+        let staged = list.get_index_coverage_file(&file).await.unwrap().unwrap();
+        assert_eq!(
+            staged.meta.index_size, 0,
+            "staging never changes query visibility"
+        );
+        assert!(
+            list.publish_index_generation(&file, 120, generation, 1)
+                .await
+                .unwrap()
+        );
+        let current = list.get_index_coverage_file(&file).await.unwrap().unwrap();
+        assert_eq!(current.key, file.key);
+        assert_eq!(
+            (current.meta.index_size, current.meta.index_generation),
+            (120, generation)
+        );
+        assert!(
+            !list
+                .publish_index_generation(&file, 120, generation, 1)
+                .await
+                .unwrap(),
+            "stale snapshot loses CAS"
+        );
+        list.remove(&file.key).await.unwrap();
+        assert!(list.get_index_coverage_file(&file).await.unwrap().is_none());
     }
 
     #[tokio::test]
