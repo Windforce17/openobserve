@@ -586,6 +586,24 @@ pub async fn init() -> Result<(), anyhow::Error> {
         std::fs::create_dir_all(&file.root_dir).expect("create cache dir success");
     }
 
+    #[cfg(unix)]
+    if cfg.disk_cache.enabled && cfg.limit.file_download_device_check_enabled {
+        let files = FILES[0].read().await;
+        let mut roots = vec![PathBuf::from(&files.root_dir)];
+        roots.extend(
+            files
+                .multi_dir
+                .iter()
+                .map(|dir| PathBuf::from(format!("{}{dir}", files.root_dir))),
+        );
+        for cache in roots {
+            super::download_io::check_same_device(
+                Path::new(&cfg.common.data_tmp_dir),
+                &cache,
+                cfg.limit.file_download_same_device_required,
+            )?;
+        }
+    }
     tokio::task::spawn(async move {
         log::info!("Loading disk cache start");
         let root_dir = FILES[0].read().await.root_dir.clone();
@@ -1374,9 +1392,12 @@ pub(crate) async fn download_exact(
         std::sync::Arc::new((lifetime.clone(), tmp_file.clone())),
     )
     .await?;
-    set_from_tmp_file(file, tmp_file, data_len)
-        .await
-        .map_err(|e| anyhow::anyhow!("set file {file} to disk cache failed: {e}"))?;
+    let publish_started = std::time::Instant::now();
+    let published = set_from_tmp_file(file, tmp_file, data_len).await;
+    super::download_io::Settings::configured()
+        .metrics
+        .time("publish", publish_started.elapsed());
+    published.map_err(|e| anyhow::anyhow!("set file {file} to disk cache failed: {e}"))?;
     drop(lifetime);
     Ok(data_len)
 }
@@ -1393,8 +1414,12 @@ pub(crate) async fn set_admitted(
         PathBuf::from(tmp_file.path()),
         std::sync::Arc::new((lifetime.clone(), tmp_file.clone())),
     );
+    if let super::DownloadSink::PipelinedFile { writer, .. } = &mut sink {
+        writer.set_size(data_len as u64);
+    }
     sink.reset().await?;
     sink.write_chunk(data).await?;
+    sink.finish_attempt().await?;
     drop(sink);
     set_from_tmp_file(file, tmp_file, data_len).await
 }
