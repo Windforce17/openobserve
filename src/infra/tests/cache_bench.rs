@@ -610,14 +610,31 @@ async fn await_disk_quiescence(root: &Path, expected_bytes: u64) -> BenchResult<
 }
 
 fn directory_totals(root: &Path) -> io::Result<(u64, u64)> {
+    // Evictions unlink files asynchronously while this walk runs, so an entry
+    // can vanish between read_dir and metadata. Skip it: the caller polls
+    // until the total matches the index, so a skipped entry only delays that.
     fn visit(path: &Path, bytes: &mut u64, files: &mut u64) -> io::Result<()> {
-        for entry in fs::read_dir(path)? {
+        let entries = match fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
             let entry = entry?;
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             if file_type.is_dir() {
                 visit(&entry.path(), bytes, files)?;
             } else if file_type.is_file() {
-                *bytes = bytes.saturating_add(entry.metadata()?.len());
+                let len = match entry.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error),
+                };
+                *bytes = bytes.saturating_add(len);
                 *files += 1;
             }
         }
