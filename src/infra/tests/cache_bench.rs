@@ -43,6 +43,7 @@ const RESULT_SAMPLE_EVERY_SETS: u64 = 128;
 const DEFAULT_DURATION_SECS: u64 = 30;
 const MAX_DURATION_SECS: u64 = 45;
 const QUIESCE_TIMEOUT_SECS: u64 = 10;
+const PACED_SETS_PER_SEC: u64 = 2_000;
 
 type BenchResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -550,12 +551,24 @@ async fn memory_task(
     task_id: usize,
     deadline: Instant,
     data: Arc<Vec<Bytes>>,
+    set_interval: Option<Duration>,
 ) -> BenchResult<TaskStats> {
     let mut rng = XorShift64::seeded(0x8f21_9d0b_c36e_41a5 ^ task_id as u64);
     let mut stats = TaskStats::new();
     let mut set_count = 0;
+    let mut next_set = Instant::now();
     while Instant::now() < deadline {
-        match rng.below(100) {
+        // Unpaced: 60% get, 10% exist, 30% set. Paced: a set whenever one is
+        // due, otherwise a read with the same 6:1 get-to-exist mix.
+        let choice = match set_interval {
+            None => rng.below(100),
+            Some(interval) if Instant::now() >= next_set => {
+                next_set += interval;
+                99
+            }
+            Some(_) => rng.below(70),
+        };
+        match choice {
             0..=59 => {
                 let key = disk_data_key(read_id(&mut rng, task_id, set_count, DATA_WARM_ENTRIES));
                 measured_memory_get(&mut stats, &key).await;
@@ -805,6 +818,22 @@ async fn disk_result_small() -> BenchResult {
 #[tokio::test(flavor = "multi_thread", worker_threads = 32)]
 #[ignore = "run with scripts in .work/perf1031-moka/bench"]
 async fn memory_churn() -> BenchResult {
+    run_memory_scenario("memory_churn", None).await
+}
+
+/// Production memory-cache inserts follow object-store downloads, so their
+/// rate is bounded by network bandwidth (about 200/s at 1 GB/s and 5 MB per
+/// file). memory_churn inserts several hundred thousand per second and mostly
+/// measures write backpressure. This scenario caps inserts at
+/// PACED_SETS_PER_SEC in total, about 10x that estimate, with unpaced reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 32)]
+#[ignore = "run with scripts in .work/perf1031-moka/bench"]
+async fn memory_paced() -> BenchResult {
+    let per_task = Duration::from_secs(TASKS as u64) / PACED_SETS_PER_SEC as u32;
+    run_memory_scenario("memory_paced", Some(per_task)).await
+}
+
+async fn run_memory_scenario(name: &str, set_interval: Option<Duration>) -> BenchResult {
     let dirs = BenchDirs::memory()?;
     let duration = duration_from_env()?;
     initialize_cache().await?;
@@ -826,12 +855,12 @@ async fn memory_churn() -> BenchResult {
 
     let deadline = Instant::now() + duration;
     let tasks = (0..TASKS)
-        .map(|task_id| tokio::spawn(memory_task(task_id, deadline, data.clone())))
+        .map(|task_id| tokio::spawn(memory_task(task_id, deadline, data.clone(), set_interval)))
         .collect();
     combined.merge(collect_tasks(tasks).await?);
     let (capacity, used, entries) = measured_memory_stats(&mut combined).await;
     let record = make_record(
-        "memory_churn",
+        name,
         &combined,
         capacity,
         used,
