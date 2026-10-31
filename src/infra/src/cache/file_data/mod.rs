@@ -244,6 +244,9 @@ impl CacheStrategy {
         }
     }
 
+    // contains_key, len and is_empty are test-only: block.rs, the remaining
+    // user, never calls them after the whole-file tiers moved to moka.
+    #[cfg(test)]
     fn contains_key(&self, key: &str) -> bool {
         match self {
             CacheStrategy::Lru(cache) => cache.contains_key(key),
@@ -252,6 +255,7 @@ impl CacheStrategy {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         match self {
             CacheStrategy::Lru(cache) => cache.len(),
@@ -260,7 +264,6 @@ impl CacheStrategy {
         }
     }
 
-    // Only tests use this after the whole-file tiers moved to moka.
     #[cfg(test)]
     fn is_empty(&self) -> bool {
         match self {
