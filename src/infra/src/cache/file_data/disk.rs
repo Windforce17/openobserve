@@ -124,6 +124,7 @@ struct FileData {
     file_type: FileType,
     data: Cache<String, DiskEntry>,
     stripes: [Mutex<()>; STRIPES],
+    maintenance: super::MaintenanceGate,
 }
 
 #[derive(Clone)]
@@ -367,6 +368,7 @@ impl FileData {
                 file_type,
                 data,
                 stripes: std::array::from_fn(|_| Mutex::new(())),
+                maintenance: super::MaintenanceGate::default(),
             }
         })
     }
@@ -482,7 +484,8 @@ impl FileData {
     fn enforce_capacity(&self) {
         if self.used_bytes.load(Ordering::Relaxed) > self.max_size {
             // One pass bounds overshoot to in-flight inserts without blocking on IO.
-            self.data.run_pending_tasks();
+            // Single-flight: concurrent writers must not queue on moka's lock.
+            self.maintenance.try_run(|| self.data.run_pending_tasks());
         }
     }
 

@@ -24,6 +24,7 @@ use std::{
     collections::{BTreeMap, VecDeque},
     ops::Range,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 use bytes::Bytes;
@@ -47,6 +48,38 @@ pub enum CacheType {
     Disk,
     Memory,
     None,
+}
+
+/// Lets the write path bound moka's lazy-eviction overshoot without queueing
+/// writers: moka's explicit `run_pending_tasks` waits on a blocking lock, so
+/// concurrent writers on a full cache would serialize behind it on tokio
+/// worker threads. At most one caller runs a pass; the others return at once.
+/// Their writes are applied by that pass or the next one, and moka also runs
+/// maintenance on later reads and writes.
+#[derive(Default)]
+struct MaintenanceGate(AtomicBool);
+
+impl MaintenanceGate {
+    /// Runs `pass` unless another caller is running one. Returns whether it ran.
+    fn try_run(&self, pass: impl FnOnce()) -> bool {
+        if self
+            .0
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        // Reopen the gate even if the pass panics.
+        struct Reopen<'a>(&'a AtomicBool);
+        impl Drop for Reopen<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _reopen = Reopen(&self.0);
+        pass();
+        true
+    }
 }
 
 enum CacheStrategy {
@@ -1085,6 +1118,37 @@ fn get_file_time(file: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maintenance_gate_skips_concurrent_callers_and_reopens() {
+        let gate = std::sync::Arc::new(MaintenanceGate::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let runner = {
+            let gate = std::sync::Arc::clone(&gate);
+            std::thread::spawn(move || {
+                gate.try_run(|| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            })
+        };
+        entered_rx.recv().unwrap();
+        // A second writer must not wait for the running pass.
+        let mut ran = false;
+        assert!(!gate.try_run(|| ran = true));
+        assert!(!ran);
+        release_tx.send(()).unwrap();
+        assert!(runner.join().unwrap());
+        assert!(gate.try_run(|| ran = true));
+        assert!(ran);
+        // A panicking pass must not leave maintenance disabled forever.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gate.try_run(|| panic!("maintenance pass failed"))
+        }));
+        assert!(result.is_err());
+        assert!(gate.try_run(|| {}));
+    }
 
     #[test]
     fn test_is_file_list_tracked_data_file() {

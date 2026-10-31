@@ -92,6 +92,7 @@ pub struct FileData {
     cache: Cache<String, Bytes>,
     total_bytes: usize,
     accounting: Arc<CacheAccounting>,
+    maintenance: super::MaintenanceGate,
 }
 
 impl Default for FileData {
@@ -154,6 +155,7 @@ impl FileData {
             cache,
             total_bytes,
             accounting,
+            maintenance: super::MaintenanceGate::default(),
         }
     }
 
@@ -205,8 +207,9 @@ impl FileData {
 
         // Moka applies writes lazily. One pass bounds overshoot without reviving
         // the old synchronous, release-size-based whole-cache garbage collection.
+        // Single-flight: concurrent writers must not queue on moka's lock.
         if self.accounting.used_bytes() > self.total_bytes {
-            self.cache.run_pending_tasks();
+            self.maintenance.try_run(|| self.cache.run_pending_tasks());
         }
 
         Ok(SetTransition {
