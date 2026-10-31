@@ -308,6 +308,7 @@ o2_dex = { path = "src/enterprise/o2_dex" }
 o2_enterprise = { path = "src/enterprise/o2_enterprise", default-features = false }
 o2_openfga = { path = "src/enterprise/o2_openfga" }
 o2_ratelimit = { path = "src/enterprise/o2_ratelimit" }
+moka = { version = "0.12.16", default-features = false, features = ["sync"] }
 vortex = { version = "0.79", features = ["tokio", "object_store"] }
 vortex-datafusion = { version = "0.79" }
 vortex_index = { path = "src/vortex_index" }
