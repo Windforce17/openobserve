@@ -260,6 +260,8 @@ impl CacheStrategy {
         }
     }
 
+    // Only tests use this after the whole-file tiers moved to moka.
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         match self {
             CacheStrategy::Lru(cache) => cache.is_empty(),
