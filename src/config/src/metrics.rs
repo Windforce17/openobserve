@@ -437,6 +437,45 @@ pub static QUERY_DISK_CACHE_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+pub static DISK_CACHE_EVICTED_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "disk_cache_evicted_bytes_total",
+            "Exact bytes evicted from the whole-file disk cache",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type"],
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_PENDING_DELETES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "disk_cache_pending_deletes",
+            "Pending whole-file disk cache eviction deletions",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type"],
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_DELETE_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "disk_cache_delete_errors_total",
+            "Whole-file disk cache eviction deletion errors",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type"],
+    )
+    .expect("Metric created")
+});
+
 // querier disk block cache stats (block-granular tier behind the whole-file
 // disk cache; see infra::cache::file_data::block)
 pub static QUERY_DISK_BLOCK_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -2632,6 +2671,15 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(QUERY_DISK_CACHE_FILES.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(DISK_CACHE_EVICTED_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(DISK_CACHE_PENDING_DELETES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(DISK_CACHE_DELETE_ERRORS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(QUERY_DISK_BLOCK_CACHE_USED_BYTES.clone()))
         .expect("Metric registered");
     registry
@@ -3313,6 +3361,10 @@ mod tests {
         let _ = QUERY_DISK_CACHE_LIMIT_BYTES.clone();
         let _ = QUERY_DISK_CACHE_USED_BYTES.clone();
         let _ = QUERY_DISK_CACHE_FILES.clone();
+        let _ = DISK_CACHE_EVICTED_BYTES_TOTAL.clone();
+        let _ = DISK_CACHE_PENDING_DELETES.clone();
+        let _ = DISK_CACHE_DELETE_ERRORS_TOTAL.clone();
+
         let _ = QUERY_DISK_RESULT_CACHE_USED_BYTES.clone();
         let _ = QUERY_DISK_METRICS_CACHE_USED_BYTES.clone();
         let _ = QUERY_PARQUET_CACHE_RATIO.clone();
