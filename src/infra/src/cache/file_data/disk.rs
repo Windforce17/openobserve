@@ -21,7 +21,7 @@ use std::{
         Arc, LazyLock as Lazy, Mutex, MutexGuard,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -54,6 +54,13 @@ static TEST_TMP_ROOT: Lazy<tempfile::TempDir> =
 static DELETIONS: Lazy<DeleteQueue> = Lazy::new(DeleteQueue::new);
 const STRIPES: usize = 1024;
 const DELETE_BATCH_SIZE: usize = 256;
+/// Result-tier files written this close to the newest file of the previous
+/// run are deleted at startup. `.pb` (protobuf) and `.arrow` (IPC stream)
+/// have no end marker, so a crash that cut one at a message boundary would
+/// decode as a valid, shorter result. Dirty pages reach the disk within
+/// ~30 s (`vm.dirty_expire_centisecs`); the margin covers writeback backlog.
+/// Result files are small, so a clean restart loses only these minutes.
+const RESULT_RECENT_WINDOW: Duration = Duration::from_secs(600);
 
 pub static QUERY_RESULT_CACHE: Lazy<RwAHashMap<String, Vec<ResultCacheMeta>>> =
     Lazy::new(Default::default);
@@ -125,6 +132,10 @@ struct FileData {
     data: Cache<String, DiskEntry>,
     stripes: [Mutex<()>; STRIPES],
     maintenance: super::MaintenanceGate,
+    /// Set once the startup load has checked every file left by the previous
+    /// run. Reads open paths without the index, so until then only keys this
+    /// process published (and therefore indexed) are served.
+    checked: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -369,6 +380,7 @@ impl FileData {
                 data,
                 stripes: std::array::from_fn(|_| Mutex::new(())),
                 maintenance: super::MaintenanceGate::default(),
+                checked: AtomicBool::new(false),
             }
         })
     }
@@ -382,6 +394,27 @@ impl FileData {
             })
     }
 
+    /// Whether a read may open `file`'s path: see [`FileData::checked`].
+    fn serves(&self, file: &str) -> bool {
+        self.checked.load(Ordering::Acquire) || self.data.contains_key(file)
+    }
+
+    /// Unlink a file found by the startup load, unless this process has
+    /// published the key since. Publication renames and indexes under the
+    /// same stripe, so an unindexed path is the scanned file or an evicted
+    /// leftover that the deleter is about to remove anyway.
+    fn remove_unindexed(&self, file: &str) -> std::io::Result<bool> {
+        let _stripe = self.lock_key(file);
+        if self.data.contains_key(file) {
+            return Ok(false);
+        }
+        match std::fs::remove_file(self.get_file_path(file)) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn exist(&self, file: &str) -> bool {
         self.data.contains_key(file)
     }
@@ -391,6 +424,9 @@ impl FileData {
     }
 
     async fn get(&self, file: &str, range: Option<Range<u64>>) -> Option<Bytes> {
+        if !self.serves(file) {
+            return None;
+        }
         self.data.get(file);
         let file_path = self.get_file_path(file);
         tokio::task::spawn_blocking(move || match get_file_contents(&file_path, range) {
@@ -403,6 +439,9 @@ impl FileData {
     }
 
     async fn get_size(&self, file: &str) -> Option<usize> {
+        if !self.serves(file) {
+            return None;
+        }
         let file_path = self.get_file_path(file);
         match get_file_size(&file_path) {
             Ok(v) => Some(v as usize),
@@ -671,11 +710,16 @@ pub async fn init() -> Result<(), anyhow::Error> {
             )?;
         }
     }
-    tokio::spawn(async {
+    // Files with an mtime from this point on were written by this process,
+    // not by the run the startup check judges.
+    let started = SystemTime::now();
+    tokio::spawn(async move {
         log::info!("Loading disk cache start");
         match tokio::fs::canonicalize(&FILES.root_dir).await {
             Ok(root) => {
-                if let Err(error) = load(&root, [&FILES, &RESULT_FILES, &AGGREGATION_FILES]).await {
+                if let Err(error) =
+                    load(&root, [&FILES, &RESULT_FILES, &AGGREGATION_FILES], started).await
+                {
                     log::error!("load disk cache {} failed: {error}", root.display());
                 }
             }
@@ -776,6 +820,9 @@ async fn get_opts_from(
     file: &str,
     options: GetOptions,
 ) -> object_store::Result<GetResult> {
+    if !files.serves(file) {
+        return Err(not_yet_checked(file));
+    }
     files.data.get(file);
     let path = PathBuf::from(files.get_file_path(file));
     let (metadata, fp) = match std::fs::File::open(&path).and_then(|f| Ok((f.metadata()?, f))) {
@@ -814,48 +861,23 @@ async fn get_opts_from(
     };
     options.check_preconditions(&meta)?;
 
-    let range = match resolve_get_range(file, options.range.as_ref(), meta.size) {
-        Ok(range) => range,
-        Err(error)
-            if options
-                .range
-                .as_ref()
-                .is_some_and(|range| is_start_too_large(range, meta.size)) =>
-        {
-            log::warn!(
-                "File disk cache entry is stale for {file}: requested {:?}, cached size {}; \
-                 evicting and falling back to object storage",
-                options.range,
+    // Callers derive ranges from the object's real size, and a whole-file
+    // entry is a full copy, so a range past the cached end means a truncated
+    // copy (crash, stale generation). object_store would silently return the
+    // shorter overlap; miss instead so the caller reads object storage.
+    if let Some(requested) = options.range.as_ref()
+        && exceeds_cached_size(requested, meta.size)
+    {
+        evict_stale(files, file, &generation, requested, meta.size)?;
+        return Err(object_store::Error::NotFound {
+            path: file.to_string(),
+            source: Box::new(std::io::Error::other(format!(
+                "requested {requested:?} exceeds cached size {}",
                 meta.size
-            );
-            match files.remove(file, Some(&generation)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    log::debug!(
-                        "File disk cache preserved a newer generation of stale entry {file}"
-                    );
-                }
-                Err(remove_error) => {
-                    log::error!(
-                        "File disk cache failed to evict stale generation {file}: requested {:?}, \
-                         cached size {}: {remove_error}",
-                        options.range,
-                        meta.size
-                    );
-                    return Err(object_store::Error::Generic {
-                        store: "disk cache",
-                        source: Box::new(std::io::Error::other(format!(
-                            "failed to evict {file} after requested range {:?} exceeded cached \
-                             size {}: {remove_error}",
-                            options.range, meta.size
-                        ))),
-                    });
-                }
-            }
-            return Err(error);
-        }
-        Err(error) => return Err(error),
-    };
+            ))),
+        });
+    }
+    let range = resolve_get_range(file, options.range.as_ref(), meta.size)?;
 
     Ok(GetResult {
         payload: GetResultPayload::File(fp, path),
@@ -863,6 +885,64 @@ async fn get_opts_from(
         range,
         meta,
     })
+}
+
+/// Error for a key whose file the startup load has not checked yet.
+fn not_yet_checked(file: &str) -> object_store::Error {
+    object_store::Error::NotFound {
+        path: file.to_string(),
+        source: Box::new(std::io::Error::other(
+            "disk cache startup check has not reached this file",
+        )),
+    }
+}
+
+/// Whether `requested` reaches past the end of a cached copy of `size`
+/// bytes. Invalid ranges are left to `resolve_get_range`.
+fn exceeds_cached_size(requested: &GetRange, size: u64) -> bool {
+    if requested.is_valid().is_err() {
+        return false;
+    }
+    match requested {
+        GetRange::Bounded(range) => range.end > size,
+        GetRange::Offset(offset) => *offset >= size,
+        GetRange::Suffix(_) => false,
+    }
+}
+
+/// Evict the exact generation a read found too short. A newer generation
+/// published meanwhile is kept.
+fn evict_stale(
+    files: &FileData,
+    file: &str,
+    generation: &FileGeneration,
+    requested: &dyn fmt::Debug,
+    cached_size: u64,
+) -> object_store::Result<()> {
+    log::warn!(
+        "File disk cache entry is stale for {file}: requested {requested:?}, cached size {cached_size}; \
+         evicting and falling back to object storage"
+    );
+    match files.remove(file, Some(generation)) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            log::debug!("File disk cache preserved a newer generation of stale entry {file}");
+            Ok(())
+        }
+        Err(remove_error) => {
+            log::error!(
+                "File disk cache failed to evict stale generation {file}: requested {requested:?}, \
+                 cached size {cached_size}: {remove_error}"
+            );
+            Err(object_store::Error::Generic {
+                store: "disk cache",
+                source: Box::new(std::io::Error::other(format!(
+                    "failed to evict {file} after requested range {requested:?} exceeded cached \
+                     size {cached_size}: {remove_error}"
+                ))),
+            })
+        }
+    }
 }
 
 #[inline]
@@ -903,6 +983,9 @@ async fn get_ranges_from(
     file: &str,
     ranges: &[Range<u64>],
 ) -> object_store::Result<Vec<Bytes>> {
+    if !files.serves(file) {
+        return Err(not_yet_checked(file));
+    }
     files.data.get(file);
     let path = PathBuf::from(files.get_file_path(file));
     let ranges_owned: Vec<Range<u64>> = ranges.to_vec();
@@ -913,6 +996,26 @@ async fn get_ranges_from(
             path: file_label.clone(),
             source: Box::new(e),
         })?;
+        // One fstat per batch: a range past the end means a truncated copy
+        // (see `get_opts_from`); evict it instead of failing every later read.
+        let metadata = f.metadata().map_err(|e| object_store::Error::Generic {
+            store: "DiskCache",
+            source: Box::new(e),
+        })?;
+        if let Some(beyond) = ranges_owned
+            .iter()
+            .find(|r| r.start <= r.end && r.end > metadata.len())
+        {
+            let generation = FileGeneration::from_metadata(&metadata);
+            evict_stale(files, &file_label, &generation, beyond, metadata.len())?;
+            return Err(object_store::Error::NotFound {
+                path: file_label.clone(),
+                source: Box::new(std::io::Error::other(format!(
+                    "requested {beyond:?} exceeds cached size {}",
+                    metadata.len()
+                ))),
+            });
+        }
         let mut out = Vec::with_capacity(ranges_owned.len());
         for r in &ranges_owned {
             if r.start > r.end {
@@ -1091,7 +1194,16 @@ pub async fn remove(file: &str) -> Result<(), anyhow::Error> {
     cache_for_key(file).remove(file, None).map(|_| ())
 }
 
-async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow::Error> {
+async fn load(
+    root_dir: &Path,
+    caches: [&Arc<FileData>; 3],
+    started: SystemTime,
+) -> Result<(), anyhow::Error> {
+    #[cfg(unix)]
+    let holes_reported = reports_holes(root_dir, &caches[0].multi_dir);
+    #[cfg(not(unix))]
+    let holes_reported = false;
+    let mut removed = StartupRemovals::default();
     let mut scan_dirs = vec![root_dir.to_path_buf()];
     let mut loaded = Vec::new();
     let mut metrics_cache = Vec::new();
@@ -1153,6 +1265,15 @@ async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow
             } else {
                 1
             };
+            // Only this tier's prefixes: the root may also hold other tiers'
+            // directories (the block tier's sparse `blocks/` files).
+            if !key.starts_with("files")
+                && !key.starts_with("results")
+                && !key.starts_with("aggregations")
+                && !key.starts_with("metrics_results")
+            {
+                continue;
+            }
             if caches[index].data.contains_key(&key) {
                 continue;
             }
@@ -1160,12 +1281,31 @@ async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow
             if total.is_multiple_of(1000) {
                 log::info!("Loading disk cache {total}");
             }
+            match startup_damage(&path, holes_reported) {
+                Ok(None) => {}
+                Ok(Some(damage)) => {
+                    removed.remove(caches[index], &key, damage, metadata.len());
+                    continue;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    log::error!(
+                        "check cache file {} failed: {error}; not loading it",
+                        path.display()
+                    );
+                    continue;
+                }
+            }
             let size = metadata.len() as usize;
+            let modified = metadata.modified().unwrap_or_else(|error| {
+                log::warn!(
+                    "read cache mtime {} failed: {error}; treating it as oldest",
+                    path.display()
+                );
+                SystemTime::UNIX_EPOCH
+            });
             if key.starts_with("metrics_results") {
-                // Historical startup behavior: metrics results are readable by path,
-                // but only their separate metadata list is populated.
-                update_metrics(&key, size as i64, 0);
-                metrics_cache.push(key);
+                metrics_cache.push((key, size, modified));
                 continue;
             }
             if (key.starts_with("results") && parse_result_cache_key(&key).is_none())
@@ -1174,26 +1314,46 @@ async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow
                 log::error!("parse disk cache key failed: {key}");
                 continue;
             }
-            if !key.starts_with("files")
-                && !key.starts_with("results")
-                && !key.starts_with("aggregations")
-            {
-                continue;
-            }
-            let modified = metadata.modified().unwrap_or_else(|error| {
-                log::warn!(
-                    "read cache mtime {} failed: {error}; treating it as oldest",
-                    path.display()
-                );
-                SystemTime::UNIX_EPOCH
-            });
             loaded.push((key, size, modified, index));
         }
     }
+    // The newest file of the previous run approximates when it last wrote.
+    // Queries publish files while this scan runs; one seen between its rename
+    // and its index insert must not move the window to now.
+    let previous_run = |modified: &SystemTime| *modified < started;
+    let recent_from = loaded
+        .iter()
+        .map(|(_, _, modified, _)| *modified)
+        .chain(metrics_cache.iter().map(|(_, _, modified)| *modified))
+        .filter(previous_run)
+        .max()
+        .map(|newest| {
+            newest
+                .checked_sub(RESULT_RECENT_WINDOW)
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+    let is_recent_result = |modified: &SystemTime| {
+        previous_run(modified) && recent_from.is_some_and(|from| *modified >= from)
+    };
     loaded.sort_by_key(|(_, _, modified, _)| *modified);
-    METRICS_RESULT_CACHE.write().await.extend(metrics_cache);
-    for (key, size, _, index) in loaded {
+    let mut metrics_keys = Vec::with_capacity(metrics_cache.len());
+    for (key, size, modified) in metrics_cache {
+        if is_recent_result(&modified) {
+            removed.remove(caches[1], &key, StartupDamage::RecentResult, size as u64);
+            continue;
+        }
+        // Historical startup behavior: metrics results are readable by path,
+        // but only their separate metadata list is populated.
+        update_metrics(&key, size as i64, 0);
+        metrics_keys.push(key);
+    }
+    METRICS_RESULT_CACHE.write().await.extend(metrics_keys);
+    for (key, size, modified, index) in loaded {
         let files = caches[index];
+        if index != 0 && is_recent_result(&modified) {
+            removed.remove(files, &key, StartupDamage::RecentResult, size as u64);
+            continue;
+        }
         // Acquire metadata before the stripe, matching the deleter's lock order.
         // Metadata and index publication cannot race with eviction cleanup, and
         // skipped/oversized files never leave a query metadata entry behind.
@@ -1217,11 +1377,7 @@ async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow
                     continue;
                 }
             };
-            let size = if metadata.len() as usize == size {
-                size
-            } else {
-                metadata.len() as usize
-            };
+            let size = metadata.len() as usize;
             if size > files.max_size || files.max_size < 1024 {
                 log::debug!(
                     "[CacheType:{}] bypass loaded disk cache entry {key}: {size} bytes cannot fit capacity {} bytes in KiB weights",
@@ -1257,7 +1413,131 @@ async fn load(root_dir: &Path, caches: [&Arc<FileData>; 3]) -> Result<(), anyhow
     for files in caches {
         files.data.run_pending_tasks();
     }
+    removed.log(holes_reported);
+    for files in caches {
+        files.checked.store(true, Ordering::Release);
+    }
     Ok(())
+}
+
+/// Why the startup load deletes a file left by the previous run.
+#[derive(Clone, Copy, Debug)]
+enum StartupDamage {
+    /// Zero length: the rename reached the disk, the data did not.
+    Empty,
+    /// A range reads as zeros: written data that never reached the disk.
+    Hole,
+    /// The filesystem does not report holes, so a hole cannot be ruled out.
+    Unverifiable,
+    /// A result-tier file inside [`RESULT_RECENT_WINDOW`].
+    RecentResult,
+}
+
+#[derive(Default)]
+struct StartupRemovals {
+    empty: usize,
+    holes: usize,
+    unverifiable: usize,
+    recent_results: usize,
+    bytes: u64,
+    errors: usize,
+}
+
+impl StartupRemovals {
+    fn remove(&mut self, files: &FileData, key: &str, damage: StartupDamage, size: u64) {
+        match files.remove_unindexed(key) {
+            Ok(true) => {
+                self.bytes += size;
+                match damage {
+                    StartupDamage::Empty => self.empty += 1,
+                    StartupDamage::Hole => self.holes += 1,
+                    StartupDamage::Unverifiable => self.unverifiable += 1,
+                    StartupDamage::RecentResult => self.recent_results += 1,
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.errors += 1;
+                log::error!(
+                    "[CacheType:{}] remove {damage:?} cache file {key} at startup failed: {error}; it stays unloaded",
+                    files.file_type
+                );
+            }
+        }
+    }
+
+    fn log(&self, holes_reported: bool) {
+        log::info!(
+            "Loading disk cache checked files left by the previous run (holes reported: {holes_reported}): removed {} empty, {} with holes, {} unverifiable, {} recent result files, {} bytes; {} removal errors",
+            self.empty,
+            self.holes,
+            self.unverifiable,
+            self.recent_results,
+            self.bytes,
+            self.errors
+        );
+    }
+}
+
+/// Classify a file left by a previous run. After a power loss, ext4
+/// `data=ordered` and XFS leave a file shorter, or with ranges that read as
+/// zeros and are reported as holes; ranges reported as data hold what was
+/// written. Shorter files are caught on read (`exceeds_cached_size`, format
+/// checks). Complete cache files never have holes: `set` writes them densely
+/// and ranged downloads write every byte of their preallocation.
+fn startup_damage(path: &Path, holes_reported: bool) -> std::io::Result<Option<StartupDamage>> {
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(Some(StartupDamage::Empty));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        if !holes_reported {
+            return Ok(Some(StartupDamage::Unverifiable));
+        }
+        // SEEK_HOLE always finds the implicit hole at EOF; anything earlier is real.
+        let hole = super::block::lseek_whence(file.as_raw_fd(), 0, libc::SEEK_HOLE)?;
+        if hole.is_some_and(|offset| offset < len) {
+            return Ok(Some(StartupDamage::Hole));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = holes_reported;
+    Ok(None)
+}
+
+/// Self-test that every directory holding this tier's files reports holes.
+/// Without that, [`startup_damage`] cannot see zero ranges, so the startup
+/// load deletes every file left by the previous run instead of trusting it.
+#[cfg(unix)]
+fn reports_holes(root: &Path, multi_dir: &[String]) -> bool {
+    let mut dirs = vec![root.to_path_buf()];
+    dirs.extend(
+        multi_dir
+            .iter()
+            .map(|dir| root.join(dir))
+            .filter(|dir| dir.is_dir()),
+    );
+    dirs.iter()
+        .all(|dir| match super::block::hole_probe(dir) {
+            Ok(true) => true,
+            Ok(false) => {
+                log::warn!(
+                    "disk cache directory {} does not report holes (SEEK_DATA/SEEK_HOLE); files left by the previous run are deleted at startup",
+                    dir.display()
+                );
+                false
+            }
+            Err(error) => {
+                log::warn!(
+                    "disk cache hole self-test on {} failed: {error}; files left by the previous run are deleted at startup",
+                    dir.display()
+                );
+                false
+            }
+        })
 }
 
 #[inline]
@@ -1668,8 +1948,7 @@ mod tests {
 
         assert!(matches!(&error, object_store::Error::NotFound { .. }));
         assert!(
-            error.to_string().contains("starting at 8")
-                && error.to_string().contains("only 5 bytes"),
+            error.to_string().contains("exceeds cached size 5"),
             "{error}"
         );
         assert!(!exist(&file).await);
@@ -1763,16 +2042,78 @@ mod tests {
     }
 
     #[test]
-    fn disk_range_still_clamps_an_end_beyond_the_cached_file() {
-        assert_eq!(
-            resolve_get_range(
-                "files/default/traces/default/example.vxi",
-                Some(&GetRange::Bounded(4..20)),
-                10,
-            )
-            .unwrap(),
-            4..10
+    fn range_past_the_cached_end_is_detected() {
+        assert!(exceeds_cached_size(&GetRange::Bounded(4..11), 10));
+        assert!(exceeds_cached_size(&GetRange::Offset(10), 10));
+        assert!(!exceeds_cached_size(&GetRange::Bounded(4..10), 10));
+        assert!(!exceeds_cached_size(&GetRange::Offset(9), 10));
+        assert!(!exceeds_cached_size(&GetRange::Suffix(20), 10));
+        // Invalid ranges keep their Precondition error from `resolve_get_range`.
+        assert!(!exceeds_cached_size(&GetRange::Bounded(8..8), 10));
+    }
+
+    #[tokio::test]
+    async fn range_ending_past_a_short_entry_evicts_it() {
+        let file = unique_disk_range_test_key("short-end");
+        set(&file, Bytes::from_static(b"0123456789")).await.unwrap();
+        let path = get_file_path(&file).unwrap();
+
+        // A range inside the copy is served.
+        let result = get_opts(
+            &file,
+            GetOptions {
+                range: Some(GetRange::Bounded(2..10)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.range, 2..10);
+        // One that ends past it (start still inside) is a truncated copy:
+        // evicted, and the caller falls back instead of getting 8 bytes.
+        let error = match get_opts(
+            &file,
+            GetOptions {
+                range: Some(GetRange::Bounded(2..20)),
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("a range past the cached end unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, object_store::Error::NotFound { .. }),
+            "{error}"
         );
+        assert!(!exist(&file).await);
+        assert!(!Path::new(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn batched_ranges_past_a_short_entry_evict_it() {
+        let file = unique_disk_range_test_key("short-batch");
+        set(&file, Bytes::from_static(b"0123456789")).await.unwrap();
+        let path = get_file_path(&file).unwrap();
+
+        let read = get_ranges(&file, &[0..2, 8..10]).await.unwrap();
+        assert_eq!(
+            read,
+            vec![Bytes::from_static(b"01"), Bytes::from_static(b"89")]
+        );
+        let error = get_ranges(&file, &[0..2, 8..12]).await.unwrap_err();
+        assert!(
+            matches!(&error, object_store::Error::NotFound { .. }),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("exceeds cached size 10"),
+            "{error}"
+        );
+        assert!(!exist(&file).await);
+        assert!(!Path::new(&path).exists());
     }
 
     #[tokio::test]
@@ -2435,6 +2776,9 @@ mod tests {
     #[tokio::test]
     async fn load_orders_by_mtime_and_preserves_metrics_results_handling() {
         let data = test_cache(FileType::Data, 2 * 1024, "lru");
+        if !keeps_holes(data.root.path()) {
+            return;
+        }
         let results = FileData::with_capacity(
             FileType::Result,
             2 * 1024,
@@ -2463,20 +2807,24 @@ mod tests {
                 .open(&path)
                 .unwrap()
                 .set_times(std::fs::FileTimes::new().set_modified(
-                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100 + i as u64),
+                    SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100_000 + i as u64),
                 ))
                 .unwrap();
         }
         let metric_key = format!("metrics_results/load-{}/value", config::ider::generate());
-        let metric_path = data.get_file_path(&metric_key);
-        std::fs::create_dir_all(Path::new(&metric_path).parent().unwrap()).unwrap();
-        std::fs::write(&metric_path, b"metric").unwrap();
+        // Older than the previous run's last write by more than the recent
+        // window, so it is kept.
+        let metric_path = write_cache_file(&data, &metric_key, b"metric", 50);
         let abandoned = data.root.path().join("abandoned.tmp");
         std::fs::write(&abandoned, b"tmp").unwrap();
         let root = data.root.path().canonicalize().unwrap();
-        load(&root, [&data.files, &results, &aggregations])
-            .await
-            .unwrap();
+        load(
+            &root,
+            [&data.files, &results, &aggregations],
+            SystemTime::now(),
+        )
+        .await
+        .unwrap();
         data.quiesce().await;
         assert!(!data.exist(keys[0]).await);
         assert!(data.exist(keys[1]).await);
@@ -2491,6 +2839,215 @@ mod tests {
             .retain(|key| key != &metric_key);
         std::fs::remove_file(metric_path).unwrap();
         data.reconcile();
+    }
+
+    /// The startup check trusts files left by a previous run only on a
+    /// filesystem that keeps holes after writeback (ext4, XFS). On APFS it
+    /// deletes them all, so tests of adoption are skipped there.
+    fn keeps_holes(dir: &Path) -> bool {
+        #[cfg(unix)]
+        let keeps = crate::cache::file_data::block::hole_probe(dir).unwrap();
+        #[cfg(not(unix))]
+        let keeps = false;
+        // Linux test filesystems (ext4, XFS, overlayfs, tmpfs) keep holes; a
+        // failing probe there is a regression, not a reason to skip.
+        #[cfg(target_os = "linux")]
+        assert!(keeps, "{} must keep holes after writeback", dir.display());
+        if !keeps {
+            eprintln!(
+                "skipped: {} does not keep holes after writeback",
+                dir.display()
+            );
+        }
+        keeps
+    }
+
+    /// Write `bytes` at `key`'s path with an mtime of `secs` after the epoch.
+    fn write_cache_file(files: &FileData, key: &str, bytes: &[u8], secs: u64) -> String {
+        let path = files.get_file_path(key);
+        std::fs::create_dir_all(Path::new(&path).parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        set_mtime(&path, secs);
+        path
+    }
+
+    fn set_mtime(path: &str, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)),
+            )
+            .unwrap();
+    }
+
+    fn sibling_caches(data: &TestCache, capacity: usize) -> (Arc<FileData>, Arc<FileData>) {
+        let make = |file_type| {
+            FileData::with_capacity(
+                file_type,
+                capacity,
+                data.root_dir.clone(),
+                Vec::new(),
+                data.queue.sender.clone(),
+            )
+        };
+        (make(FileType::Result), make(FileType::Aggregation))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_removes_crash_damage_and_recent_results() {
+        let data = test_cache(FileType::Data, 64 << 20, "lru");
+        if !keeps_holes(data.root.path()) {
+            return;
+        }
+        let (results, aggregations) = sibling_caches(&data, 64 << 20);
+        let intact = "files/crash/logs/intact.parquet";
+        write_cache_file(&data, intact, &[7; 4096], 100_000);
+        // The rename reached the disk, the data did not.
+        let empty = "files/crash/logs/empty.parquet";
+        write_cache_file(&data, empty, b"", 100_000);
+        // The head reached the disk, the rest of the extent did not.
+        let holed = "files/crash/logs/holed.parquet";
+        let holed_path = write_cache_file(&data, holed, &[9; 4096], 100_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&holed_path)
+            .unwrap()
+            .set_len(4 << 20)
+            .unwrap();
+        set_mtime(&holed_path, 100_000);
+        // Result files: long before the previous run's last write, and
+        // inside the recent window, where a message-aligned cut could decode.
+        let id = config::ider::generate();
+        let old_result = format!(
+            "results/default/logs/default/crash-old-{id}/1744081170000000_1744081180000000_0_1.json"
+        );
+        write_cache_file(&results, &old_result, b"{\"old\":1}", 99_000);
+        let recent_result = format!(
+            "results/default/logs/default/crash-new-{id}/1744081170000000_1744081180000000_0_1.json"
+        );
+        let recent_path = write_cache_file(&results, &recent_result, b"{\"new\":1}", 99_940);
+        let recent_metric = format!("metrics_results/crash-{id}/value");
+        let recent_metric_path = write_cache_file(&results, &recent_metric, b"metric", 99_990);
+        // Files this run published while the scan ran (mtime after `started`),
+        // seen before their index insert: loaded as usual, and they do not
+        // move the recent window off the previous run's last write.
+        let fresh = "files/crash/logs/fresh.parquet";
+        write_cache_file(&data, fresh, &[5; 4096], 200_000);
+        let fresh_result = format!(
+            "results/default/logs/default/crash-fresh-{id}/1744081170000000_1744081180000000_0_1.json"
+        );
+        write_cache_file(&results, &fresh_result, b"{\"fresh\":1}", 200_000);
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100_500);
+        // Another tier's sparse file under the same root is not judged here.
+        let block_file = data
+            .root
+            .path()
+            .join("blocks/files/crash/logs/sparse.parquet");
+        std::fs::create_dir_all(block_file.parent().unwrap()).unwrap();
+        std::fs::File::create(&block_file)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+
+        let root = data.root.path().canonicalize().unwrap();
+        assert!(!data.checked.load(Ordering::Acquire));
+        load(&root, [&data.files, &results, &aggregations], started)
+            .await
+            .unwrap();
+        data.quiesce().await;
+
+        assert!(data.checked.load(Ordering::Acquire));
+        assert!(results.checked.load(Ordering::Acquire));
+        assert!(data.exist(intact).await);
+        assert_eq!(
+            data.get(intact, None).await.unwrap(),
+            Bytes::from_static(&[7; 4096])
+        );
+        for key in [empty, holed] {
+            assert!(!data.exist(key).await, "{key}");
+            assert!(!Path::new(&data.get_file_path(key)).exists(), "{key}");
+        }
+        assert!(results.data.contains_key(&old_result));
+        assert!(!results.data.contains_key(&recent_result));
+        assert!(!Path::new(&recent_path).exists());
+        assert!(!Path::new(&recent_metric_path).exists());
+        assert!(!METRICS_RESULT_CACHE.read().await.contains(&recent_metric));
+        assert!(data.exist(fresh).await);
+        assert!(results.data.contains_key(&fresh_result));
+        assert!(block_file.exists());
+        for key in [&old_result, &fresh_result] {
+            let (_, _, query_key, _) = parse_result_cache_key(key).unwrap();
+            QUERY_RESULT_CACHE.write().await.remove(&query_key);
+        }
+    }
+
+    #[tokio::test]
+    async fn reads_serve_only_published_keys_until_the_startup_check() {
+        let data = test_cache(FileType::Data, 1 << 20, "lru");
+        if !keeps_holes(data.root.path()) {
+            return;
+        }
+        let (results, aggregations) = sibling_caches(&data, 1 << 20);
+        let left = "files/gate/logs/left-by-previous-run";
+        write_cache_file(&data, left, b"previous", 100_000);
+        assert!(data.get(left, None).await.is_none());
+        assert!(data.get_size(left).await.is_none());
+        let error = match get_opts_from(&data, left, GetOptions::default()).await {
+            Ok(_) => panic!("an unchecked file was served"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, object_store::Error::NotFound { .. }),
+            "{error}"
+        );
+        #[cfg(unix)]
+        assert!(matches!(
+            get_ranges_from(&data, left, std::slice::from_ref(&(0..2))).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+        // Keys this process published are indexed and served at once.
+        let published = "files/gate/logs/published";
+        data.put(published, b"fresh").await;
+        assert_eq!(
+            data.get(published, None).await.unwrap(),
+            Bytes::from_static(b"fresh")
+        );
+
+        let root = data.root.path().canonicalize().unwrap();
+        load(
+            &root,
+            [&data.files, &results, &aggregations],
+            SystemTime::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            data.get(left, None).await.unwrap(),
+            Bytes::from_static(b"previous")
+        );
+        assert_eq!(data.get_size(left).await, Some(8));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn without_hole_reporting_every_file_is_unverifiable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, [1u8; 4096]).unwrap();
+        assert!(startup_damage(&path, true).unwrap().is_none());
+        assert!(matches!(
+            startup_damage(&path, false).unwrap(),
+            Some(StartupDamage::Unverifiable)
+        ));
+        std::fs::write(&path, b"").unwrap();
+        assert!(matches!(
+            startup_damage(&path, true).unwrap(),
+            Some(StartupDamage::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -276,6 +276,23 @@ async fn range_content_matches_legacy_and_handles_partial_last_segment() {
             Sha1::digest(std::fs::read(&path).unwrap()),
             Sha1::digest(&expected)
         );
+        // The disk tier's startup check deletes any cache file with a hole,
+        // so a complete download must have written its whole preallocation.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let written = std::fs::File::open(&path).unwrap();
+            assert_eq!(
+                crate::cache::file_data::block::lseek_whence(
+                    written.as_raw_fd(),
+                    0,
+                    libc::SEEK_HOLE
+                )
+                .unwrap(),
+                Some(size as u64),
+                "a complete ranged download has no hole before EOF"
+            );
+        }
         assert!(store.peak.load(Ordering::SeqCst) <= options.concurrency);
         assert_eq!(store.active.load(Ordering::SeqCst), 0);
         assert!(store.attempts.lock().values().all(|&count| count == 1));
