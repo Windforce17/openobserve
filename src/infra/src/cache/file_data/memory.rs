@@ -205,11 +205,13 @@ impl FileData {
             return Ok(SetTransition::default());
         }
 
-        // Moka applies writes lazily. One pass bounds overshoot without reviving
+        // Moka applies writes lazily. Maintenance bounds overshoot without reviving
         // the old synchronous, release-size-based whole-cache garbage collection.
         // Single-flight: concurrent writers must not queue on moka's lock.
-        if self.accounting.used_bytes() > self.total_bytes {
-            self.maintenance.try_run(|| self.cache.run_pending_tasks());
+        let over_capacity = || self.accounting.used_bytes() > self.total_bytes;
+        if over_capacity() {
+            self.maintenance
+                .run_while(over_capacity, || self.cache.run_pending_tasks());
         }
 
         Ok(SetTransition {

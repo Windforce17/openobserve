@@ -53,22 +53,32 @@ pub enum CacheType {
 /// Lets the write path bound moka's lazy-eviction overshoot without queueing
 /// writers: moka's explicit `run_pending_tasks` waits on a blocking lock, so
 /// concurrent writers on a full cache would serialize behind it on tokio
-/// worker threads. At most one caller runs a pass; the others return at once.
-/// Their writes are applied by that pass or the next one, and moka also runs
-/// maintenance on later reads and writes.
+/// worker threads. At most one caller runs passes; the others record a request
+/// and return at once.
+///
+/// The running caller repeats the pass while a request is pending or the
+/// cache is still over capacity. Both are needed for the cache to converge
+/// when no later write arrives: a request can come after the running pass
+/// drained moka's write log, and one moka pass is bounded (100 ms, 4 x 64
+/// write-log entries, 384 evictions). Without this, an idle cache could stay
+/// above its capacity.
 #[derive(Default)]
-struct MaintenanceGate(AtomicBool);
+struct MaintenanceGate {
+    running: AtomicBool,
+    requested: AtomicBool,
+}
+
+/// Upper bound of passes per call, so that one writer does not block its
+/// worker thread for long. The next writer continues if the cache still
+/// needs maintenance.
+const MAINTENANCE_MAX_PASSES: usize = 8;
 
 impl MaintenanceGate {
-    /// Runs `pass` unless another caller is running one. Returns whether it ran.
-    fn try_run(&self, pass: impl FnOnce()) -> bool {
-        if self
-            .0
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            return false;
-        }
+    /// Requests maintenance. If no other caller is running passes, runs `pass`
+    /// while a request is pending or `needed()` holds, at most
+    /// [`MAINTENANCE_MAX_PASSES`] times. All callers of one gate must supply
+    /// the same pass. Returns the number of passes this caller ran.
+    fn run_while(&self, needed: impl Fn() -> bool, pass: impl Fn()) -> usize {
         // Reopen the gate even if the pass panics.
         struct Reopen<'a>(&'a AtomicBool);
         impl Drop for Reopen<'_> {
@@ -76,9 +86,32 @@ impl MaintenanceGate {
                 self.0.store(false, Ordering::Release);
             }
         }
-        let _reopen = Reopen(&self.0);
-        pass();
-        true
+
+        self.requested.store(true, Ordering::Release);
+        let mut passes = 0;
+        loop {
+            if self
+                .running
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                // The running caller sees the request after its current pass.
+                return passes;
+            }
+            let reopen = Reopen(&self.running);
+            while passes < MAINTENANCE_MAX_PASSES
+                && (self.requested.swap(false, Ordering::AcqRel) || needed())
+            {
+                pass();
+                passes += 1;
+            }
+            drop(reopen);
+            // A request made after the last check saw `running` set and
+            // returned, so it must be served here.
+            if passes >= MAINTENANCE_MAX_PASSES || !self.requested.load(Ordering::Acquire) {
+                return passes;
+            }
+        }
     }
 }
 
@@ -1120,34 +1153,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn maintenance_gate_skips_concurrent_callers_and_reopens() {
-        let gate = std::sync::Arc::new(MaintenanceGate::default());
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    fn maintenance_gate_serves_requests_made_during_a_pass() {
+        use std::sync::{Arc, atomic::AtomicUsize, mpsc};
+
+        let gate = Arc::new(MaintenanceGate::default());
+        let passes = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         let runner = {
-            let gate = std::sync::Arc::clone(&gate);
+            let gate = Arc::clone(&gate);
+            let passes = Arc::clone(&passes);
             std::thread::spawn(move || {
-                gate.try_run(|| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
+                gate.run_while(
+                    || false,
+                    || {
+                        if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv().unwrap();
+                        }
+                    },
+                )
             })
         };
         entered_rx.recv().unwrap();
-        // A second writer must not wait for the running pass.
-        let mut ran = false;
-        assert!(!gate.try_run(|| ran = true));
-        assert!(!ran);
+        // A second writer must not wait for the running pass ...
+        let ran = AtomicUsize::new(0);
+        let own = gate.run_while(
+            || false,
+            || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(own, 0);
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
         release_tx.send(()).unwrap();
-        assert!(runner.join().unwrap());
-        assert!(gate.try_run(|| ran = true));
-        assert!(ran);
+        // ... and the running caller serves its request with one more pass, even
+        // though the request came after that caller's pass drained the log.
+        assert_eq!(runner.join().unwrap(), 2);
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        // Without a pending request or need, a call runs only its own pass.
+        assert_eq!(gate.run_while(|| false, || {}), 1);
+    }
+
+    #[test]
+    fn maintenance_gate_repeats_while_needed_up_to_the_bound() {
+        use std::sync::atomic::AtomicUsize;
+
+        let gate = MaintenanceGate::default();
+        // One moka pass is bounded, so passes repeat until capacity is met.
+        let remaining = AtomicUsize::new(3);
+        let passes = gate.run_while(
+            || remaining.load(Ordering::SeqCst) > 0,
+            || {
+                remaining.fetch_sub(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(passes, 3);
+        // A pass that makes no progress stops at the bound.
+        assert_eq!(gate.run_while(|| true, || {}), MAINTENANCE_MAX_PASSES);
         // A panicking pass must not leave maintenance disabled forever.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            gate.try_run(|| panic!("maintenance pass failed"))
+            gate.run_while(|| false, || panic!("maintenance pass failed"))
         }));
         assert!(result.is_err());
-        assert!(gate.try_run(|| {}));
+        assert_eq!(gate.run_while(|| false, || {}), 1);
     }
 
     #[test]

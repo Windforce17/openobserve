@@ -521,10 +521,12 @@ impl FileData {
     }
 
     fn enforce_capacity(&self) {
-        if self.used_bytes.load(Ordering::Relaxed) > self.max_size {
-            // One pass bounds overshoot to in-flight inserts without blocking on IO.
-            // Single-flight: concurrent writers must not queue on moka's lock.
-            self.maintenance.try_run(|| self.data.run_pending_tasks());
+        let over_capacity = || self.used_bytes.load(Ordering::Relaxed) > self.max_size;
+        if over_capacity() {
+            // Passes do no IO: the listener only queues unlinks. Single-flight:
+            // concurrent writers must not queue on moka's lock.
+            self.maintenance
+                .run_while(over_capacity, || self.data.run_pending_tasks());
         }
     }
 
@@ -3155,6 +3157,53 @@ mod tests {
         })
         .await
         .expect("concurrent disk cache operations deadlocked");
+        cache.reconcile();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_during_a_drained_pass_is_applied_before_the_cache_idles() {
+        // E2E B1 (perf5run1) found an idle cache 0.7% over capacity: a writer
+        // found maintenance running after that pass had drained the write log,
+        // so its insert stayed pending until some later operation.
+        let cache = test_cache(FileType::Data, 4 * 1024, "lru");
+        for i in 0..4 {
+            cache
+                .put(&format!("files/pass/logs/test/{i}"), &[1u8; 1024])
+                .await;
+        }
+        cache.data.run_pending_tasks();
+        assert_eq!(cache.size().1, 4 * 1024);
+
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let files = cache.files.clone();
+        let holder = std::thread::spawn(move || {
+            let first = AtomicBool::new(true);
+            files.maintenance.run_while(
+                || files.used_bytes.load(Ordering::Relaxed) > files.max_size,
+                || {
+                    files.data.run_pending_tasks();
+                    if first.swap(false, Ordering::SeqCst) {
+                        drained_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+        drained_rx.recv().unwrap();
+        // Over capacity while the drained pass still holds the gate.
+        cache.put("files/pass/logs/test/4", &[1u8; 1024]).await;
+        assert!(cache.size().1 > cache.max_size);
+        release_tx.send(()).unwrap();
+        assert_eq!(holder.join().unwrap(), 2);
+
+        // No further operation: the holder must have applied the write.
+        let (max, used) = cache.size();
+        assert!(
+            used <= max,
+            "idle cache over capacity: used {used} > max {max}"
+        );
+        cache.quiesce().await;
         cache.reconcile();
     }
 }
