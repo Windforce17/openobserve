@@ -127,6 +127,19 @@ pub fn global() -> Option<&'static Arc<BlockCache>> {
     GLOBAL.get()
 }
 
+/// Stop the fill writers of the process-wide tier. They are blocking-pool
+/// tasks of the runtime that ran [`init`], and dropping a runtime waits for
+/// its blocking tasks; [`GLOBAL`] is never dropped, so [`BlockCache`]'s
+/// `Drop` never closes their queue. Each writer finishes the fill it is
+/// writing and exits; queued fills are dropped unwritten (their blocks stay
+/// holes, which a restart never adopts). Call it once nothing reads through
+/// the tier any more, before that runtime is dropped.
+pub fn shutdown() {
+    if let Some(cache) = GLOBAL.get() {
+        cache.fills.close();
+    }
+}
+
 pub async fn init() -> Result<(), anyhow::Error> {
     let cfg = get_config();
     if !cfg.disk_cache.enabled || !cfg.disk_cache.block_enabled {
@@ -1754,6 +1767,52 @@ mod tests {
     }
 
     const KEY: &str = "files/org/logs/stream/2026/10/08/11/a.vix";
+
+    /// The server keeps the tier in [`GLOBAL`], so it outlives the runtime
+    /// that owns its fill writers: that runtime can only shut down after
+    /// [`shutdown`] closes the queue. A fill written before stays served.
+    #[test]
+    fn closing_the_fill_queue_lets_the_owning_runtime_shut_down() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        let cache = rt.block_on(async {
+            let cache = cache(dir.path(), 1 << 30);
+            cache
+                .read_through(KEY, 0..1000, None, &fetch)
+                .await
+                .unwrap();
+            settle(&cache).await;
+            cache
+        });
+
+        cache.fills.close();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(rt);
+            dropped_tx.send(()).ok();
+        });
+        assert!(
+            dropped_rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "dropping the runtime still waits on the fill writers"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let read = rt
+            .block_on(cache.read_through(KEY, 0..1000, None, &fetch))
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Hit);
+        assert_eq!(read.bytes, remote.data.slice(0..1000));
+        assert_eq!(remote.calls(), 1);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_read_fills_aligned_blocks_then_hits() {

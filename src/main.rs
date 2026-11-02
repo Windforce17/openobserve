@@ -375,6 +375,9 @@ async fn run() -> Result<(), anyhow::Error> {
             // flush db
             let db = infra::db::get_db().await;
             _ = db.close().await;
+            // The block tier's fill writers block this runtime's drop until
+            // their queue is closed; nothing reads through the tier now.
+            infra::cache::file_data::block::shutdown();
         });
     });
 
