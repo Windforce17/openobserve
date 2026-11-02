@@ -60,6 +60,48 @@ pub(crate) fn warm_cache_type(compressed_size: i64) -> file_data::CacheType {
     }
 }
 
+/// Queries read `files/` objects by range, and the block tier caches exactly
+/// those ranges. A query-triggered whole-object download of a large object into
+/// the disk tier therefore only re-fetches bytes the block tier already serves.
+/// Small objects keep the whole-object download: one GET is cheaper than
+/// several ranged reads. "Small" is the same definition as the `DemandSmall`
+/// download class. The memory tier and disk-only setups without a block tier
+/// keep the whole-object download, because nothing else would cache the object.
+fn leaves_to_block_tier(
+    cache_type: file_data::CacheType,
+    key: &str,
+    size: i64,
+    block_tier_active: bool,
+    small_object_bytes: usize,
+) -> bool {
+    let small = size > 0 && (size as u64) <= small_object_bytes as u64;
+    cache_type == file_data::CacheType::Disk
+        && block_tier_active
+        && key.starts_with("files/")
+        && !small
+}
+
+fn leave_to_block_tier(cache_type: file_data::CacheType, key: &str, size: i64) -> bool {
+    leaves_to_block_tier(
+        cache_type,
+        key,
+        size,
+        file_data::block::global().is_some(),
+        get_config().limit.file_download_small_object_bytes,
+    )
+}
+
+fn record_block_tier_skip(class: &str, size: i64) {
+    if get_config().limit.file_download_ledger_enabled {
+        config::metrics::FILE_DOWNLOAD_LEDGER_EVENTS
+            .with_label_values(&[class, "block_tier"])
+            .inc();
+        config::metrics::FILE_DOWNLOAD_LEDGER_BYTES
+            .with_label_values(&[class, "block_tier"])
+            .inc_by(size.max(0) as u64);
+    }
+}
+
 /// Admit only a sidecar the chosen foreground path actually used. The downloader
 /// retains its count/byte/dedup/age/size gates and independent admitted ownership.
 pub(crate) async fn warm_used_sidecar(
@@ -77,6 +119,14 @@ pub(crate) async fn warm_used_sidecar(
         return;
     };
     file_downloader::note_query_activity();
+    if leave_to_block_tier(cache_type, &key, file.meta.index_size) {
+        record_block_tier_skip("used_sidecar", file.meta.index_size);
+        log::debug!(
+            "[trace_id {trace_id}] search->vix: used sidecar left to block tier file={key} size={}",
+            file.meta.index_size
+        );
+        return;
+    }
     let outcome = file_downloader::queue_download_class(
         trace_id,
         file.id,
@@ -194,6 +244,8 @@ pub(crate) async fn cache_files_with_policy(
     let mut cached = 0usize;
     let mut rejected = 0usize;
     let mut rejected_bytes = 0u64;
+    let mut block_tier = 0usize;
+    let mut block_tier_bytes = 0u64;
     for (id, account, file, size, ts, records) in files {
         if cached_files.contains(file) {
             cached += 1;
@@ -201,6 +253,14 @@ pub(crate) async fn cache_files_with_policy(
         }
         if !file_downloader::should_download(*records) {
             skipped += 1;
+            continue;
+        }
+        // Checked before the per-query quota so that objects left to the block
+        // tier do not use up the quota of small objects in the same query.
+        if leave_to_block_tier(cache_type, file, *size) {
+            block_tier += 1;
+            block_tier_bytes = block_tier_bytes.saturating_add((*size).max(0) as u64);
+            record_block_tier_skip("query_bulk", *size);
             continue;
         }
         if !admission.allows((*size).max(0) as usize) {
@@ -246,7 +306,7 @@ pub(crate) async fn cache_files_with_policy(
         }
     }
     log::info!(
-        "[trace_id {trace_id}] search->storage: background download admission file_type={file_type} cache={cache_type:?} accepted={accepted} accepted_bytes={accepted_bytes} deduplicated={deduplicated} skipped={skipped} cached={cached} rejected={rejected} rejected_bytes={rejected_bytes}"
+        "[trace_id {trace_id}] search->storage: background download admission file_type={file_type} cache={cache_type:?} accepted={accepted} accepted_bytes={accepted_bytes} deduplicated={deduplicated} skipped={skipped} cached={cached} rejected={rejected} rejected_bytes={rejected_bytes} block_tier={block_tier} block_tier_bytes={block_tier_bytes}"
     );
 
     if scan_stats.querier_memory_cached_files + scan_stats.querier_disk_cached_files < files_num / 2
@@ -286,7 +346,75 @@ impl QueryAdmission {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryAdmission, calc_target_partitions};
+    use infra::cache::file_data::CacheType;
+
+    use super::{QueryAdmission, calc_target_partitions, leaves_to_block_tier};
+
+    #[test]
+    fn large_files_objects_are_left_to_the_block_tier_only_on_disk_with_blocks() {
+        const SMALL: usize = 8 << 20;
+        let data = "files/default/logs/app/2026/11/02/01/a.vix";
+        let sidecar = "files/default/logs/app/2026/11/02/01/a.vxi";
+        let large = SMALL as i64 + 1;
+
+        assert!(leaves_to_block_tier(
+            CacheType::Disk,
+            data,
+            large,
+            true,
+            SMALL
+        ));
+        assert!(leaves_to_block_tier(
+            CacheType::Disk,
+            sidecar,
+            large,
+            true,
+            SMALL
+        ));
+        // Unknown sizes are not small, which matches the DemandSmall class rule.
+        assert!(leaves_to_block_tier(CacheType::Disk, data, 0, true, SMALL));
+        assert!(leaves_to_block_tier(CacheType::Disk, data, -1, true, SMALL));
+
+        // Small objects keep the whole-object download, including the boundary.
+        assert!(!leaves_to_block_tier(
+            CacheType::Disk,
+            data,
+            SMALL as i64,
+            true,
+            SMALL
+        ));
+        assert!(!leaves_to_block_tier(CacheType::Disk, data, 1, true, SMALL));
+        // Nothing else caches the object without a disk block tier.
+        assert!(!leaves_to_block_tier(
+            CacheType::Disk,
+            data,
+            large,
+            false,
+            SMALL
+        ));
+        assert!(!leaves_to_block_tier(
+            CacheType::Memory,
+            data,
+            large,
+            true,
+            SMALL
+        ));
+        assert!(!leaves_to_block_tier(
+            CacheType::None,
+            data,
+            large,
+            true,
+            SMALL
+        ));
+        // The block tier serves only `files/` keys.
+        assert!(!leaves_to_block_tier(
+            CacheType::Disk,
+            "wal_segments/node/00000000000000000001",
+            large,
+            true,
+            SMALL
+        ));
+    }
 
     #[test]
     fn query_admission_file_and_byte_limits_count_only_accepted() {
