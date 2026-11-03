@@ -825,6 +825,21 @@ fn release_unlink(unlinking: &Mutex<HashMap<Arc<str>, usize>>, key: &str) {
     }
 }
 
+/// One pending unlink of `key`, registered with [`Bucket::pend_unlink`] and
+/// released when this is dropped: after the remove ran, or when the unlink
+/// task panics or never runs (a shut-down runtime drops it unstarted). The
+/// remove can then no longer run, so a new entry for the key is safe.
+struct PendingUnlink {
+    unlinking: Arc<Mutex<HashMap<Arc<str>, usize>>>,
+    key: Arc<str>,
+}
+
+impl Drop for PendingUnlink {
+    fn drop(&mut self) {
+        release_unlink(&self.unlinking, &self.key);
+    }
+}
+
 struct Index {
     entries: HashMap<Arc<str>, Arc<Entry>>,
     order: CacheStrategy,
@@ -842,6 +857,17 @@ struct State {
     bits: Vec<u64>,
     present_bytes: u64,
     evicted: bool,
+}
+
+/// A file found at startup and scanned for adoption, with the open handle
+/// of the inode the scan read.
+struct Adoption {
+    key: Arc<str>,
+    path: PathBuf,
+    file: std::fs::File,
+    object_size: u64,
+    bits: Vec<u64>,
+    present_bytes: u64,
 }
 
 impl Entry {
@@ -1089,8 +1115,8 @@ impl BlockCache {
     /// object once its size is known), the fetched runs queued for the fill
     /// writers behind the read. `requested.end` past the object end is
     /// clipped like `GetRange::as_range`; a start at or past it is
-    /// `NotFound`. `owner` is held through the blocking IO, the fill's write
-    /// included.
+    /// `NotFound`. `owner` is held until the read returns (a remote fallback
+    /// included) and through the blocking IO, the fill's write included.
     pub async fn read_through(
         &self,
         key: &str,
@@ -1247,8 +1273,11 @@ impl BlockCache {
         }
         let bytes = if plans.iter().any(|plan| plan.unserved().is_some()) {
             let reader = Arc::clone(&entry);
+            // A clone covers the blocking read even if this future is
+            // dropped; `owner` itself stays held through a remote fallback.
+            let read_owner = owner.clone();
             let (read, plans, evicted) = tokio::task::spawn_blocking(move || {
-                let _owner = owner;
+                let _owner = read_owner;
                 let read = read_plans(&reader.path, &plans);
                 // Checked after the read: the path names this entry's file
                 // only until its eviction schedules the unlink. Once the
@@ -1465,16 +1494,25 @@ impl BlockCache {
 
     /// Index one file found at startup; returns whether it became an entry.
     fn adopt_file(&self, key: &str, path: &Path) -> bool {
+        self.scan_adoption(key, path)
+            .is_some_and(|adoption| self.publish_adoption(adoption))
+    }
+
+    /// Reconstruct the present blocks of a file found at startup, off the
+    /// index lock. `None` when a live entry owns the key or the file is not
+    /// adoptable (then it is removed).
+    fn scan_adoption(&self, key: &str, path: &Path) -> Option<Adoption> {
         let bucket = self.bucket(key);
         if bucket.index.read().entries.contains_key(key) {
-            return false;
+            return None;
         }
         // Not ours, torn (a hole where a block was half written), written
         // with another block size, or unreadable: remove it.
-        let adopted = std::fs::File::open(path).ok().and_then(|file| {
+        let scanned = std::fs::File::open(path).ok().and_then(|file| {
             #[cfg(unix)]
             {
-                present_blocks(&file, self.block_size).ok()
+                let blocks = present_blocks(&file, self.block_size).ok()?;
+                Some((file, blocks))
             }
             #[cfg(not(unix))]
             {
@@ -1482,18 +1520,45 @@ impl BlockCache {
                 None
             }
         });
-        let Some((object_size, bits, present_bytes)) = adopted else {
+        let Some((file, (object_size, bits, present_bytes))) = scanned else {
             remove_unowned(bucket, key, path, "invalid");
-            return false;
+            return None;
         };
         if object_size == 0 || present_bytes == 0 {
             remove_unowned(bucket, key, path, "empty");
-            return false;
+            return None;
         }
-        let key: Arc<str> = Arc::from(key);
+        Some(Adoption {
+            key: Arc::from(key),
+            path: path.to_path_buf(),
+            file,
+            object_size,
+            bits,
+            present_bytes,
+        })
+    }
+
+    /// Publish a scanned file as an entry; returns whether it became one.
+    /// The scan read the inode it opened, while the path may have moved on:
+    /// an eviction of an entry created meanwhile, or a late fill's orphan
+    /// cleanup, can unlink it and finish before this runs, leaving no pending
+    /// unlink behind. Every unlink of a cache path is registered under the
+    /// index write lock before it runs, and nothing else links or renames
+    /// files in the root, so with the lock held, no pending unlink and the
+    /// opened inode still linked mean the path still names the scanned file.
+    fn publish_adoption(&self, adoption: Adoption) -> bool {
+        let Adoption {
+            key,
+            path,
+            file,
+            object_size,
+            bits,
+            present_bytes,
+        } = adoption;
+        let bucket = self.bucket(&key);
         let entry = Arc::new(Entry {
             key: Arc::clone(&key),
-            path: path.to_path_buf(),
+            path,
             object_size,
             block_size: self.block_size,
             state: Mutex::new(State {
@@ -1503,12 +1568,14 @@ impl BlockCache {
             }),
         });
         let mut index = bucket.index.write();
-        if index.entries.contains_key(&*key) || bucket.unlink_pending(&key) {
+        if index.entries.contains_key(&*key) || bucket.unlink_pending(&key) || !still_linked(&file)
+        {
             return false;
         }
         index.order.insert(key.to_string(), 0);
         index.entries.insert(Arc::clone(&key), entry);
         drop(index);
+        drop(file);
         bucket.cur_size.fetch_add(present_bytes, Ordering::Relaxed);
         let [org, stream_type] = key_labels(&key);
         metrics::QUERY_DISK_BLOCK_CACHE_FILES
@@ -1723,6 +1790,18 @@ fn remove_unowned(bucket: &Bucket, key: &str, path: &Path, what: &str) {
     release_unlink(&bucket.unlinking, &key);
 }
 
+/// Whether the opened file still has a directory entry.
+#[cfg(unix)]
+fn still_linked(file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().is_ok_and(|meta| meta.nlink() > 0)
+}
+
+#[cfg(not(unix))]
+fn still_linked(_file: &std::fs::File) -> bool {
+    false
+}
+
 /// Remove the cache files of `entries` on the blocking pool, then release
 /// their keys from `bucket`'s pending unlinks. The caller registered them
 /// with [`Bucket::pend_unlinks`] in the critical section that took them out
@@ -1731,13 +1810,18 @@ fn unlink_later(bucket: &Bucket, entries: Vec<Arc<Entry>>) {
     if entries.is_empty() {
         return;
     }
-    let unlinking = Arc::clone(&bucket.unlinking);
-    let files: Vec<(Arc<str>, PathBuf)> = entries
+    let files: Vec<(PendingUnlink, PathBuf)> = entries
         .iter()
-        .map(|e| (Arc::clone(&e.key), e.path.clone()))
+        .map(|e| {
+            let pending = PendingUnlink {
+                unlinking: Arc::clone(&bucket.unlinking),
+                key: Arc::clone(&e.key),
+            };
+            (pending, e.path.clone())
+        })
         .collect();
     tokio::task::spawn_blocking(move || {
-        for (key, path) in files {
+        for (pending, path) in files {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -1746,7 +1830,7 @@ fn unlink_later(bucket: &Bucket, entries: Vec<Arc<Entry>>) {
             // Released after a failed remove too: a file left in place keeps
             // the object's own bytes, and a new entry serves only the blocks
             // it writes itself.
-            release_unlink(&unlinking, &key);
+            drop(pending);
         }
     });
 }
@@ -2112,6 +2196,173 @@ mod tests {
             read.bytes[1].iter().filter(|b| **b == 0).count(),
             read.bytes[1].len()
         );
+    }
+
+    /// Startup loading scans a file off the index lock. Here the entry that
+    /// owned the file is evicted, the scan reads the file, and the unlink
+    /// finishes before the scan is published: the scanned bits describe a
+    /// deleted inode. Published, they would let a later fill recreate the
+    /// path with holes where those bits claim data. They must be dropped.
+    #[test]
+    fn a_scan_whose_file_was_unlinked_meanwhile_is_not_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        // As above: holding the last blocking thread queues the unlink.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(FILL_WRITERS + 1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let size = 64 * BS;
+        let tail = size - 12 * BS..size;
+        let remote = Remote::new(size as usize);
+        let fetch = remote.fetcher();
+        let want = remote.data.slice(tail.start as usize..tail.end as usize);
+        rt.block_on(async {
+            let cache = cache(dir.path(), 1 << 30);
+            let path = cache.path_for(KEY);
+            cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            settle(&cache).await;
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            started_rx.await.unwrap();
+            cache.evict(cache.bucket(KEY), u64::MAX);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                path.exists(),
+                "the unlink must still be queued for this test to reproduce the race"
+            );
+            let adoption = cache
+                .scan_adoption(KEY, &path)
+                .expect("the file with the tail is adoptable");
+
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            wait_gone(&path).await;
+            for _ in 0..200 {
+                if !cache.bucket(KEY).unlink_pending(KEY) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                !cache.bucket(KEY).unlink_pending(KEY),
+                "the eviction's unlink did not finish"
+            );
+            assert!(
+                !cache.publish_adoption(adoption),
+                "the scan of an unlinked file was adopted"
+            );
+            assert!(cache.get_entry(KEY).is_none());
+
+            // The key caches again from scratch: a head fill recreates the
+            // file, and the tail is the object's, not that file's holes.
+            let head = cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            assert_eq!(head.bytes, remote.data.slice(0..BS as usize));
+            settle(&cache).await;
+            let read = cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            assert!(
+                read.bytes == want,
+                "tail does not match the object ({} of {} bytes are zero)",
+                read.bytes.iter().filter(|b| **b == 0).count(),
+                read.bytes.len()
+            );
+        });
+    }
+
+    /// The caller's `owner` holds its fetch permit. A read whose local read
+    /// failed falls back to object storage, and that fetch must still run
+    /// under the owner; the owner is released once the read returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_fallback_runs_under_the_readers_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+        settle(&cache).await;
+        // The block is present, but the file is gone: the read plans it from
+        // the file, fails with NotFound and falls back.
+        std::fs::remove_file(cache.path_for(KEY)).unwrap();
+
+        let owner: Arc<dyn Send + Sync> = Arc::new(());
+        let alive = Arc::downgrade(&owner);
+        let fallbacks = Arc::new(AtomicUsize::new(0));
+        let checking = {
+            let inner = remote.fetcher();
+            let (alive, fallbacks) = (alive.clone(), Arc::clone(&fallbacks));
+            move |range: Range<u64>| -> FetchFuture {
+                assert!(
+                    alive.upgrade().is_some(),
+                    "the remote fallback runs after the owner was released"
+                );
+                fallbacks.fetch_add(1, Ordering::Relaxed);
+                inner(range)
+            }
+        };
+        let read = cache
+            .read_through(KEY, 0..BS, Some(owner), &checking)
+            .await
+            .unwrap();
+        assert_eq!(read.bytes, remote.data.slice(0..BS as usize));
+        assert_eq!(fallbacks.load(Ordering::Relaxed), 1);
+        assert!(alive.upgrade().is_none(), "the owner outlived the read");
+    }
+
+    /// A pending unlink whose task never runs - here it cannot even be
+    /// spawned, outside any runtime - releases its key: the remove can no
+    /// longer happen, and the key must not stay uncacheable.
+    #[test]
+    fn an_unlink_that_never_runs_releases_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let remote = Remote::new(1 << 20);
+        let fetch = remote.fetcher();
+        let cache = rt.block_on(async {
+            let cache = cache(dir.path(), 1 << 30);
+            cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            settle(&cache).await;
+            cache
+        });
+        let path = cache.path_for(KEY);
+
+        let spawned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.evict(cache.bucket(KEY), u64::MAX);
+        }));
+        assert!(
+            spawned.is_err(),
+            "the unlink must fail to spawn off the runtime"
+        );
+        assert!(cache.get_entry(KEY).is_none());
+        assert!(
+            !cache.bucket(KEY).unlink_pending(KEY),
+            "an unlink that never ran left its key pending"
+        );
+        assert!(path.exists(), "the unlink never ran, so the file stays");
+
+        rt.block_on(async {
+            let cold = cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            assert_eq!(cold.outcome, Outcome::Miss);
+            settle(&cache).await;
+            let warm = cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            assert_eq!(warm.outcome, Outcome::Hit);
+            assert_eq!(warm.bytes, remote.data.slice(0..BS as usize));
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
