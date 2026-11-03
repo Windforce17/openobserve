@@ -48,6 +48,17 @@ pub enum VixReadMode {
     Ranged,
 }
 
+/// The last route attempted for one file; retries overwrite it, not count twice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FileRoute {
+    #[default]
+    Fallback,
+    Postings,
+    NativeDocs,
+    ResultCache,
+    Metadata,
+}
+
 pub fn vix_read_mode() -> VixReadMode {
     match config::get_config().common.vix_read_mode.as_str() {
         "cached" => VixReadMode::Cached,
@@ -60,6 +71,7 @@ pub fn vix_read_mode() -> VixReadMode {
 /// HTTP attempts/retries. Unknown ObjectStore implementations are never called remote.
 #[derive(Debug, Default)]
 pub struct FetchStats {
+    pub(super) route: Mutex<FileRoute>,
     pub fetches: AtomicU64,
     pub bytes: AtomicU64,
     pub batches: AtomicU64,
@@ -165,6 +177,10 @@ pub(crate) struct ReadOperation {
 }
 
 impl ReadOperation {
+    pub(super) fn set_route(&self, route: FileRoute) {
+        *self.stats.route.lock() = route;
+    }
+
     pub(crate) fn new(stats: Arc<FetchStats>, deadline: Option<Instant>) -> Arc<Self> {
         let (stopped, _) = watch::channel(false);
         Arc::new(Self {

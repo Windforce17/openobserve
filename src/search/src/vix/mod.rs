@@ -57,6 +57,8 @@
 
 mod aggregate_reject;
 pub mod cache;
+#[cfg(test)]
+mod cold_histogram_tests;
 mod collect;
 #[cfg(test)]
 mod dispatch_bench;
@@ -540,6 +542,7 @@ pub async fn vix_search(
     const BAIL_SAMPLE_FILES: usize = 32;
     let eval_bail = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let files_total: usize = index_parquet_files.len();
+    let mut routes = RouteTally::new(&query.trace_id, files_total);
     let mut files_evaluated: usize = 0;
     // Whole-file skip accounting, QUERY-scoped (#32 — this used to reset per
     // file group, so a fleet of files each skipping after a costly open was
@@ -657,17 +660,19 @@ pub async fn vix_search(
                     })
                     .catch_unwind()
                     .await;
+                    let route = *file_stats.route.lock();
                     (
                         position,
                         outcome,
                         file_stats.bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        route,
                     )
                 }
             };
             pending.push(task);
         }
 
-        let Some((position, outcome, file_bytes)) = pending.next().await else {
+        let Some((position, outcome, file_bytes, route)) = pending.next().await else {
             break 'window;
         };
         in_flight.remove(&position);
@@ -699,6 +704,7 @@ pub async fn vix_search(
                 file_list.extend(file_list_map.into_values());
                 return Err(Error::Message("VIX query cancelled".to_string()));
             }
+            routes.record(route, &result);
             // Each result corresponds to a file in the file list
             match result {
                 Ok((file_name, result, has_skipped_conditions)) => {
@@ -1030,6 +1036,48 @@ pub async fn vix_search(
         is_add_filter_back,
         multi_result,
     ))
+}
+
+/// Completed files have one final route, even after retries.
+/// Drop also publishes partial totals for cancellation and early-LIMIT exits.
+struct RouteTally<'a> {
+    trace_id: &'a str,
+    total: usize,
+    counts: [usize; 5],
+}
+
+impl<'a> RouteTally<'a> {
+    fn new(trace_id: &'a str, total: usize) -> Self {
+        Self {
+            trace_id,
+            total,
+            counts: [0; 5],
+        }
+    }
+
+    fn record(
+        &mut self,
+        route: source::FileRoute,
+        result: &anyhow::Result<(String, VixSearchResult, bool)>,
+    ) {
+        let route = match result {
+            Ok((_, result, false)) if !matches!(result, VixSearchResult::Skipped { .. }) => route,
+            _ => source::FileRoute::Fallback,
+        };
+        self.counts[route as usize] += 1;
+    }
+}
+
+impl Drop for RouteTally<'_> {
+    fn drop(&mut self) {
+        let [fallback, postings, native_docs, result_cache, metadata] = self.counts;
+        let unfinished = self.total.saturating_sub(self.counts.iter().sum());
+        log::info!(
+            "[trace_id {}] search->vix: file_routes postings={postings} native_docs={native_docs} result_cache={result_cache} fallback={fallback} metadata={metadata} unfinished={unfinished} total={}",
+            self.trace_id,
+            self.total,
+        );
+    }
 }
 
 /// Errors that move the file to the scan branch by design, not by accident:
@@ -1619,6 +1667,7 @@ async fn search_vix_index(
         && matches!(idx_optimize_rule, Some(IndexOptimizeMode::SimpleCount))
         && condition.is_condition_all()
     {
+        operation.set_route(source::FileRoute::Metadata);
         return Ok((
             parquet_file.key.to_string(),
             VixSearchResult::Count(parquet_file.meta.records as usize),
@@ -1667,6 +1716,7 @@ async fn search_vix_index(
             metrics::VIX_RESULT_CACHE_HITS_TOTAL
                 .with_label_values::<&str>(&[])
                 .inc();
+            operation.set_route(source::FileRoute::ResultCache);
             return Ok((parquet_file.key.to_string(), result, false));
         }
         // A memoized SUPERSET (a previous `has_skipped` evaluation of this
@@ -1678,26 +1728,25 @@ async fn search_vix_index(
             metrics::VIX_RESULT_CACHE_HITS_TOTAL
                 .with_label_values::<&str>(&[])
                 .inc();
+            operation.set_route(source::FileRoute::ResultCache);
             return Ok((parquet_file.key.to_string(), result, true));
         }
     }
 
-    // A remote-cold equality histogram uses the native docs helper: reading
-    // its narrow predicate/timestamp columns is cheaper than downloading a
-    // whole sidecar. Once the sidecar is local (or its parsed reader is hot),
-    // use term postings instead. Wide first-touch queries commonly have all
-    // sidecars on disk but no parsed readers; treating those as remote-cold
-    // scanned billions of docs and read gigabytes unnecessarily.
+    // Ranged readers do not need a whole local sidecar. Try its dictionary
+    // before scanning docs, retaining the evaluator's field-coverage checks.
+    // Whole-object mode keeps its existing cold native route.
     let equality_histogram = condition.single_equal_term().is_some()
         && matches!(
             &idx_optimize_rule,
             Some(IndexOptimizeMode::SimpleHistogram(..))
         );
-    let parsed_sidecar_available = equality_histogram
+    let cached_equality_histogram = equality_histogram && read_mode == VixReadMode::Cached;
+    let parsed_sidecar_available = cached_equality_histogram
         && reader_cache::GLOBAL_CACHE
             .peek(&reader_key)
             .is_some_and(|reader| reader.has_index());
-    let local_sidecar_available = if equality_histogram
+    let local_sidecar_available = if cached_equality_histogram
         && parquet_file.meta.index_size > 0
         && !parsed_sidecar_available
         && !sidecar_access.all_cached
@@ -1710,10 +1759,10 @@ async fn search_vix_index(
             None => false,
         }
     } else {
-        equality_histogram && parquet_file.meta.index_size > 0 && sidecar_access.all_cached
+        cached_equality_histogram && parquet_file.meta.index_size > 0 && sidecar_access.all_cached
     };
     let cold_native_histogram =
-        equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
+        cached_equality_histogram && !parsed_sidecar_available && !local_sidecar_available;
     // Unfiltered histogram/count answers come from the DATA object alone:
     // `row_count` and the zone table are data-side properties and the
     // straddling clamp decodes docs `_timestamp` chunks — the sidecar adds
@@ -1863,6 +1912,11 @@ async fn search_vix_index(
     };
     let file_records = parquet_file.meta.records;
     let covered_for_access = file_in_range && parquet_file.meta.min_ts <= parquet_file.meta.max_ts;
+    operation.set_route(if data_only_all_aggregate {
+        source::FileRoute::Metadata
+    } else {
+        source::FileRoute::Postings
+    });
     let raw = run_evaluation(trace_id, operation, permit, move || {
         let reader = reader_input.open()?;
         if let Some(answer) = early_exact_access(
@@ -2137,6 +2191,7 @@ async fn search_vix_docs_optimized(
         idx_optimize_rule.as_ref(),
     )?;
     let task_mode = idx_optimize_rule.expect("supported optimize mode checked above");
+    operation.set_route(source::FileRoute::NativeDocs);
     let evaluated = run_evaluation(trace_id, operation, permit, move || {
         let docs = input.open()?;
         let row_count = docs.row_count();
@@ -6451,11 +6506,16 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(histogram_key, key);
-        assert!(matches!(equality_histogram, VixSearchResult::NoMatch));
+        match equality_histogram {
+            VixSearchResult::Histogram(histogram) => assert_eq!(histogram, vec![0; 5]),
+            other => panic!("expected empty indexed histogram, got {other:?}"),
+        }
         assert!(!has_skipped);
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&master_reader_key),
-            "equality histogram after ALL histogram must stay query-local"
+            reader_cache::GLOBAL_CACHE
+                .get(&master_reader_key)
+                .is_some_and(|reader| reader.has_index()),
+            "ranged equality histogram must open its sidecar after a data-only ALL histogram"
         );
 
         let mut sidecar_condition = IndexCondition::new();
@@ -6485,14 +6545,14 @@ mod tests {
             reader_cache::GLOBAL_CACHE
                 .get(&master_reader_key)
                 .is_some_and(|reader| reader.has_index()),
-            "a later filtered query must upgrade the cached reader with its sidecar"
+            "a later filtered query must retain the indexed reader"
         );
     }
 
-    /// A cold indexed equality histogram must use the data-only native docs
-    /// path without opening the unrelated sidecar.
+    /// A cold indexed equality histogram uses ranged postings without
+    /// requiring a whole-file sidecar cache entry.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_cold_indexed_equality_histogram_skips_sidecar() {
+    async fn test_cold_indexed_equality_histogram_uses_postings() {
         let master = store_core_file_with_rows(
             "files/org/logs/native-histogram/2026/01/01/00/cold-indexed.vix",
             1_000,
@@ -6538,15 +6598,113 @@ mod tests {
         .unwrap();
 
         assert!(!add_filter_back);
-        assert!(files.is_empty(), "native histogram must remove the file");
+        assert!(files.is_empty(), "indexed histogram must remove the file");
         match result {
             MultiResult::Histogram(histogram) => assert_eq!(histogram, vec![5, 5, 1, 0, 0]),
-            other => panic!("expected native histogram, got {other:?}"),
+            other => panic!("expected indexed histogram, got {other:?}"),
         }
         assert!(
-            !reader_cache::GLOBAL_CACHE.contains(&reader_key),
-            "cold native histogram must not open the sidecar"
+            reader_cache::GLOBAL_CACHE
+                .get(&reader_key)
+                .is_some_and(|reader| reader.has_index()),
+            "cold ranged histogram must open the sidecar"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_cold_histogram_routes_count_hits_misses_and_cache_once() {
+        let mut file = store_core_file_with_rows(
+            "files/org/logs/cold-routes/2026/01/01/00/count.vix",
+            1_000,
+            100,
+        )
+        .await;
+        let sidecar = config::vix_sidecar_key(&file.key, file.meta.index_generation).unwrap();
+        let mut tally = RouteTally::new("cold-route-count", 5);
+        for (needle, expected) in [("info", 100), ("missing", 0)] {
+            reader_cache::GLOBAL_CACHE.remove(&file.key);
+            vix_result_cache::GLOBAL_CACHE.remove_file_entries(std::iter::once(file.key.as_str()));
+            file_data::memory::remove(&sidecar).await.unwrap();
+            file_data::disk::remove(&sidecar).await.unwrap();
+            let mut condition = IndexCondition::new();
+            condition.add_condition(Condition::Equal("level".into(), needle.into()));
+            for expected_route in [source::FileRoute::Postings, source::FileRoute::ResultCache] {
+                let stats = Arc::new(source::FetchStats::default());
+                let result = search_vix_index(
+                    "cold-route-count",
+                    (900, 1_100),
+                    Some(condition.clone()),
+                    Some(IndexOptimizeMode::SimpleHistogram(900, 200, 1, 0)),
+                    &file,
+                    VixReadMode::Ranged,
+                    SidecarAccess::check_only(false),
+                    &source::ReadOperation::new(Arc::clone(&stats), None),
+                    None,
+                )
+                .await;
+                let route = *stats.route.lock();
+                tally.record(route, &result);
+                let (_, result, skipped) = result.unwrap();
+                assert!(!skipped);
+                match result {
+                    VixSearchResult::Histogram(counts) => assert_eq!(counts, vec![expected]),
+                    VixSearchResult::NoMatch => assert_eq!(expected, 0),
+                    other => panic!("unexpected histogram result: {other:?}"),
+                }
+                assert_eq!(route, expected_route);
+                if expected_route == source::FileRoute::ResultCache {
+                    assert_eq!(stats.fetches.load(std::sync::atomic::Ordering::Relaxed), 0);
+                }
+            }
+        }
+        // Indexless files still use native docs, including a boundary clamp.
+        file.meta.index_size = 0;
+        let mut condition = IndexCondition::new();
+        condition.add_condition(Condition::Equal("level".into(), "info".into()));
+        let stats = Arc::new(source::FetchStats::default());
+        let result = search_vix_index(
+            "cold-route-native",
+            (990, 1_000),
+            Some(condition),
+            Some(IndexOptimizeMode::SimpleHistogram(990, 5, 2, 0)),
+            &file,
+            VixReadMode::Ranged,
+            SidecarAccess::check_only(false),
+            &source::ReadOperation::new(Arc::clone(&stats), None),
+            None,
+        )
+        .await;
+        let route = *stats.route.lock();
+        tally.record(route, &result);
+        assert_eq!(route, source::FileRoute::NativeDocs);
+        match result.unwrap() {
+            (_, VixSearchResult::Histogram(counts), false) => assert_eq!(counts, vec![5, 5]),
+            other => panic!("unexpected native histogram result: {other:?}"),
+        }
+        assert_eq!(tally.counts, [0, 2, 1, 2, 0]);
+    }
+
+    #[test]
+    fn test_route_tally_classifies_final_fallbacks() {
+        let mut tally = RouteTally::new("route-fallbacks", 4);
+        tally.record(
+            source::FileRoute::Postings,
+            &Err(anyhow::anyhow!("read failed")),
+        );
+        tally.record(
+            source::FileRoute::NativeDocs,
+            &Ok((
+                "file".into(),
+                VixSearchResult::Skipped { percent: 100 },
+                true,
+            )),
+        );
+        tally.record(
+            source::FileRoute::ResultCache,
+            &Ok(("file".into(), VixSearchResult::Count(1), true)),
+        );
+        assert_eq!(tally.counts, [3, 0, 0, 0, 0]);
+        assert_eq!(tally.total - tally.counts.iter().sum::<usize>(), 1);
     }
 
     /// Check-only miss handling must not weaken the all-local shortcut: when
