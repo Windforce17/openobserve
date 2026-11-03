@@ -67,7 +67,7 @@ pub(crate) fn warm_cache_type(compressed_size: i64) -> file_data::CacheType {
 /// several ranged reads. "Small" is the same definition as the `DemandSmall`
 /// download class. The memory tier and disk-only setups without a block tier
 /// keep the whole-object download, because nothing else would cache the object.
-fn leaves_to_block_tier(
+pub(crate) fn leaves_to_block_tier(
     cache_type: file_data::CacheType,
     key: &str,
     size: i64,

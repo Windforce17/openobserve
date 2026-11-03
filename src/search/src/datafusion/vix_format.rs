@@ -1114,6 +1114,16 @@ fn has_string_equality(bounds: &[ColumnBound]) -> bool {
 
 impl FileOpener for VixCoreOpener {
     fn open(&self, file: PartitionedFile) -> Result<FileOpenFuture> {
+        self.open_with_block_tier(file, infra::cache::file_data::block::global().is_some())
+    }
+}
+
+impl VixCoreOpener {
+    fn open_with_block_tier(
+        &self,
+        file: PartitionedFile,
+        block_tier_active: bool,
+    ) -> Result<FileOpenFuture> {
         let store = Arc::clone(&self.object_store);
         let projected_schema = Arc::clone(&self.projected_schema);
         let timestamp_filter = self.timestamp_filter;
@@ -1152,7 +1162,18 @@ impl FileOpener for VixCoreOpener {
                 && predicate == vortex_index::NativePredicateStrategy::BoundedPrepass
                 && has_string_equality(&column_bounds);
             let late_source_predicate = late_source_predicate.filter(|_| selection.is_none());
-            let ranged_wanted = equality_prepass || late_source_predicate.is_some() || should_use_ranged_scan(
+            // Match the disk downloader's perf5 boundary. Range reads still
+            // probe existing whole-file memory/disk copies before the block tier.
+            // Listing locations include request/account prefixes, not just the key.
+            let (_, cache_key) = super::storage::format_location(&location);
+            let left_to_blocks = crate::file_cache::leaves_to_block_tier(
+                infra::cache::file_data::CacheType::Disk,
+                cache_key.as_ref(),
+                i64::try_from(file.object_meta.size).unwrap_or(i64::MAX),
+                block_tier_active,
+                config::get_config().limit.file_download_small_object_bytes,
+            );
+            let ranged_wanted = left_to_blocks || equality_prepass || late_source_predicate.is_some() || should_use_ranged_scan(
                 &projected_schema,
                 selection.is_some(),
                 usize::try_from(file.object_meta.size).unwrap_or(usize::MAX),
@@ -1242,9 +1263,9 @@ impl FileOpener for VixCoreOpener {
             let cleanup_key = stale_row_cleanup_key(&location);
             let cleanup_handle = tokio::runtime::Handle::try_current().ok();
 
-            // Ranged mode fetches only projected column chunks. Wide
-            // `_source` scans below the configured threshold retain a
-            // single whole-object get for cache locality.
+            // Ranged mode fetches projected chunks through the cache ladder.
+            // Small wide scans and deployments without blocks keep the
+            // existing whole-object path below the safety threshold.
             let input = match docs_range_source(&store, &file.object_meta, ranged_wanted) {
                 Some(source) => DocsInput::Ranged(io_operation.run(|| {
                     source.for_current_operation().unwrap_or(source)
@@ -4045,9 +4066,136 @@ mod ranged_tests {
         }
     }
 
-    /// A small no-selection scan that projects native columns must stay
-    /// columnar: it may not fall back to a whole-object get merely because
-    /// the file is below the wide-scan size threshold.
+    /// A medium source scan must reuse the block path without changing rows
+    /// or retaining its reservation after completion, failure, or cancellation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn medium_source_full_scan_uses_blocks_and_preserves_rows() {
+        use arrow::array::StringArray;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use vortex_index::{VixWriter, VixWriterOptions};
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        let mut state = 42u64;
+        let sources: Vec<String> = (0..512)
+            .map(|_| {
+                let text: String = (0..32 * 1024)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (b'a' + (state % 26) as u8) as char
+                    })
+                    .collect();
+                format!(r#"{{"message":"{text}"}}"#)
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(1..513))])
+                .unwrap();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+            .unwrap();
+        let data = bytes::Bytes::from(writer.finish().unwrap().0);
+        assert!(data.len() > 8 * 1024 * 1024 && data.len() < 256 * 1024 * 1024);
+        let store = Arc::new(RangeOnlyStore {
+            inner: InMemory::new(),
+            reads: Default::default(),
+        });
+        // Match the account-qualified paths produced by file_list::set.
+        let path = Path::from(
+            "trace/schema=x/format=vix/$$/account/::/files/default/logs/app/2026/11/03/00/source.vix",
+        );
+        store.put(&path, data.clone().into()).await.unwrap();
+        let pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+        let opener = VixCoreOpener {
+            object_store: store.clone(),
+            projected_schema: Arc::new(Schema::new(vec![Field::new(
+                SOURCE_COL_NAME,
+                DataType::Utf8,
+                true,
+            )])),
+            timestamp_filter: None,
+            column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            late_source_predicate: None,
+            selective_source_range_prepass: true,
+            emit_ts_desc: false,
+            batch_size: 64,
+            memory_pool: Some(pool.clone()),
+            conversion_width: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            partition: 0,
+        };
+        let file = PartitionedFile::new(path.to_string(), data.len() as u64);
+        let mut stream = opener
+            .open_with_block_tier(file.clone(), true)
+            .unwrap()
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            let array = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            got.extend(array.iter().map(|value| value.unwrap().to_owned()));
+        }
+        drop(stream);
+        assert_eq!(got, sources);
+        assert_eq!(pool.reserved(), 0);
+
+        // Without blocks, a medium wide scan still attempts a whole GET.
+        assert!(
+            opener
+                .open_with_block_tier(file.clone(), false)
+                .unwrap()
+                .await
+                .is_err()
+        );
+        assert_eq!(pool.reserved(), 0);
+
+        // Dropping an active range scan must release its reservation after work exits.
+        let mut stream = opener
+            .open_with_block_tier(file, true)
+            .unwrap()
+            .await
+            .unwrap();
+        drop(stream.try_next().await.unwrap());
+        drop(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pool.reserved() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        // Small files and non-files keys retain their whole-object behavior.
+        for (key, bytes) in [
+            ("files/default/logs/app/small.vix", build_core_file()),
+            ("wal/source.vix", data),
+        ] {
+            let path = Path::from(key);
+            let size = bytes.len() as u64;
+            store.put(&path, bytes.into()).await.unwrap();
+            assert!(
+                opener
+                    .open_with_block_tier(PartitionedFile::new(key, size), true)
+                    .unwrap()
+                    .await
+                    .is_err()
+            );
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    /// A small native projection stays columnar below the wide-scan threshold.
     #[tokio::test(flavor = "multi_thread")]
     async fn small_narrow_full_scan_uses_range_reads_only() {
         let data = build_core_file();
