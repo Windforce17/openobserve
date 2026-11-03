@@ -82,6 +82,9 @@
 //! index; until that unlink ran, no entry is created or adopted for the key
 //! (its reads are served uncached), so a successor never fills, then serves
 //! the holes of, a file that is about to be deleted.
+//! A reader opens the file by path too, so it re-checks its entry after the
+//! read: bytes read once the entry was evicted may come from a successor's
+//! recreated file and are discarded for a remote read.
 
 use std::{
     collections::VecDeque,
@@ -793,16 +796,32 @@ impl Bucket {
     /// Record a pending unlink for each entry's file. Call with this bucket's
     /// index write-locked, in the critical section that removed the entries.
     fn pend_unlinks(&self, entries: &[Arc<Entry>]) {
-        let mut pending = self.unlinking.lock();
         for entry in entries {
-            *pending.entry(Arc::clone(&entry.key)).or_insert(0) += 1;
+            self.pend_unlink(&entry.key);
         }
+    }
+
+    /// Record one pending unlink of `key`'s file. Call with this bucket's
+    /// index write-locked.
+    fn pend_unlink(&self, key: &Arc<str>) {
+        *self.unlinking.lock().entry(Arc::clone(key)).or_insert(0) += 1;
     }
 
     /// Whether a deferred unlink of `key`'s file is still pending. Call with
     /// this bucket's index write-locked.
     fn unlink_pending(&self, key: &str) -> bool {
         self.unlinking.lock().contains_key(key)
+    }
+}
+
+/// Release one pending unlink of `key` once its remove ran.
+fn release_unlink(unlinking: &Mutex<HashMap<Arc<str>, usize>>, key: &str) {
+    let mut pending = unlinking.lock();
+    if let Some(count) = pending.get_mut(key) {
+        *count -= 1;
+        if *count == 0 {
+            pending.remove(key);
+        }
     }
 }
 
@@ -1228,13 +1247,23 @@ impl BlockCache {
         }
         let bytes = if plans.iter().any(|plan| plan.unserved().is_some()) {
             let reader = Arc::clone(&entry);
-            let (read, plans) = tokio::task::spawn_blocking(move || {
+            let (read, plans, evicted) = tokio::task::spawn_blocking(move || {
                 let _owner = owner;
-                (read_plans(&reader.path, &plans), plans)
+                let read = read_plans(&reader.path, &plans);
+                // Checked after the read: the path names this entry's file
+                // only until its eviction schedules the unlink. Once the
+                // unlink ran, a successor may have recreated the file, with
+                // holes where this entry's present blocks were.
+                let evicted = reader.state.lock().evicted;
+                (read, plans, evicted)
             })
             .await
             .map_err(|e| generic("disk block cache", e))?;
             match read {
+                Ok(_) if evicted => {
+                    log::debug!("[BlockCache] {key} evicted during read, serving remote");
+                    return serve_remote(key, plans, object_size, remote_bytes, fetch).await;
+                }
                 Ok(bytes) => bytes,
                 Err(error) => {
                     // Evicted between lookup and IO (NotFound), or the local
@@ -1454,25 +1483,11 @@ impl BlockCache {
             }
         });
         let Some((object_size, bits, present_bytes)) = adopted else {
-            if !bucket.index.read().entries.contains_key(key)
-                && let Err(e) = std::fs::remove_file(path)
-            {
-                log::warn!(
-                    "[BlockCache] remove invalid cache file {}: {e}",
-                    path.display()
-                );
-            }
+            remove_unowned(bucket, key, path, "invalid");
             return false;
         };
         if object_size == 0 || present_bytes == 0 {
-            if !bucket.index.read().entries.contains_key(key)
-                && let Err(e) = std::fs::remove_file(path)
-            {
-                log::warn!(
-                    "[BlockCache] remove empty cache file {}: {e}",
-                    path.display()
-                );
-            }
+            remove_unowned(bucket, key, path, "empty");
             return false;
         }
         let key: Arc<str> = Arc::from(key);
@@ -1682,6 +1697,32 @@ fn write_runs(entry: &Entry, writes: &[(Range<u64>, Bytes)]) -> std::io::Result<
     Ok(())
 }
 
+/// Remove a file found at startup that no entry owns (`what` names why it
+/// is not adopted). Startup loading runs alongside queries, so the check and
+/// the remove go through the pending-unlink guard like an eviction: a cold
+/// reader could otherwise insert an entry for the key and fill this very
+/// file between them, then serve the holes of the file recreated after it.
+fn remove_unowned(bucket: &Bucket, key: &str, path: &Path, what: &str) {
+    let key: Arc<str> = {
+        let index = bucket.index.write();
+        if index.entries.contains_key(key) {
+            return;
+        }
+        let key: Arc<str> = Arc::from(key);
+        bucket.pend_unlink(&key);
+        key
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!(
+            "[BlockCache] remove {what} cache file {}: {e}",
+            path.display()
+        ),
+    }
+    release_unlink(&bucket.unlinking, &key);
+}
+
 /// Remove the cache files of `entries` on the blocking pool, then release
 /// their keys from `bucket`'s pending unlinks. The caller registered them
 /// with [`Bucket::pend_unlinks`] in the critical section that took them out
@@ -1705,13 +1746,7 @@ fn unlink_later(bucket: &Bucket, entries: Vec<Arc<Entry>>) {
             // Released after a failed remove too: a file left in place keeps
             // the object's own bytes, and a new entry serves only the blocks
             // it writes itself.
-            let mut pending = unlinking.lock();
-            if let Some(count) = pending.get_mut(&key) {
-                *count -= 1;
-                if *count == 0 {
-                    pending.remove(&key);
-                }
-            }
+            release_unlink(&unlinking, &key);
         }
     });
 }
@@ -1998,6 +2033,85 @@ mod tests {
             assert_eq!(again.outcome, Outcome::Hit);
             assert_eq!(again.bytes, tail_bytes(&remote));
         });
+    }
+
+    /// A reader that found blocks present opens the cache file by path only
+    /// after its remote fetches. If its entry is evicted meanwhile, the
+    /// unlink runs and a successor recreates the file, the path names a file
+    /// with holes where the reader's present blocks were. The reader must
+    /// still return the object's bytes, never those holes (zeros).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_evicted_mid_read_never_serves_a_successors_holes() {
+        let dir = tempfile::tempdir().unwrap();
+        let size = 64 * BS;
+        let tail = size - 12 * BS..size;
+        let remote = Remote::new(size as usize);
+        let fetch = remote.fetcher();
+        let cache = cache(dir.path(), 1 << 30);
+        let path = cache.path_for(KEY);
+        cache
+            .read_through(KEY, tail.clone(), None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+
+        // The reader's fetch of block 0 parks until released: its tail is
+        // planned from the file, and the file read waits behind the fetch.
+        let entered = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gated = {
+            let inner = remote.fetcher();
+            let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+            move |range: Range<u64>| -> FetchFuture {
+                let fetched = inner(range.clone());
+                let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+                async move {
+                    if range.start == 0 {
+                        entered.add_permits(1);
+                        release.acquire().await.unwrap().forget();
+                    }
+                    fetched.await
+                }
+                .boxed()
+            }
+        };
+        let reader = {
+            let cache = Arc::clone(&cache);
+            let ranges = [0..BS, tail.clone()];
+            tokio::spawn(async move { cache.read_through_many(KEY, &ranges, None, &gated).await })
+        };
+        entered.acquire().await.unwrap().forget();
+
+        cache.evict(cache.bucket(KEY), u64::MAX);
+        wait_gone(&path).await;
+        for _ in 0..200 {
+            if !cache.bucket(KEY).unlink_pending(KEY) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !cache.bucket(KEY).unlink_pending(KEY),
+            "the eviction's unlink did not finish"
+        );
+        // A successor recreates the file with one block of its own.
+        cache
+            .read_through(KEY, 30 * BS..31 * BS, None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+        assert!(path.exists(), "the successor must have recreated the file");
+
+        release.add_permits(1);
+        let read = reader.await.unwrap().unwrap();
+        assert_eq!(read.bytes[0], remote.data.slice(0..BS as usize));
+        let want = remote.data.slice(tail.start as usize..tail.end as usize);
+        assert!(
+            read.bytes[1] == want,
+            "tail does not match the object ({} of {} bytes are zero)",
+            read.bytes[1].iter().filter(|b| **b == 0).count(),
+            read.bytes[1].len()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
