@@ -1991,6 +1991,20 @@ mod tests {
         panic!("{} still exists", path.display());
     }
 
+    /// The file is gone and its pending unlink is released, so the key
+    /// caches again. The release follows the remove, so the file can be gone
+    /// while the key is still pending.
+    async fn wait_unlinked(cache: &BlockCache, path: &Path, key: &str) {
+        wait_gone(path).await;
+        for _ in 0..200 {
+            if !cache.bucket(key).unlink_pending(key) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the unlink of {key} is still pending");
+    }
+
     const KEY: &str = "files/org/logs/stream/2026/10/08/11/a.vix";
 
     /// The server keeps the tier in [`GLOBAL`], so it outlives the runtime
@@ -2092,7 +2106,7 @@ mod tests {
             settle(&cache).await;
             release_tx.send(()).unwrap();
             blocker.await.unwrap();
-            wait_gone(&path).await;
+            wait_unlinked(&cache, &path, KEY).await;
 
             let head = cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
             assert_eq!(head.bytes, remote.data.slice(0..BS as usize));
@@ -2167,17 +2181,7 @@ mod tests {
         entered.acquire().await.unwrap().forget();
 
         cache.evict(cache.bucket(KEY), u64::MAX);
-        wait_gone(&path).await;
-        for _ in 0..200 {
-            if !cache.bucket(KEY).unlink_pending(KEY) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert!(
-            !cache.bucket(KEY).unlink_pending(KEY),
-            "the eviction's unlink did not finish"
-        );
+        wait_unlinked(&cache, &path, KEY).await;
         // A successor recreates the file with one block of its own.
         cache
             .read_through(KEY, 30 * BS..31 * BS, None, &fetch)
@@ -2246,17 +2250,7 @@ mod tests {
 
             release_tx.send(()).unwrap();
             blocker.await.unwrap();
-            wait_gone(&path).await;
-            for _ in 0..200 {
-                if !cache.bucket(KEY).unlink_pending(KEY) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            assert!(
-                !cache.bucket(KEY).unlink_pending(KEY),
-                "the eviction's unlink did not finish"
-            );
+            wait_unlinked(&cache, &path, KEY).await;
             assert!(
                 !cache.publish_adoption(adoption),
                 "the scan of an unlinked file was adopted"
