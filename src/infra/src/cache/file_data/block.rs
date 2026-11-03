@@ -78,6 +78,10 @@
 //! runs on the blocking pool outside the locks, so a slow disk or an
 //! eviction sweep cannot stall unrelated readers - unlike the whole-file
 //! tier, whose set-triggered GC unlinks files under its bucket write lock.
+//! An evicted entry's file is unlinked by path after the entry left the
+//! index; until that unlink ran, no entry is created or adopted for the key
+//! (its reads are served uncached), so a successor never fills, then serves
+//! the holes of, a file that is about to be deleted.
 
 use std::{
     collections::VecDeque,
@@ -775,6 +779,31 @@ struct Bucket {
     cur_size: AtomicU64,
     evicting: AtomicBool,
     index: RwLock<Index>,
+    /// Keys whose cache file a deferred unlink ([`unlink_later`]) has yet to
+    /// remove, with the number of such unlinks. The unlink removes the file
+    /// by path, and every entry of a key uses the same path, so no entry is
+    /// created or adopted for a key listed here: it would fill a file the
+    /// unlink then deletes, and serve the recreated file's holes as zeros.
+    /// Keys are added under the `index` write lock, in the critical section
+    /// that takes their entry out; lock order is `index` then `unlinking`.
+    unlinking: Arc<Mutex<HashMap<Arc<str>, usize>>>,
+}
+
+impl Bucket {
+    /// Record a pending unlink for each entry's file. Call with this bucket's
+    /// index write-locked, in the critical section that removed the entries.
+    fn pend_unlinks(&self, entries: &[Arc<Entry>]) {
+        let mut pending = self.unlinking.lock();
+        for entry in entries {
+            *pending.entry(Arc::clone(&entry.key)).or_insert(0) += 1;
+        }
+    }
+
+    /// Whether a deferred unlink of `key`'s file is still pending. Call with
+    /// this bucket's index write-locked.
+    fn unlink_pending(&self, key: &str) -> bool {
+        self.unlinking.lock().contains_key(key)
+    }
 }
 
 struct Index {
@@ -945,6 +974,7 @@ impl BlockCache {
                     entries: HashMap::new(),
                     order: CacheStrategy::new(strategy),
                 }),
+                unlinking: Arc::new(Mutex::new(HashMap::new())),
             })
             .collect();
         let fills = FillQueue::new(fill_queue_bytes);
@@ -1002,8 +1032,9 @@ impl BlockCache {
     }
 
     /// Insert an empty entry for a cold object, or adopt the one a concurrent
-    /// cold reader inserted first.
-    fn insert_or_get(&self, key: &str, object_size: u64) -> Arc<Entry> {
+    /// cold reader inserted first. `None` while a deferred unlink of the
+    /// key's previous file is pending (see [`Bucket::unlinking`]).
+    fn insert_or_get(&self, key: &str, object_size: u64) -> Option<Arc<Entry>> {
         let bucket = self.bucket(key);
         let mut index = bucket.index.write();
         if let Some(existing) = index.entries.get(key) {
@@ -1013,7 +1044,10 @@ impl BlockCache {
                     existing.object_size
                 );
             }
-            return Arc::clone(existing);
+            return Some(Arc::clone(existing));
+        }
+        if bucket.unlink_pending(key) {
+            return None;
         }
         let key: Arc<str> = Arc::from(key);
         let entry = Arc::new(Entry::new(
@@ -1028,7 +1062,7 @@ impl BlockCache {
         metrics::QUERY_DISK_BLOCK_CACHE_FILES
             .with_label_values(&[org, stream_type])
             .inc();
-        entry
+        Some(entry)
     }
 
     /// Serve `requested` of object `key`: present blocks from the cache file,
@@ -1106,25 +1140,24 @@ impl BlockCache {
                     return Err(short_response(key, expected, fetched.bytes.len()));
                 }
                 remote_bytes += expected;
-                let entry = self.insert_or_get(key, object_size);
                 fills.push((run, fetched.bytes));
-                entry
+                match self.insert_or_get(key, object_size) {
+                    Some(entry) => entry,
+                    None => {
+                        // The previous file of this key is still being
+                        // unlinked: serve without caching.
+                        log::debug!(
+                            "[BlockCache] {key} unlink pending, serving remote without caching"
+                        );
+                        let ranges = clip_ranges(key, requested, object_size)?;
+                        let plans = plan_ranges(&ranges, &fills, bs, object_size);
+                        return serve_remote(key, plans, object_size, remote_bytes, fetch).await;
+                    }
+                }
             }
         };
         let object_size = entry.object_size;
-        let mut ranges = Vec::with_capacity(requested.len());
-        for r in requested {
-            if r.start > object_size || (r.start == object_size && !r.is_empty()) {
-                return Err(object_store::Error::NotFound {
-                    path: key.to_string(),
-                    source: Box::new(std::io::Error::other(format!(
-                        "range start {} beyond object size {object_size}",
-                        r.start
-                    ))),
-                });
-            }
-            ranges.push(r.start..r.end.min(object_size));
-        }
+        let ranges = clip_ranges(key, requested, object_size)?;
         let wanted = merge_ranges(ranges.iter().filter(|r| !r.is_empty()).cloned());
         let wanted_blocks: Vec<Range<u64>> = wanted
             .iter()
@@ -1217,47 +1250,7 @@ impl BlockCache {
                         log::warn!("[BlockCache] {key} local IO failed, serving remote: {error}");
                     }
                     self.drop_entry(&entry);
-                    // Zero-length ranges are always `Ready`, so every fetch
-                    // here is a valid request.
-                    let fetches: Vec<FetchFuture> = plans
-                        .iter()
-                        .filter_map(|plan| plan.unserved().map(|range| fetch(range.clone())))
-                        .collect();
-                    let mut results = futures::stream::iter(fetches)
-                        .buffered(FILL_CONCURRENCY)
-                        .try_collect::<Vec<Fetched>>()
-                        .await?
-                        .into_iter();
-                    let mut bytes = Vec::with_capacity(plans.len());
-                    for plan in plans {
-                        let range = match plan {
-                            Plan::Ready(ready) => {
-                                bytes.push(ready);
-                                continue;
-                            }
-                            Plan::Disk(range) | Plan::Stitch { range, .. } => range,
-                        };
-                        let want = range.end - range.start;
-                        let fetched = results.next().ok_or_else(|| short_response(key, want, 0))?;
-                        let len = fetched.bytes.len() as u64;
-                        if len != want {
-                            return Err(short_response(key, want, len as usize));
-                        }
-                        remote_bytes += len;
-                        bytes.push(fetched.bytes);
-                    }
-                    metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
-                        .with_label_values(&["miss"])
-                        .inc();
-                    metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
-                        .with_label_values(&["remote"])
-                        .inc_by(remote_bytes);
-                    return Ok(BlockReads {
-                        bytes,
-                        object_size,
-                        outcome: Outcome::Miss,
-                        remote_bytes,
-                    });
+                    return serve_remote(key, plans, object_size, remote_bytes, fetch).await;
                 }
             }
         } else {
@@ -1305,12 +1298,16 @@ impl BlockCache {
         let entry = {
             let mut index = bucket.index.write();
             index.order.remove_key(key);
-            index.entries.remove(key)
+            let entry = index.entries.remove(key);
+            if let Some(entry) = &entry {
+                bucket.pend_unlinks(std::slice::from_ref(entry));
+            }
+            entry
         };
         if let Some(entry) = entry {
             let released = self.retire(&entry);
             bucket.cur_size.fetch_sub(released, Ordering::Relaxed);
-            unlink_later(vec![entry]);
+            unlink_later(bucket, vec![entry]);
         }
     }
 
@@ -1323,6 +1320,7 @@ impl BlockCache {
             match index.entries.get(&*entry.key) {
                 Some(current) if Arc::ptr_eq(current, entry) => {
                     index.order.remove_key(&entry.key);
+                    bucket.pend_unlinks(std::slice::from_ref(entry));
                     index.entries.remove(&*entry.key)
                 }
                 _ => None,
@@ -1331,7 +1329,7 @@ impl BlockCache {
         if let Some(entry) = removed {
             let released = self.retire(&entry);
             bucket.cur_size.fetch_sub(released, Ordering::Relaxed);
-            unlink_later(vec![entry]);
+            unlink_later(bucket, vec![entry]);
         }
     }
 
@@ -1378,6 +1376,7 @@ impl BlockCache {
                     victims.push(entry);
                 }
             }
+            bucket.pend_unlinks(&victims);
         }
         bucket.cur_size.fetch_sub(released, Ordering::Relaxed);
         bucket.evicting.store(false, Ordering::Release);
@@ -1386,7 +1385,7 @@ impl BlockCache {
             victims.len(),
             start.elapsed().as_millis()
         );
-        unlink_later(victims);
+        unlink_later(bucket, victims);
     }
 
     /// Rebuild the index from the cache directory: each file's present
@@ -1489,7 +1488,7 @@ impl BlockCache {
             }),
         });
         let mut index = bucket.index.write();
-        if index.entries.contains_key(&*key) {
+        if index.entries.contains_key(&*key) || bucket.unlink_pending(&key) {
             return false;
         }
         index.order.insert(key.to_string(), 0);
@@ -1527,10 +1526,23 @@ impl BlockCache {
             self.drop_entry(&entry);
             "failed"
         } else {
-            if entry.state.lock().evicted && self.get_entry(&entry.key).is_none() {
+            if entry.state.lock().evicted {
                 // Evicted while the fill was in flight: the sweeper's unlink
-                // may have preceded our create, leaving an orphan file.
-                unlink_later(vec![Arc::clone(&entry)]);
+                // may have preceded our create, leaving an orphan file. Remove
+                // it only while no newer entry owns the path; the pending
+                // unlink then keeps new entries out until the file is gone.
+                let bucket = self.bucket(&entry.key);
+                let orphan = {
+                    let index = bucket.index.write();
+                    let orphan = !index.entries.contains_key(&*entry.key);
+                    if orphan {
+                        bucket.pend_unlinks(std::slice::from_ref(&entry));
+                    }
+                    orphan
+                };
+                if orphan {
+                    unlink_later(bucket, vec![Arc::clone(&entry)]);
+                }
             }
             let added: u64 = writes
                 .iter()
@@ -1572,6 +1584,82 @@ fn short_response(key: &str, expected: u64, got: usize) -> object_store::Error {
     )
 }
 
+/// Clip `requested` to the object like `GetRange::as_range`; a start at or
+/// past the end of a non-empty range is `NotFound`.
+fn clip_ranges(
+    key: &str,
+    requested: &[Range<u64>],
+    object_size: u64,
+) -> object_store::Result<Vec<Range<u64>>> {
+    let mut ranges = Vec::with_capacity(requested.len());
+    for r in requested {
+        if r.start > object_size || (r.start == object_size && !r.is_empty()) {
+            return Err(object_store::Error::NotFound {
+                path: key.to_string(),
+                source: Box::new(std::io::Error::other(format!(
+                    "range start {} beyond object size {object_size}",
+                    r.start
+                ))),
+            });
+        }
+        ranges.push(r.start..r.end.min(object_size));
+    }
+    Ok(ranges)
+}
+
+/// Serve `plans` without the cache file: ranges already in hand keep their
+/// bytes, every range that needed the file is fetched as is, in request
+/// order. `remote_bytes` counts what was fetched before. A miss.
+async fn serve_remote(
+    key: &str,
+    plans: Vec<Plan>,
+    object_size: u64,
+    mut remote_bytes: u64,
+    fetch: &(dyn Fn(Range<u64>) -> FetchFuture + Sync),
+) -> object_store::Result<BlockReads> {
+    // Zero-length ranges are always `Ready`, so every fetch here is a valid
+    // request.
+    let fetches: Vec<FetchFuture> = plans
+        .iter()
+        .filter_map(|plan| plan.unserved().map(|range| fetch(range.clone())))
+        .collect();
+    let mut results = futures::stream::iter(fetches)
+        .buffered(FILL_CONCURRENCY)
+        .try_collect::<Vec<Fetched>>()
+        .await?
+        .into_iter();
+    let mut bytes = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let range = match plan {
+            Plan::Ready(ready) => {
+                bytes.push(ready);
+                continue;
+            }
+            Plan::Disk(range) | Plan::Stitch { range, .. } => range,
+        };
+        let want = range.end - range.start;
+        let fetched = results.next().ok_or_else(|| short_response(key, want, 0))?;
+        let len = fetched.bytes.len() as u64;
+        if len != want {
+            return Err(short_response(key, want, len as usize));
+        }
+        remote_bytes += len;
+        bytes.push(fetched.bytes);
+    }
+    metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
+        .with_label_values(&["miss"])
+        .inc();
+    metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
+        .with_label_values(&["remote"])
+        .inc_by(remote_bytes);
+    Ok(BlockReads {
+        bytes,
+        object_size,
+        outcome: Outcome::Miss,
+        remote_bytes,
+    })
+}
+
 /// Write `writes` (block runs, bytes) into `entry`'s cache file, creating
 /// it if needed: the file mirrors the object exactly, its logical length is
 /// the object's size, so every never-fetched offset is a hole - which is
@@ -1594,17 +1682,35 @@ fn write_runs(entry: &Entry, writes: &[(Range<u64>, Bytes)]) -> std::io::Result<
     Ok(())
 }
 
-fn unlink_later(entries: Vec<Arc<Entry>>) {
+/// Remove the cache files of `entries` on the blocking pool, then release
+/// their keys from `bucket`'s pending unlinks. The caller registered them
+/// with [`Bucket::pend_unlinks`] in the critical section that took them out
+/// of the index, so no new entry for these keys exists until this runs.
+fn unlink_later(bucket: &Bucket, entries: Vec<Arc<Entry>>) {
     if entries.is_empty() {
         return;
     }
-    let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+    let unlinking = Arc::clone(&bucket.unlinking);
+    let files: Vec<(Arc<str>, PathBuf)> = entries
+        .iter()
+        .map(|e| (Arc::clone(&e.key), e.path.clone()))
+        .collect();
     tokio::task::spawn_blocking(move || {
-        for path in paths {
+        for (key, path) in files {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => log::warn!("[BlockCache] remove {}: {e}", path.display()),
+            }
+            // Released after a failed remove too: a file left in place keeps
+            // the object's own bytes, and a new entry serves only the blocks
+            // it writes itself.
+            let mut pending = unlinking.lock();
+            if let Some(count) = pending.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    pending.remove(&key);
+                }
             }
         }
     });
@@ -1812,6 +1918,86 @@ mod tests {
         assert_eq!(read.outcome, Outcome::Hit);
         assert_eq!(read.bytes, remote.data.slice(0..1000));
         assert_eq!(remote.calls(), 1);
+    }
+
+    /// An eviction unlinks the victim's file later, off the index lock, by
+    /// path - and the next entry for the key uses the same path. Here that
+    /// unlink is held back until the successor entry has filled the old
+    /// inode; a later fill then recreates the path. The successor must still
+    /// serve the object's bytes, never the recreated file's holes (zeros).
+    #[test]
+    fn a_late_unlink_of_an_evicted_entry_never_serves_holes_to_its_successor() {
+        let dir = tempfile::tempdir().unwrap();
+        // The fill writers park on all blocking threads but one; holding that
+        // last one queues the eviction's unlink until the test releases it.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(FILL_WRITERS + 1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let size = 64 * BS;
+        let tail = size - 12 * BS..size;
+        let tail_bytes =
+            |remote: &Remote| remote.data.slice(tail.start as usize..tail.end as usize);
+        let remote = Remote::new(size as usize);
+        let fetch = remote.fetcher();
+        rt.block_on(async {
+            let cache = cache(dir.path(), 1 << 30);
+            let path = cache.path_for(KEY);
+            cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            settle(&cache).await;
+
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).ok();
+                release_rx.recv().ok();
+            });
+            started_rx.await.unwrap();
+            cache.evict(cache.bucket(KEY), u64::MAX);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                path.exists(),
+                "the unlink must still be queued for this test to reproduce the race"
+            );
+
+            let read = cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            assert_eq!(read.bytes, tail_bytes(&remote));
+            settle(&cache).await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            wait_gone(&path).await;
+
+            let head = cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            assert_eq!(head.bytes, remote.data.slice(0..BS as usize));
+            settle(&cache).await;
+
+            let read = cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            assert!(
+                read.bytes == tail_bytes(&remote),
+                "tail served from the cache does not match the object ({} of {} bytes are zero)",
+                read.bytes.iter().filter(|b| **b == 0).count(),
+                read.bytes.len()
+            );
+            // Once the unlink is done the key caches again.
+            settle(&cache).await;
+            let again = cache
+                .read_through(KEY, tail.clone(), None, &fetch)
+                .await
+                .unwrap();
+            assert_eq!(again.outcome, Outcome::Hit);
+            assert_eq!(again.bytes, tail_bytes(&remote));
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
