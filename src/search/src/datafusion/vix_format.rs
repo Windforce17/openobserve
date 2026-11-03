@@ -97,6 +97,8 @@ mod late_source;
 use late_source::LateSourcePredicate;
 
 #[cfg(test)]
+mod residual_concat_tests;
+#[cfg(test)]
 mod selective_tests;
 
 /// File extension (without the dot) of core files.
@@ -801,6 +803,8 @@ fn elapsed_ns(started: Instant) -> u64 {
 struct CoreScanOperation {
     io: Arc<ReadOperation>,
     reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>>,
+    /// Held for its Drop: releases the file workspace after the scan ends.
+    _workspace: Arc<FileWorkspace>,
     reader_high_water: parking_lot::Mutex<usize>,
     options: parking_lot::Mutex<vortex_index::NativeScanOptions>,
     downstream_wait_ns: Count,
@@ -854,6 +858,40 @@ impl vortex_index::VixReadOperation for CoreScanOperation {
         self.options.lock().clone()
     }
 
+    fn reserve_io(&self, bytes: usize) -> vortex_index::Result<Option<Arc<dyn Send + Sync>>> {
+        if self.reservation.lock().is_none() {
+            return Ok(None);
+        }
+        self.reserve(bytes)
+            .map(|charge| Some(charge as Arc<dyn Send + Sync>))
+            .map_err(|error| {
+                vortex_index::VixError::Callback(
+                    DataFusionError::ResourcesExhausted(format!(
+                        "VIX IO payload of {} needs {bytes} bytes: {error}",
+                        self.location
+                    ))
+                    .into(),
+                )
+            })
+    }
+
+    fn own_merge_batch(
+        &self,
+        batch: RecordBatch,
+        _region: Arc<dyn Send + Sync>,
+    ) -> vortex_index::Result<RecordBatch> {
+        if self.reservation.lock().is_none() {
+            return Ok(batch);
+        }
+        let bytes = batch_slice_memory_size(&batch)
+            .map_err(|error| vortex_index::VixError::Callback(error.into()))?;
+        let charge = self
+            .reserve(bytes)
+            .map_err(|error| vortex_index::VixError::Callback(error.into()))?;
+        own_output_batch(batch, charge)
+            .map_err(|error| vortex_index::VixError::Callback(error.into()))
+    }
+
     fn supports_conversion(&self) -> bool {
         self.options.lock().conversion.is_some() && self.reservation.lock().is_some()
     }
@@ -874,6 +912,140 @@ impl vortex_index::VixReadOperation for CoreScanOperation {
     }
 }
 
+/// Account producer values once, before the merge creates output slices.
+/// IO payloads have separate owners; downstream slices retain this charge.
+fn batch_slice_memory_size(batch: &RecordBatch) -> Result<usize> {
+    /// Bytes referenced by long (out-of-line) view values. The length is the
+    /// low 32 bits of each 16-byte view; values of at most 12 bytes are inline.
+    fn long_view_bytes(views: &[u128], nulls: Option<&arrow::buffer::NullBuffer>) -> usize {
+        let len = |view: &u128| {
+            let len = *view as u32 as usize;
+            if len > 12 { len } else { 0 }
+        };
+        match nulls.filter(|nulls| nulls.null_count() > 0) {
+            None => views.iter().map(len).sum(),
+            Some(nulls) => views
+                .iter()
+                .zip(nulls.iter())
+                .map(|(view, valid)| if valid { len(view) } else { 0 })
+                .sum(),
+        }
+    }
+    /// Arrow 58 counts view records but not the out-of-line bytes they
+    /// reference, at any nesting depth. Each view array is charged the
+    /// smaller of its referenced long values and its data buffers: repeated
+    /// values (dictionary expansion) share one backing, and a slice of a
+    /// large decoded chunk references only part of it.
+    fn view_backing_bytes(data: &arrow::array::ArrayData) -> usize {
+        fn charge<T: arrow::datatypes::ByteViewType + ?Sized>(
+            data: &arrow::array::ArrayData,
+        ) -> usize {
+            let array = arrow::array::GenericByteViewArray::<T>::from(data.clone());
+            let backing: usize = array.data_buffers().iter().map(|buffer| buffer.len()).sum();
+            long_view_bytes(array.views(), array.nulls()).min(backing)
+        }
+        let own = match data.data_type() {
+            DataType::Utf8View => charge::<arrow::datatypes::StringViewType>(data),
+            DataType::BinaryView => charge::<arrow::datatypes::BinaryViewType>(data),
+            _ => 0,
+        };
+        data.child_data().iter().fold(own, |bytes, child| {
+            bytes.saturating_add(view_backing_bytes(child))
+        })
+    }
+    fn array_bytes(array: &dyn Array) -> Result<usize> {
+        let data = array.to_data();
+        let bytes = data
+            .get_slice_memory_size()?
+            .saturating_add(view_backing_bytes(&data));
+        Ok(bytes.saturating_add(std::mem::size_of::<arrow::array::ArrayData>()))
+    }
+    batch
+        .columns()
+        .iter()
+        .try_fold(std::mem::size_of::<RecordBatch>(), |bytes, column| {
+            Ok(bytes.saturating_add(array_bytes(column.as_ref())?))
+        })
+}
+
+fn own_projection_batch(
+    input: &RecordBatch,
+    output: RecordBatch,
+    operation: &CoreScanOperation,
+) -> Result<RecordBatch> {
+    fn ranges(data: &arrow::array::ArrayData, out: &mut Vec<std::ops::Range<usize>>) {
+        for buffer in data
+            .buffers()
+            .iter()
+            .chain(data.nulls().map(|n| n.buffer()))
+        {
+            let start = buffer.as_ptr() as usize;
+            out.push(start..start + buffer.len());
+        }
+        for child in data.child_data() {
+            ranges(child, out);
+        }
+    }
+    fn union(mut ranges: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+        ranges.sort_unstable_by_key(|range| range.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| last.end >= range.start) {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        merged
+    }
+    fn column_address(column: &ArrayRef) -> usize {
+        Arc::as_ptr(column) as *const () as usize
+    }
+    // Columns passed through unchanged share the producer charge; only
+    // columns the projection built need their buffers inspected.
+    let mut input_columns: Vec<usize> = input.columns().iter().map(column_address).collect();
+    input_columns.sort_unstable();
+    let mut projected = Vec::new();
+    for column in output.columns() {
+        if input_columns
+            .binary_search(&column_address(column))
+            .is_err()
+        {
+            ranges(&column.to_data(), &mut projected);
+        }
+    }
+    if projected.is_empty() {
+        return Ok(output);
+    }
+    let mut original = Vec::new();
+    for column in input.columns() {
+        ranges(&column.to_data(), &mut original);
+    }
+    let original = union(original);
+    // Both lists are sorted and disjoint: one forward sweep finds the bytes
+    // of each projected range that are not inside a producer buffer.
+    let mut bytes = 0usize;
+    let mut first = 0usize;
+    for range in union(projected) {
+        while first < original.len() && original[first].end <= range.start {
+            first += 1;
+        }
+        let mut shared = 0usize;
+        for old in original[first..]
+            .iter()
+            .take_while(|old| old.start < range.end)
+        {
+            shared += range.end.min(old.end) - range.start.max(old.start);
+        }
+        bytes += range.len() - shared;
+    }
+    if bytes == 0 {
+        Ok(output)
+    } else {
+        own_output_batch(output, operation.reserve(bytes)?)
+    }
+}
+
 struct CoreMemoryCharge {
     reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>>,
     live: Arc<AtomicUsize>,
@@ -882,10 +1054,33 @@ struct CoreMemoryCharge {
 
 impl Drop for CoreMemoryCharge {
     fn drop(&mut self) {
-        if let Some(reservation) = self.reservation.lock().as_ref() {
+        // Shrink and the live count change under one lock, so FileWorkspace
+        // always sees `live` equal to the bytes still held by charges.
+        let reservation = self.reservation.lock();
+        if let Some(reservation) = reservation.as_ref() {
             reservation.shrink(self.bytes);
         }
         self.live.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// The per-file workspace: the opener estimate, the reader high water and
+/// the late-selection allowance. The opener stream and the scan operation
+/// share it. When both are gone, the reservation keeps only the bytes that
+/// output charges still hold, so a retained output row does not keep the
+/// whole file budget.
+struct FileWorkspace {
+    reservation: Arc<parking_lot::Mutex<Option<MemoryReservation>>>,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for FileWorkspace {
+    fn drop(&mut self) {
+        let reservation = self.reservation.lock();
+        if let Some(memory) = reservation.as_ref() {
+            let keep = self.live.load(Ordering::Relaxed);
+            memory.shrink(memory.size().saturating_sub(keep));
+        }
     }
 }
 
@@ -1220,15 +1415,20 @@ impl VixCoreOpener {
                     }
                     None => None,
                 }));
-            let scan_reservation = Arc::clone(&reservation);
             let io_stats = Arc::new(FetchStats::for_source(
                 metrics.clone(), partition, location.to_string(),
             ));
             let io_operation = ReadOperation::new(Arc::clone(&io_stats), None);
             let operation_owner = io_operation.owner_guard();
+            let live_owned_bytes = Arc::new(AtomicUsize::new(0));
+            let workspace = Arc::new(FileWorkspace {
+                reservation: Arc::clone(&reservation),
+                live: Arc::clone(&live_owned_bytes),
+            });
             let operation = Arc::new(CoreScanOperation {
                 io: Arc::clone(&io_operation),
                 reservation: Arc::clone(&reservation),
+                _workspace: Arc::clone(&workspace),
                 reader_high_water: parking_lot::Mutex::new(estimate),
                 options: parking_lot::Mutex::new(vortex_index::NativeScanOptions {
                     predicate,
@@ -1237,7 +1437,7 @@ impl VixCoreOpener {
                 downstream_wait_ns: MetricBuilder::new(&metrics)
                     .with_new_label("file", location.to_string())
                     .counter("vix_downstream_wait_ns", partition),
-                live_owned_bytes: Arc::new(AtomicUsize::new(0)),
+                live_owned_bytes,
                 peak_owned_bytes: AtomicUsize::new(0),
                 peak_reserved_bytes: MetricBuilder::new(&metrics)
                     .with_new_label("file", location.to_string())
@@ -1366,8 +1566,8 @@ impl VixCoreOpener {
                         };
                         // §6.2: under a declared-sort table a CONCAT file
                         // streams through the k-way region merge (its rows
-                        // are only piecewise sorted); each opened region
-                        // grows the reservation by its decode window.
+                        // are only piecewise sorted). IO payloads and decoded
+                        // batches retain independent, releasable charges.
                         if emit_ts_desc && !docs.row_order().is_ts_desc() {
                             return scan_core_docs_merged(
                                 docs,
@@ -1376,16 +1576,8 @@ impl VixCoreOpener {
                                 timestamp_filter,
                                 &column_bounds,
                                 batch_size,
-                                &mut || {
-                                    if let Some(reservation) =
-                                        scan_reservation.lock().as_mut()
-                                    {
-                                        reservation
-                                            .try_grow(chunk_bytes.saturating_mul(3))
-                                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                    }
-                                    Ok(())
-                                },
+                                Some(&operation),
+                                &mut || Ok(()),
                                 &mut send,
                             );
                         }
@@ -1451,9 +1643,17 @@ impl VixCoreOpener {
                         } else {
                             // Receiver may already be gone (e.g. limit
                             // reached); nothing to do then.
-                            let _ = tx.blocking_send(Err(DataFusionError::Execution(format!(
-                                "core .vix scan of {location} failed: {text}"
-                            ))));
+                            let message = format!("core .vix scan of {location} failed: {text}");
+                            let resource_error = e.chain().any(|cause| matches!(
+                                cause.downcast_ref::<DataFusionError>(),
+                                Some(DataFusionError::ResourcesExhausted(_))
+                            ));
+                            let error = if resource_error {
+                                DataFusionError::ResourcesExhausted(message)
+                            } else {
+                                DataFusionError::Execution(message)
+                            };
+                            let _ = tx.blocking_send(Err(error));
                         }
                     }
                     Err(panic) => {
@@ -1485,7 +1685,7 @@ impl VixCoreOpener {
             // Cancellation follows the receiver, while started CPU/IO work
             // retains its own strong reservation until it actually exits.
             let stream = ReceiverStream::new(rx).map(move |item| {
-                let _hold = (&reservation, &operation_owner);
+                let _hold = (&reservation, &operation_owner, &workspace);
                 item
             });
             Ok(stream.boxed())
@@ -1570,14 +1770,16 @@ fn scan_core_docs(
 /// sort above the scan). `on_region_open` is the per-opened-region memory
 /// hook. Used only under a declared-sort table; a file without a proven
 /// region decomposition errs (never a silent unordered stream).
-fn scan_core_docs_merged(
+#[allow(clippy::too_many_arguments)]
+fn scan_core_docs_merged<R: Send + Sync + 'static>(
     docs: VixDocs,
     projected_schema: &SchemaRef,
     selection: Option<&RowIdBitmap>,
     timestamp_filter: Option<(i64, i64)>,
     column_bounds: &[ColumnBound],
     batch_size: usize,
-    on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
+    operation: Option<&CoreScanOperation>,
+    on_region_open: &mut dyn FnMut() -> anyhow::Result<R>,
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
@@ -1585,14 +1787,22 @@ fn scan_core_docs_merged(
     if selection.is_some_and(RowIdBitmap::is_empty) {
         return Ok(());
     }
-    docs.scan_docs_ts_desc_merged_selection(
+    docs.scan_docs_ts_desc_merged_selection_owned(
         Some(&plan.physical_projection),
         rows,
         timestamp_filter,
         column_bounds,
         None,
-        on_region_open,
-        &mut |batch| emit_bounded_batch(plan.project(&batch)?, batch_size, on_batch),
+        &mut || Ok(Arc::new(on_region_open()?) as Arc<dyn Send + Sync>),
+        &mut |batch| {
+            let projected = plan.project(&batch)?;
+            // Only newly allocated projection buffers need another charge.
+            let batch = match operation.filter(|op| op.reservation.lock().is_some()) {
+                Some(operation) => own_projection_batch(&batch, projected, operation)?,
+                None => projected,
+            };
+            emit_bounded_batch(batch, batch_size, on_batch)
+        },
     )
 }
 
@@ -2278,6 +2488,7 @@ mod tests {
             None,
             &[],
             2,
+            None,
             &mut || Ok(()),
             &mut |batch| {
                 merged.push(batch);
@@ -2301,6 +2512,7 @@ mod tests {
             None,
             &[],
             2,
+            None,
             &mut || Ok(()),
             &mut |batch| {
                 selected_merged.push(batch);
@@ -2322,6 +2534,7 @@ mod tests {
             None,
             &[],
             2,
+            None,
             &mut || Ok(()),
             &mut |batch| {
                 sparse_merged.push(batch);
@@ -2376,6 +2589,7 @@ mod tests {
                 None,
                 &[],
                 1,
+                None,
                 &mut || Ok(()),
                 &mut |_| anyhow::bail!("intentional downstream stop"),
             )
@@ -2789,6 +3003,7 @@ mod tests {
         );
 
         // and the merged output is really the 5 newest rows, newest first
+        assert!(rendered.contains("fetch=5"), "{rendered}");
         let batches = collect(plan, ctx.task_ctx()).await?;
         let mut rows = Vec::new();
         for batch in &batches {
@@ -3115,7 +3330,15 @@ mod tests {
     /// len)`) stored back-to-back, stamped `row_order=concat` exactly like
     /// a concatenation-merge output. NOT globally sorted whenever a later
     /// run is newer than the previous run's tail.
-    fn build_concat_core_file(runs: &[(i64, usize)], level: &str) -> bytes::Bytes {
+    pub(super) fn build_concat_core_file(runs: &[(i64, usize)], level: &str) -> bytes::Bytes {
+        build_concat_core_file_with_chunk_rows(runs, level, 0)
+    }
+
+    pub(super) fn build_concat_core_file_with_chunk_rows(
+        runs: &[(i64, usize)],
+        level: &str,
+        chunk_rows: usize,
+    ) -> bytes::Bytes {
         let schema = Arc::new(Schema::new(vec![
             Field::new("_timestamp", DataType::Int64, false),
             Field::new("level", DataType::Utf8, true),
@@ -3123,6 +3346,7 @@ mod tests {
         let opts = VixWriterOptions {
             row_group_size: 4,
             concat_row_order: true,
+            docs_chunk_max_rows: chunk_rows,
             ..Default::default()
         };
         let timestamps: Vec<i64> = runs

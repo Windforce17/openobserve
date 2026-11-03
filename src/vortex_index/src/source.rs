@@ -59,9 +59,25 @@ pub trait VixReadOperation: Send + Sync {
         Ok(())
     }
 
+    /// Own a newly allocated IO payload until its last buffer reference drops.
+    /// Shared resident bytes and opening metadata do not use this hook.
+    fn reserve_io(&self, _bytes: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
+        Ok(None)
+    }
+
     /// Execution policy is private to this operation, never to a cached reader.
     fn scan_options(&self) -> crate::NativeScanOptions {
         crate::NativeScanOptions::default()
+    }
+
+    /// Admit decoded merge batches before they enter the producer channel.
+    /// Returned buffers must retain their admission through downstream slices.
+    fn own_merge_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+        _region: Arc<dyn Send + Sync>,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        Ok(batch)
     }
 
     /// Only callers with strong allocation ownership may queue conversions.
@@ -88,6 +104,31 @@ pub trait VixReadOperation: Send + Sync {
         Err(VixError::Malformed(
             "operation does not own downstream conversion buffers".to_string(),
         ))
+    }
+}
+
+struct OwnedIoBytes<T> {
+    bytes: T,
+    _charge: Arc<dyn Send + Sync>,
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for OwnedIoBytes<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+fn own_io_bytes(bytes: Bytes, operation: Option<&dyn VixReadOperation>) -> Result<Bytes> {
+    match operation
+        .map(|op| op.reserve_io(bytes.len()))
+        .transpose()?
+        .flatten()
+    {
+        Some(charge) => Ok(Bytes::from_owner(OwnedIoBytes {
+            bytes,
+            _charge: charge,
+        })),
+        None => Ok(bytes),
     }
 }
 
@@ -139,17 +180,28 @@ impl PrefetchedWindows {
 
     /// Register `bytes` as the content of `range`, merging with adjacent or
     /// overlapping windows so a coalesced read over neighbours stays covered.
-    pub(crate) fn add(&self, range: Range<u64>, bytes: Bytes) {
+    pub(crate) fn add(&self, range: Range<u64>, bytes: Bytes) -> Result<()> {
+        // The field prefetch caller already reserves these windows through
+        // ReaderMemory. Only recording IO windows need payload ownership.
+        self.add_with_operation(range, bytes, None)
+    }
+
+    fn add_with_operation(
+        &self,
+        range: Range<u64>,
+        bytes: Bytes,
+        operation: Option<&dyn VixReadOperation>,
+    ) -> Result<()> {
         debug_assert_eq!(bytes.len() as u64, range.end - range.start);
         if range.is_empty() {
-            return;
+            return Ok(());
         }
         let mut windows = self.windows.write();
         let first = windows.partition_point(|(window, _)| window.end < range.start);
         let last = windows.partition_point(|(window, _)| window.start <= range.end);
         if first == last {
             windows.insert(first, (range, bytes));
-            return;
+            return Ok(());
         }
         // Every drained neighbour touches `range`, and neighbours are pairwise
         // disjoint, so in start order each part begins at or before the bytes
@@ -174,7 +226,11 @@ impl PrefetchedWindows {
             offset = window.end;
         }
         debug_assert_eq!(offset, end);
-        windows.insert(first, (start..end, merged.freeze()));
+        windows.insert(
+            first,
+            (start..end, own_io_bytes(merged.freeze(), operation)?),
+        );
+        Ok(())
     }
 
     /// The bytes of `range` when a single window covers all of it.
@@ -718,9 +774,10 @@ async fn fetch_footer_range(
     footer: &FooterState,
     range: Range<u64>,
     operation: Option<&dyn VixReadOperation>,
+    account_payload: bool,
 ) -> VortexResult<Bytes> {
     let Some(ranges) = footer.ranges.get() else {
-        return fetch_native_range(source, range, operation).await;
+        return fetch_native_range(source, range, operation, account_payload).await;
     };
     if let Some((cached, bytes)) = ranges
         .iter()
@@ -734,7 +791,7 @@ async fn fetch_footer_range(
         .iter()
         .any(|(cached, _)| cached.start < range.end && range.start < cached.end)
     {
-        return fetch_native_range(source, range, operation).await;
+        return fetch_native_range(source, range, operation, account_payload).await;
     }
     let mut bytes = BytesMut::with_capacity((range.end - range.start) as usize);
     let mut offset = range.start;
@@ -744,7 +801,8 @@ async fn fetch_footer_range(
         }
         if offset < cached.start {
             bytes.extend_from_slice(
-                &fetch_native_range(source, offset..cached.start, operation).await?,
+                &fetch_native_range(source, offset..cached.start, operation, account_payload)
+                    .await?,
             );
             offset = cached.start;
         }
@@ -755,18 +813,29 @@ async fn fetch_footer_range(
         offset = end;
     }
     if offset < range.end {
-        bytes.extend_from_slice(&fetch_native_range(source, offset..range.end, operation).await?);
+        bytes.extend_from_slice(
+            &fetch_native_range(source, offset..range.end, operation, account_payload).await?,
+        );
     }
-    Ok(bytes.freeze())
+    let bytes = bytes.freeze();
+    if account_payload {
+        own_io_bytes(bytes, operation).map_err(|error| vortex_err!(External: error))
+    } else {
+        Ok(bytes)
+    }
 }
 
 async fn fetch_native_range(
     source: &dyn VixRangeSource,
     range: Range<u64>,
     operation: Option<&dyn VixReadOperation>,
+    account_payload: bool,
 ) -> VortexResult<Bytes> {
     if operation.is_some_and(|op| op.is_cancelled()) {
         return Err(vortex_err!(External: VixError::Cancelled));
+    }
+    if let Some(bytes) = source.resident(range.clone()) {
+        return Ok(bytes);
     }
     let bytes = source
         .fetch(range.clone())
@@ -782,7 +851,11 @@ async fn fetch_native_range(
             bytes.len()
         ));
     }
-    Ok(bytes)
+    if account_payload {
+        own_io_bytes(bytes, operation).map_err(|error| vortex_err!(External: error))
+    } else {
+        Ok(bytes)
+    }
 }
 
 impl RangedBlob {
@@ -1291,12 +1364,18 @@ impl VortexReadAt for BlobReadAt {
                         &footer,
                         start..end,
                         operation.as_deref(),
+                        !opening,
                     )
                     .await?;
                     // a recording window set keeps what this scan fetched for
                     // the scans that follow it on the same handle
                     if let Some(windows) = prefetched.as_ref().filter(|w| w.records()) {
-                        windows.add(start..end, bytes.clone());
+                        // Opening reads are admitted by OpeningMemory, so a
+                        // merged copy of them does not take a second IO charge.
+                        let charge_to = if opening { None } else { operation.as_deref() };
+                        windows
+                            .add_with_operation(start..end, bytes.clone(), charge_to)
+                            .map_err(|error| vortex_err!(External: error))?;
                     }
                     bytes
                 }
@@ -1318,9 +1397,29 @@ impl VortexReadAt for BlobReadAt {
             } else {
                 bytes
             };
-            Ok(BufferHandle::new_host(
-                ByteBuffer::from(bytes).aligned(alignment),
-            ))
+            let buffer = ByteBuffer::from(bytes);
+            // aligned() copies when needed. Keep the new allocation's charge
+            // on the aligned buffer, not on the discarded unaligned input.
+            let buffer = if !opening && !buffer.is_aligned(alignment) {
+                let charge = operation
+                    .as_deref()
+                    .map(|op| op.reserve_io(length))
+                    .transpose()
+                    .map_err(|error| vortex_err!(External: error))?
+                    .flatten();
+                let buffer = buffer.aligned(alignment);
+                match charge {
+                    Some(charge) => ByteBuffer::from(Bytes::from_owner(OwnedIoBytes {
+                        bytes: buffer,
+                        _charge: charge,
+                    }))
+                    .aligned(alignment),
+                    None => buffer,
+                }
+            } else {
+                buffer.aligned(alignment)
+            };
+            Ok(BufferHandle::new_host(buffer))
         }
         .boxed()
     }
@@ -1336,9 +1435,163 @@ fn _assert_send_sync() {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    struct IoBudget {
+        live: Arc<AtomicUsize>,
+        calls: AtomicUsize,
+        cancelled: AtomicBool,
+        limit: usize,
+    }
+
+    struct IoCharge(Arc<AtomicUsize>, usize);
+    impl Drop for IoCharge {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1, Ordering::SeqCst);
+        }
+    }
+    impl VixReadOperation for IoBudget {
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+        fn reserve_io(&self, bytes: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let previous = self.live.fetch_add(bytes, Ordering::SeqCst);
+            if previous + bytes > self.limit {
+                self.live.fetch_sub(bytes, Ordering::SeqCst);
+                return Err(VixError::Callback(anyhow::anyhow!(
+                    "Resources exhausted: test IO needs {bytes} bytes"
+                )));
+            }
+            Ok(Some(Arc::new(IoCharge(self.live.clone(), bytes))))
+        }
+    }
+    fn io_budget(limit: usize) -> Arc<IoBudget> {
+        Arc::new(IoBudget {
+            live: Arc::new(AtomicUsize::new(0)),
+            calls: AtomicUsize::new(0),
+            cancelled: AtomicBool::new(false),
+            limit,
+        })
+    }
+    struct FreshSource;
+    impl VixRangeSource for FreshSource {
+        fn len(&self) -> u64 {
+            128
+        }
+        fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            // Deliberately unaligned to exercise the alignment-copy owner.
+            let data = Bytes::from(vec![7; (range.end - range.start) as usize + 1]).slice(1..);
+            futures::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    #[test]
+    fn io_charge_follows_buffers_not_bridge_or_operation() {
+        let op = io_budget(1024);
+        let blob = RangedBlob::new(Arc::new(FreshSource), 0..128);
+        let read = with_read_operation(op.clone(), || blob.read_at());
+        let bytes = futures::executor::block_on(read.read_at(0, 64, Alignment::of::<u64>()))
+            .unwrap()
+            .unwrap_host();
+        assert_eq!(bytes.as_ref(), &[7; 64]);
+        assert_eq!(op.live.load(Ordering::SeqCst), 64);
+        assert_eq!(
+            op.calls.load(Ordering::SeqCst),
+            2,
+            "the alignment copy needs a new owner"
+        );
+        // ByteBuffer slices must start on the buffer alignment (8 bytes here).
+        let slice = bytes.slice(8..16);
+        drop(bytes);
+        drop(read);
+        drop(blob);
+        assert_eq!(op.live.load(Ordering::SeqCst), 64);
+        drop(slice);
+        assert_eq!(op.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn io_admission_and_cancel_errors_release_payloads() {
+        for (limit, cancel) in [(0, false), (80, false), (1024, true)] {
+            let op = io_budget(limit);
+            let blob = RangedBlob::new(Arc::new(FreshSource), 0..128);
+            let read = with_read_operation(op.clone(), || blob.read_at());
+            op.cancelled.store(cancel, Ordering::SeqCst);
+            let error = futures::executor::block_on(read.read_at(0, 64, Alignment::of::<u64>()))
+                .unwrap_err();
+            let text = error.to_string();
+            assert!(
+                text.contains(if cancel {
+                    "cancelled"
+                } else {
+                    "Resources exhausted"
+                }),
+                "{text}"
+            );
+            drop(read);
+            assert_eq!(op.live.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[test]
+    fn recording_window_copy_replaces_charge_and_footer_never_retains_it() {
+        let op = io_budget(1024);
+        let blob = RangedBlob::new(Arc::new(FreshSource), 0..128);
+        let windows = PrefetchedWindows::recording();
+        with_read_operation(op.clone(), || {
+            let _scope = blob.prefetch_scope(windows.clone());
+            let read = blob.read_at();
+            for offset in [0, 32] {
+                drop(
+                    futures::executor::block_on(read.read_at(offset, 32, Alignment::none()))
+                        .unwrap(),
+                );
+            }
+            assert_eq!(op.live.load(Ordering::SeqCst), 64);
+            let calls = op.calls.load(Ordering::SeqCst);
+            drop(futures::executor::block_on(read.read_at(0, 64, Alignment::none())).unwrap());
+            assert_eq!(
+                op.calls.load(Ordering::SeqCst),
+                calls,
+                "covered windows are not charged again"
+            );
+            // An opening may see a charged recording window. Footer compaction
+            // must detach it before publishing shared reader state.
+            let (read, opening) = blob.opening_read_at();
+            drop(futures::executor::block_on(read.read_at(0, 64, Alignment::none())).unwrap());
+            drop(opening.finish());
+        });
+        drop(windows);
+        assert_eq!(op.live.load(Ordering::SeqCst), 0);
+        let read = with_read_operation(op.clone(), || blob.read_at());
+        let calls = op.calls.load(Ordering::SeqCst);
+        drop(futures::executor::block_on(read.read_at(0, 64, Alignment::none())).unwrap());
+        assert_eq!(op.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(op.live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn opening_and_resident_payloads_do_not_receive_io_charges() {
+        let op = io_budget(0);
+        with_read_operation(op.clone(), || {
+            let blob = RangedBlob::new(Arc::new(FreshSource), 0..128);
+            let (read, opening) = blob.opening_read_at();
+            drop(futures::executor::block_on(read.read_at(0, 64, Alignment::none())).unwrap());
+            drop(opening.finish());
+            let blob = RangedBlob::new(
+                BytesRangeSource::new("resident", Bytes::from(vec![7; 128])),
+                0..128,
+            );
+            drop(
+                futures::executor::block_on(blob.read_at().read_at(0, 64, Alignment::none()))
+                    .unwrap(),
+            );
+        });
+        assert_eq!(op.calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn encoded_footer_ranges_fetch_only_missing_overlap_windows() {

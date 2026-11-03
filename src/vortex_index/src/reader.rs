@@ -2657,7 +2657,7 @@ impl VixReader {
             Some(previous) => previous.merge(pending),
             None => pending,
         });
-        prefetch.windows.add(window, compact_bytes(bytes));
+        prefetch.windows.add(window, compact_bytes(bytes))?;
         Ok(())
     }
 

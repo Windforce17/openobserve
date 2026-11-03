@@ -2146,6 +2146,33 @@ impl VixDocs {
         on_region_open: &mut dyn FnMut() -> anyhow::Result<()>,
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        self.scan_docs_ts_desc_merged_selection_owned(
+            projection,
+            rows,
+            ts_range,
+            bounds,
+            limit,
+            &mut || {
+                on_region_open()?;
+                Ok(Arc::new(()) as Arc<dyn Send + Sync>)
+            },
+            on_batch,
+        )
+    }
+
+    /// Keep each region workspace alive with its producer and cursor.
+    /// The operation admits decoded batches before publication to the channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_docs_ts_desc_merged_selection_owned(
+        &self,
+        projection: Option<&[String]>,
+        rows: Option<Selection>,
+        ts_range: Option<(i64, i64)>,
+        bounds: &[ColumnBound],
+        limit: Option<u64>,
+        on_region_open: &mut dyn FnMut() -> anyhow::Result<Arc<dyn Send + Sync>>,
+        on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let _scope = self.enter_read()?;
         use std::cmp::Reverse;
 
@@ -2344,8 +2371,8 @@ impl VixDocs {
         };
 
         // one cursor per region: a lazily spawned scan thread streaming
-        // batches over a 1-slot channel (≤2 decoded batches resident per
-        // OPEN region), plus the in-batch position
+        // batches over a one-slot channel. Producer, slot and cursor may each
+        // own one batch; downstream slices can retain older batches.
         struct Cursor {
             work: Option<RegionWork>, // taken by open()
             rx: Option<std::sync::mpsc::Receiver<anyhow::Result<RecordBatch>>>,
@@ -2353,6 +2380,7 @@ impl VixDocs {
             pos: usize,
             ts: i64,
             opened: bool,
+            owner: Option<Arc<dyn Send + Sync>>,
         }
         impl Cursor {
             /// The current batch's `_timestamp` values (non-null by contract).
@@ -2386,6 +2414,7 @@ impl VixDocs {
                         Err(_) => {
                             self.rx = None;
                             self.batch = None;
+                            self.owner = None;
                             return Ok(false);
                         }
                     }
@@ -2393,26 +2422,28 @@ impl VixDocs {
             }
         }
 
-        let mut cursors: Vec<Cursor> = work
-            .iter()
-            .map(|_| Cursor {
-                work: None,
-                rx: None,
-                batch: None,
-                pos: 0,
-                ts: i64::MIN,
-                opened: false,
-            })
-            .collect();
-        for (cursor, (item, _)) in cursors.iter_mut().zip(work.iter_mut()) {
-            cursor.work = Some(std::mem::replace(
-                item,
-                RegionWork::Selection(Selection::All, None),
-            ));
-        }
-
-        let mut remaining = limit;
         std::thread::scope(|scope| -> anyhow::Result<()> {
+            // Locals drop before the scope joins, including callback unwinding.
+            let mut cursors: Vec<Cursor> = work
+                .iter()
+                .map(|_| Cursor {
+                    work: None,
+                    rx: None,
+                    batch: None,
+                    pos: 0,
+                    ts: i64::MIN,
+                    opened: false,
+                    owner: None,
+                })
+                .collect();
+            for (cursor, (item, _)) in cursors.iter_mut().zip(work.iter_mut()) {
+                cursor.work = Some(std::mem::replace(
+                    item,
+                    RegionWork::Selection(Selection::All, None),
+                ));
+            }
+
+            let mut remaining = limit;
             let result = (|| -> anyhow::Result<()> {
                 // max-heap on (ts key, smaller region index wins ties)
                 let mut heap: std::collections::BinaryHeap<(i64, Reverse<usize>)> =
@@ -2424,7 +2455,8 @@ impl VixDocs {
                     let cursor = &mut cursors[index];
                     if !cursor.opened {
                         // open at its bound: spawn the region's scan stream
-                        on_region_open()?;
+                        let owner = on_region_open()?;
+                        cursor.owner = Some(Arc::clone(&owner));
                         cursor.opened = true;
                         let (tx, rx) =
                             std::sync::mpsc::sync_channel::<anyhow::Result<RecordBatch>>(1);
@@ -2451,6 +2483,14 @@ impl VixDocs {
                                         None,
                                         0,
                                         &mut |batch| {
+                                            let batch =
+                                                match crate::source::current_read_operation() {
+                                                    Some(operation) => operation.own_merge_batch(
+                                                        batch,
+                                                        Arc::clone(&owner),
+                                                    )?,
+                                                    None => batch,
+                                                };
                                             tx.send(Ok(batch)).map_err(|_| {
                                                 VixError::Callback(anyhow::anyhow!(
                                                     "merge consumer dropped"
@@ -2541,6 +2581,7 @@ impl VixDocs {
             for cursor in &mut cursors {
                 cursor.rx.take();
                 cursor.batch.take();
+                cursor.owner.take();
             }
             result
         })
@@ -3137,7 +3178,10 @@ mod memory_regressions {
 
         let adequate = Budget::new(64 * 1024 * 1024);
         let docs = with_read_operation(adequate.clone(), || VixDocs::open(data)).unwrap();
-        assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
+        assert_eq!(
+            docs.eq_string_count("value", "needle", None).unwrap(),
+            Some(256)
+        );
         assert!(adequate.peak() > input + metadata);
     }
 
@@ -3200,7 +3244,10 @@ mod memory_regressions {
                 }
             })
             .unwrap();
-            assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
+            assert_eq!(
+                docs.eq_string_count("value", "needle", None).unwrap(),
+                Some(256)
+            );
         }
     }
 
@@ -3224,9 +3271,10 @@ mod memory_regressions {
             );
             let cancelled = Budget::new(usize::MAX);
             cancelled.cancelled.store(true, Ordering::Release);
-            let error =
-                with_read_operation(cancelled, || docs.eq_string_count("missing", "needle", None))
-                    .unwrap_err();
+            let error = with_read_operation(cancelled, || {
+                docs.eq_string_count("missing", "needle", None)
+            })
+            .unwrap_err();
             assert!(error.chain().any(|cause| matches!(
                 cause.downcast_ref::<VixError>(),
                 Some(VixError::Cancelled)
@@ -3246,7 +3294,10 @@ mod memory_regressions {
             );
             assert!(docs.decoded_stats.get().is_none());
             assert_eq!(docs.pruned_scan_ranges(None, &[bound]), Some(Vec::new()));
-            assert_eq!(docs.eq_string_count("value", "needle", None).unwrap(), Some(256));
+            assert_eq!(
+                docs.eq_string_count("value", "needle", None).unwrap(),
+                Some(256)
+            );
         }
     }
 
@@ -3273,8 +3324,9 @@ mod memory_regressions {
             }
             let after = Budget::new(usize::MAX);
             assert_eq!(
-                with_read_operation(after.clone(), || docs.eq_string_count("missing", "needle", None))
-                    .unwrap(),
+                with_read_operation(after.clone(), || docs
+                    .eq_string_count("missing", "needle", None))
+                .unwrap(),
                 None
             );
             assert!(
