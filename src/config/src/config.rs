@@ -949,10 +949,12 @@ pub struct Grpc {
     #[env_config(
         name = "ZO_GRPC_CLIENT_KEEPALIVE_INTERVAL",
         default = 10,
-        help = "Seconds between HTTP/2 keepalive PINGs on inter-node gRPC client connections, \
-                also while the connection is idle. A peer that does not acknowledge a PING \
-                within ZO_GRPC_CLIENT_KEEPALIVE_TIMEOUT is treated as dead: the connection \
-                is closed and its in-flight calls fail instead of hanging. 0 disables keepalive."
+        help = "Seconds between HTTP/2 keepalive PINGs on inter-node gRPC connections, also \
+                while the connection is idle. Applies to client connections and to the \
+                connections this node's gRPC server accepts. A peer that does not acknowledge \
+                a PING within ZO_GRPC_CLIENT_KEEPALIVE_TIMEOUT is treated as dead: the \
+                connection is closed and its in-flight calls fail instead of hanging, and a \
+                server no longer waits for it at shutdown. 0 disables keepalive."
     )]
     pub client_keepalive_interval: u64,
     #[env_config(
@@ -2879,7 +2881,13 @@ pub struct Limit {
     pub grpc_runtime_worker_num: usize, // equals to cpu_num if 0
     #[env_config(name = "ZO_GRPC_RUNTIME_BLOCKING_WORKER_NUM", default = 0)]
     pub grpc_runtime_blocking_worker_num: usize, // equals to 512 if 0
-    #[env_config(name = "ZO_GRPC_RUNTIME_SHUTDOWN_TIMEOUT", default = 10)] // seconds
+    #[env_config(
+        name = "ZO_GRPC_RUNTIME_SHUTDOWN_TIMEOUT",
+        default = 10,
+        help = "Seconds the gRPC server waits at shutdown for its connections to finish \
+                gracefully, and then for the gRPC runtime's blocking tasks. Connections still \
+                open after it are dropped."
+    )]
     pub grpc_runtime_shutdown_timeout: u64,
     #[env_config(name = "ZO_JOB_RUNTIME_WORKER_NUM", default = 0)]
     pub job_runtime_worker_num: usize, // equals to cpu_num if 0

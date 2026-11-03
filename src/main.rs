@@ -408,7 +408,7 @@ async fn run() -> Result<(), anyhow::Error> {
             rt.handle().clone(),
         );
 
-        let _guard = rt.enter();
+        let guard = rt.enter();
         rt.block_on(async move {
             let ret = if config::cluster::LOCAL_NODE.is_router() {
                 init_router_grpc_server(grpc_init_tx, grpc_shutdown_rx, grpc_stopped_tx).await
@@ -420,6 +420,12 @@ async fn run() -> Result<(), anyhow::Error> {
                 std::process::exit(1);
             }
         });
+        drop(guard);
+        // Dropping a runtime waits without limit for its blocking tasks; bound it so a stuck
+        // task cannot hold back the backend job shutdown (WAL flush, db close) that follows.
+        rt.shutdown_timeout(Duration::from_secs(
+            get_config().limit.grpc_runtime_shutdown_timeout,
+        ));
     });
 
     // wait for gRPC init
@@ -665,7 +671,13 @@ async fn init_common_grpc_server(
         .initial_connection_window_size(config::GRPC_HTTP2_CONNECTION_WINDOW_SIZE)
         .http2_adaptive_window(Some(cfg.grpc.http2_adaptive_window))
         .tcp_nodelay(true);
-    let ret = builder
+    let builder = infra::grpc_server::with_keepalive(
+        builder,
+        cfg.grpc.client_keepalive_interval,
+        cfg.grpc.client_keepalive_timeout,
+    );
+    let (drain_tx, drain_rx) = oneshot::channel();
+    let serve = builder
         .layer(tonic::service::InterceptorLayer::new(check_auth))
         .add_service(event_svc)
         .add_service(search_svc)
@@ -679,11 +691,17 @@ async fn init_common_grpc_server(
         .add_service(flight_svc)
         .add_service(node_svc)
         .add_service(cluster_info_svc)
-        .serve_with_shutdown(gaddr, async {
+        .serve_with_shutdown(gaddr, async move {
             shutdown_rx.await.ok();
             log::info!("gRPC server starts shutting down");
-        })
-        .await;
+            drain_tx.send(()).ok();
+        });
+    let ret = infra::grpc_server::serve_with_drain_timeout(
+        serve,
+        drain_rx,
+        Duration::from_secs(cfg.limit.grpc_runtime_shutdown_timeout),
+    )
+    .await;
     if let Err(e) = ret {
         return Err(anyhow::anyhow!("{e}"));
     }
@@ -735,16 +753,28 @@ async fn init_router_grpc_server(
         .initial_connection_window_size(config::GRPC_HTTP2_CONNECTION_WINDOW_SIZE)
         .http2_adaptive_window(Some(cfg.grpc.http2_adaptive_window))
         .tcp_nodelay(true);
-    let ret = builder
+    let builder = infra::grpc_server::with_keepalive(
+        builder,
+        cfg.grpc.client_keepalive_interval,
+        cfg.grpc.client_keepalive_timeout,
+    );
+    let (drain_tx, drain_rx) = oneshot::channel();
+    let serve = builder
         .layer(tonic::service::InterceptorLayer::new(check_auth))
         .add_service(logs_svc)
         .add_service(metrics_svc)
         .add_service(traces_svc)
-        .serve_with_shutdown(gaddr, async {
+        .serve_with_shutdown(gaddr, async move {
             shutdown_rx.await.ok();
             log::info!("gRPC server starts shutting down");
-        })
-        .await;
+            drain_tx.send(()).ok();
+        });
+    let ret = infra::grpc_server::serve_with_drain_timeout(
+        serve,
+        drain_rx,
+        Duration::from_secs(cfg.limit.grpc_runtime_shutdown_timeout),
+    )
+    .await;
     if let Err(e) = ret {
         return Err(anyhow::anyhow!("{e}"));
     }
