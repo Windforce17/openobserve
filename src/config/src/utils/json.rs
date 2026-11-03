@@ -116,22 +116,11 @@ pub fn estimate_json_bytes(val: &Value) -> usize {
             }
         }
         Value::String(s) => {
-            // count quotes and backslashes in one pass; these add an extra byte when escaped
-            // also we use bytes() here as sometimes compiler can optimize it faster with sse
-            // see https://users.rust-lang.org/t/count-number-of-z-in-a-string/49763/5
-            let (quote_count, slash_count) =
-                s.bytes()
-                    .fold((0usize, 0usize), |(quote_count, slash_count), b| {
-                        (
-                            quote_count + usize::from(b == b'"'),
-                            slash_count + usize::from(b == b'\\'),
-                        )
-                    });
-            // "?"=>2
-            size += s.len() + 2 + quote_count + slash_count;
+            // quotes and backslashes add an extra byte when escaped; "?"=>2
+            size += s.len() + 2 + count_quotes_and_backslashes(s);
         }
         Value::Number(n) => {
-            size += n.to_string().len();
+            size += display_len(n);
         }
         Value::Bool(b) => {
             // true for 4 bytes, false for 5 bytes
@@ -142,6 +131,49 @@ pub fn estimate_json_bytes(val: &Value) -> usize {
         }
     }
     size
+}
+
+/// Number of `"` and `\` bytes in `s`.
+///
+/// Counted per 32-byte chunk into a `u32` (at most 32 per chunk, so it never
+/// overflows), which the compiler vectorizes; the previous two-counter `fold`
+/// over `bytes()` did not vectorize and was ~6x slower in a standalone
+/// micro-benchmark on an M5 Pro (19.3 vs 3.0-3.4 GB/s).
+/// estimate_json_bytes runs it over every string of every ingested record.
+fn count_quotes_and_backslashes(s: &str) -> usize {
+    let mut chunks = s.as_bytes().chunks_exact(32);
+    let mut total = 0usize;
+    for chunk in &mut chunks {
+        let mut count: u32 = 0;
+        for &b in chunk {
+            count += u32::from((b == b'"') | (b == b'\\'));
+        }
+        total += count as usize;
+    }
+    total
+        + chunks
+            .remainder()
+            .iter()
+            .filter(|&&b| b == b'"' || b == b'\\')
+            .count()
+}
+
+/// `value.to_string().len()` without building the string: estimate_json_bytes
+/// runs over every number of every ingested record.
+fn display_len(value: &impl std::fmt::Display) -> usize {
+    struct LenCounter(usize);
+    impl std::fmt::Write for LenCounter {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 += s.len();
+            Ok(())
+        }
+    }
+    let mut counter = LenCounter(0);
+    // the counter never fails, so only a broken Display impl could error
+    if std::fmt::write(&mut counter, format_args!("{value}")).is_err() {
+        return value.to_string().len();
+    }
+    counter.0
 }
 
 /// NOTE: caller should check if the path == '.', because if so,
@@ -569,5 +601,71 @@ mod tests {
             estimate_json_bytes(&with_special),
             estimate_json_bytes(&without_special)
         );
+    }
+
+    /// `estimate_json_bytes` counts a number's length without building its
+    /// string: the count must equal `to_string().len()` for every number form
+    /// (the workspace parses numbers with `arbitrary_precision`).
+    #[test]
+    fn test_number_display_len_matches_to_string() {
+        let parsed = [
+            "0",
+            "-0",
+            "7",
+            "-42",
+            "1e10",
+            "1E+2",
+            "-1.5e-7",
+            "3.14159",
+            "0.1",
+            "1.0",
+            "18446744073709551615",
+            "-9223372036854775808",
+            "123456789012345678901234567890",
+            "1.7976931348623157e308",
+        ];
+        let mut numbers: Vec<Number> = parsed
+            .iter()
+            .map(|s| from_str::<Number>(s).unwrap_or_else(|e| panic!("parse {s}: {e}")))
+            .collect();
+        numbers.extend([
+            Number::from(u64::MAX),
+            Number::from(i64::MIN),
+            Number::from(0u8),
+        ]);
+        numbers.extend(
+            [0.1, -2.5e-300, 1e21, f64::MAX, f64::MIN_POSITIVE]
+                .into_iter()
+                .filter_map(Number::from_f64),
+        );
+        for n in numbers {
+            assert_eq!(display_len(&n), n.to_string().len(), "number {n}");
+            assert_eq!(
+                estimate_json_bytes(&Value::Number(n.clone())),
+                n.to_string().len(),
+                "number {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn count_quotes_and_backslashes_matches_per_byte_count() {
+        // every length across the 32-byte chunk boundaries, with specials at
+        // varying offsets and multi-byte UTF-8 between them
+        let pieces = ["a", "\"", "\\", "é", "中", "\\\"", " "];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for len in 0..200 {
+            for _ in 0..8 {
+                let mut s = String::new();
+                while s.len() < len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    s.push_str(pieces[(state % pieces.len() as u64) as usize]);
+                }
+                let expected = s.bytes().filter(|&b| b == b'"' || b == b'\\').count();
+                assert_eq!(count_quotes_and_backslashes(&s), expected, "{s:?}");
+            }
+        }
     }
 }

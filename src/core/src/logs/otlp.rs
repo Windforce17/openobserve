@@ -119,6 +119,8 @@ pub async fn handle_request(
     let mut res = ExportLogsServiceResponse {
         partial_success: None,
     };
+    // one stream per request: read its flatten level once, not per record
+    let flatten_level = get_flatten_level(org_id, &stream_name, StreamType::Logs).await;
     for resource_log in request.resource_logs {
         if resource_log.scope_logs.is_empty() {
             continue;
@@ -167,36 +169,50 @@ pub async fn handle_request(
                     continue;
                 }
 
-                let mut rec = json::json!({});
-                rec.as_object_mut().unwrap().extend(service_att_map.clone());
+                // The resource attributes start every record of the resource.
+                // Cloning the map copies it in order; extending an empty map
+                // re-inserted every key. Inserts below keep the former
+                // assignment order, so a later key still overwrites an earlier
+                // one with the same name.
+                let mut map = service_att_map.clone();
 
                 if let Some(lib) = &instrumentation_logs.scope {
-                    let library_name = lib.name.to_owned();
-                    if !library_name.is_empty() {
-                        rec["instrumentation_library_name"] =
-                            serde_json::Value::String(library_name);
+                    if !lib.name.is_empty() {
+                        map.insert(
+                            "instrumentation_library_name".to_string(),
+                            json::Value::String(lib.name.to_owned()),
+                        );
                     }
-                    let lib_version = lib.version.to_owned();
-                    if !lib_version.is_empty() {
-                        rec["instrumentation_library_version"] =
-                            serde_json::Value::String(lib_version);
+                    if !lib.version.is_empty() {
+                        map.insert(
+                            "instrumentation_library_version".to_string(),
+                            json::Value::String(lib.version.to_owned()),
+                        );
                     }
                 }
 
-                rec[TIMESTAMP_COL_NAME.to_string()] = timestamp.into();
-                rec["severity"] = if !log_record.severity_text.is_empty() {
-                    log_record.severity_text.to_owned().into()
-                } else {
-                    log_record.severity_number.into()
-                };
+                map.insert(TIMESTAMP_COL_NAME.to_string(), timestamp.into());
+                map.insert(
+                    "severity".to_string(),
+                    if !log_record.severity_text.is_empty() {
+                        log_record.severity_text.to_owned().into()
+                    } else {
+                        log_record.severity_number.into()
+                    },
+                );
 
-                rec["body"] = get_val(&log_record.body.as_ref());
-                rec["dropped_attributes_count"] = log_record.dropped_attributes_count.into();
+                map.insert("body".to_string(), get_val(&log_record.body.as_ref()));
+                map.insert(
+                    "dropped_attributes_count".to_string(),
+                    log_record.dropped_attributes_count.into(),
+                );
 
-                log_record.attributes.iter().for_each(|local_attr| {
-                    rec[local_attr.key.as_str()] =
-                        get_val_with_type_retained(&local_attr.value.as_ref());
-                });
+                for local_attr in &log_record.attributes {
+                    map.insert(
+                        local_attr.key.clone(),
+                        get_val_with_type_retained(&local_attr.value.as_ref()),
+                    );
+                }
 
                 match TraceId::from_bytes(
                     log_record
@@ -208,7 +224,7 @@ pub async fn handle_request(
                 ) {
                     TraceId::INVALID => {}
                     trace_id => {
-                        rec["trace_id"] = trace_id.to_string().into();
+                        map.insert("trace_id".to_string(), trace_id.to_string().into());
                     }
                 };
 
@@ -217,9 +233,10 @@ pub async fn handle_request(
                 ) {
                     SpanId::INVALID => {}
                     span_id => {
-                        rec["span_id"] = span_id.to_string().into();
+                        map.insert("span_id".to_string(), span_id.to_string().into());
                     }
                 };
+                let mut rec = json::Value::Object(map);
 
                 // store a copy of original data before it's modified, when
                 // 1. original data is an object
@@ -250,8 +267,6 @@ pub async fn handle_request(
                     let size: &mut usize = size_by_stream.entry(stream_name.clone()).or_insert(0);
                     *size += estimate_json_bytes(&rec);
                     // JSON Flattening - use per-stream flatten level
-                    let flatten_level =
-                        get_flatten_level(org_id, &stream_name, StreamType::Logs).await;
                     rec = flatten::flatten_with_level(rec, flatten_level)?;
 
                     // get json object
@@ -386,7 +401,6 @@ pub async fn handle_request(
                 let size: &mut usize = size_by_stream.entry(stream_name.clone()).or_insert(0);
                 *size += estimate_json_bytes(&rec);
 
-                let flatten_level = get_flatten_level(org_id, &stream_name, StreamType::Logs).await;
                 rec = flatten::flatten_with_level(rec, flatten_level)?;
 
                 let mut local_val = match rec.take() {

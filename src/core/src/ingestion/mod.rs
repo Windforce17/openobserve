@@ -21,7 +21,7 @@ use std::{
     },
 };
 
-use chrono::{Duration, TimeZone, Utc};
+use chrono::{Datelike, Duration, TimeZone, Timelike, Utc};
 use config::{
     SIZE_IN_MB,
     cluster::{LOCAL_NODE, LOCAL_NODE_ID},
@@ -341,19 +341,31 @@ pub fn get_write_partition_key(
     local_val: &Map<String, Value>,
     suffix: Option<&str>,
 ) -> String {
-    // get time file name
-    let mut time_key = match time_level {
-        PartitionTimeLevel::Unset | PartitionTimeLevel::Hourly => Utc
-            .timestamp_nanos(timestamp * 1000)
-            .format("%Y/%m/%d/%H")
-            .to_string(),
-        PartitionTimeLevel::Daily => Utc
-            .timestamp_nanos(timestamp * 1000)
-            .format("%Y/%m/%d/00")
-            .to_string(),
+    // Runs once per ingested record. Same text as chrono's "%Y/%m/%d/%H"
+    // ("%Y/%m/%d/00" for daily), written digit by digit: chrono re-parses the
+    // format string on every call.
+    let time = Utc.timestamp_nanos(timestamp * 1000);
+    let hour = match time_level {
+        PartitionTimeLevel::Unset | PartitionTimeLevel::Hourly => time.hour(),
+        PartitionTimeLevel::Daily => 0,
     };
+    let mut time_key = String::with_capacity(64);
+    let year = time.year();
+    if (0..=9999).contains(&year) {
+        push_zero_padded_digits(&mut time_key, year as u32, 4);
+    } else {
+        // chrono's %Y adds a sign outside 0..=9999; keep its text.
+        time_key.push_str(&time.format("%Y").to_string());
+    }
+    time_key.push('/');
+    push_zero_padded_digits(&mut time_key, time.month(), 2);
+    time_key.push('/');
+    push_zero_padded_digits(&mut time_key, time.day(), 2);
+    time_key.push('/');
+    push_zero_padded_digits(&mut time_key, hour, 2);
     if let Some(s) = suffix {
-        time_key.push_str(&format!("/{s}"));
+        time_key.push('/');
+        time_key.push_str(s);
     } else {
         time_key.push_str("/default");
     }
@@ -366,9 +378,18 @@ pub fn get_write_partition_key(
             None => "null".to_string(),
         };
         let val = key.get_partition_key(&val);
-        time_key.push_str(&format!("/{}", format_partition_key(&val)));
+        time_key.push('/');
+        time_key.push_str(&format_partition_key(&val));
     }
     time_key
+}
+
+/// Appends the last `width` decimal digits of `value`, zero-padded.
+fn push_zero_padded_digits(out: &mut String, value: u32, width: u32) {
+    for exp in (0..width).rev() {
+        let digit = (value / 10u32.pow(exp)) % 10;
+        out.push(char::from(b'0' + digit as u8));
+    }
 }
 
 pub fn init_functions_runtime() -> Runtime {
@@ -691,6 +712,96 @@ mod tests {
             ),
             "1970/01/01/00/default"
         );
+    }
+
+    /// The implementation before digit-by-digit formatting.
+    fn reference_write_partition_key(
+        timestamp: i64,
+        partition_keys: &Vec<StreamPartition>,
+        time_level: PartitionTimeLevel,
+        local_val: &Map<String, Value>,
+        suffix: Option<&str>,
+    ) -> String {
+        let mut time_key = match time_level {
+            PartitionTimeLevel::Unset | PartitionTimeLevel::Hourly => Utc
+                .timestamp_nanos(timestamp * 1000)
+                .format("%Y/%m/%d/%H")
+                .to_string(),
+            PartitionTimeLevel::Daily => Utc
+                .timestamp_nanos(timestamp * 1000)
+                .format("%Y/%m/%d/00")
+                .to_string(),
+        };
+        if let Some(s) = suffix {
+            time_key.push_str(&format!("/{s}"));
+        } else {
+            time_key.push_str("/default");
+        }
+        for key in partition_keys {
+            if key.disabled {
+                continue;
+            }
+            let val = match local_val.get(&key.field) {
+                Some(v) => get_string_value(v),
+                None => "null".to_string(),
+            };
+            let val = key.get_partition_key(&val);
+            time_key.push_str(&format!("/{}", format_partition_key(&val)));
+        }
+        time_key
+    }
+
+    #[test]
+    fn test_get_write_partition_key_matches_strftime() {
+        // Largest |micros| for which `timestamp * 1000` fits in i64.
+        let max_us = i64::MAX / 1000;
+        let mut timestamps = vec![
+            0,
+            1,
+            -1,
+            1620000000,
+            3_599_999_999,
+            3_600_000_000,
+            -3_600_000_001,
+            951_782_400_000_000, // 2000-02-29T00:00:00Z
+            1_793_000_000_000_000,
+            max_us,
+            -max_us,
+        ];
+        let mut state: u64 = 7;
+        for _ in 0..20_000 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            timestamps.push(((state >> 1) as i64) % max_us * if state & 1 == 0 { 1 } else { -1 });
+        }
+        let mut disabled = StreamPartition::new("sport");
+        disabled.disabled = true;
+        let partition_keys = vec![
+            StreamPartition::new("country"),
+            StreamPartition::new("missing"),
+            disabled,
+        ];
+        let mut local_val = Map::new();
+        local_val.insert("country".to_string(), Value::String("U/SA".to_string()));
+        local_val.insert("sport".to_string(), Value::String("basketball".to_string()));
+        for ts in timestamps {
+            for level in [
+                PartitionTimeLevel::Unset,
+                PartitionTimeLevel::Hourly,
+                PartitionTimeLevel::Daily,
+            ] {
+                for suffix in [None, Some("suffix")] {
+                    for keys in [&vec![], &partition_keys] {
+                        assert_eq!(
+                            get_write_partition_key(ts, keys, level, &local_val, suffix),
+                            reference_write_partition_key(ts, keys, level, &local_val, suffix),
+                            "ts {ts} level {level:?} suffix {suffix:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

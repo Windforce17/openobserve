@@ -7393,6 +7393,7 @@ dependencies = [
  "log",
  "maxminddb",
  "md5",
+ "memchr",
  "mimalloc",
  "multer",
  "o2_dex",

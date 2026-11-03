@@ -13,10 +13,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{
-    collections::HashMap,
-    io::{BufReader, Cursor, Lines},
-};
+use std::collections::HashMap;
 
 use ::common::meta::stream::SchemaRecords;
 use axum::body::Bytes;
@@ -438,7 +435,7 @@ impl From<std::io::Error> for IngestionError {
 
 pub enum IngestionDataIter {
     JSONIter(std::vec::IntoIter<json::Value>),
-    MultiIter(Lines<BufReader<Cursor<bytes::Bytes>>>),
+    MultiIter(MultiLines),
     GCP(
         std::vec::IntoIter<json::Value>,
         Option<GCPIngestionResponse>,
@@ -447,6 +444,53 @@ pub enum IngestionDataIter {
         std::vec::IntoIter<json::Value>,
         Option<KinesisFHIngestionResponse>,
     ),
+}
+
+/// The lines of an NDJSON (`_multi`/`_rum`) body, borrowed from the body
+/// instead of copied into one `String` per line.
+///
+/// Yields exactly what `BufRead::lines` yielded: lines split on `\n`, one
+/// `\r` dropped before a `\n` (but not at the end of the body), and std's own
+/// InvalidData error for a line that is not UTF-8.
+pub struct MultiLines {
+    data: bytes::Bytes,
+    pos: usize,
+}
+
+impl MultiLines {
+    pub fn new(data: bytes::Bytes) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    pub fn next_line(&mut self) -> Option<Result<&str, std::io::Error>> {
+        let rest = &self.data[self.pos..];
+        if rest.is_empty() {
+            return None;
+        }
+        let (line, consumed) = match memchr::memchr(b'\n', rest) {
+            Some(end) => {
+                let line = &rest[..end];
+                (line.strip_suffix(b"\r").unwrap_or(line), end + 1)
+            }
+            None => (rest, rest.len()),
+        };
+        self.pos += consumed;
+        Some(std::str::from_utf8(line).map_err(|_| invalid_utf8_error(line)))
+    }
+}
+
+/// The error `BufRead::lines` returns for `line`. The request error message
+/// is the Debug form of this error, so it is std's own value, not a lookalike.
+fn invalid_utf8_error(line: &[u8]) -> std::io::Error {
+    let mut reader = line;
+    match std::io::BufRead::read_line(&mut reader, &mut String::new()) {
+        Err(e) => e,
+        // unreachable: the caller saw `line` fail UTF-8 validation
+        Ok(_) => std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ),
+    }
 }
 
 pub enum HecStatus {
@@ -963,5 +1007,59 @@ mod tests {
         assert!(obj.contains_key("_seq_no"));
         assert!(obj.contains_key("_primary_term"));
         assert!(obj.contains_key("originalRecord"));
+    }
+
+    /// `MultiLines` replaced `BufReader::lines` on `_multi` bodies: for every
+    /// body it must yield the same lines and the same errors, in order.
+    #[test]
+    fn test_multi_lines_matches_bufread_lines() {
+        use std::io::BufRead;
+
+        let long_line = "x".repeat(20_000);
+        let mut bodies: Vec<Vec<u8>> = [
+            "",
+            "\n",
+            "\n\n",
+            "a",
+            "a\n",
+            "a\nb",
+            "a\r\nb\r\n",
+            "a\r",
+            "a\r\r\n",
+            "\r\n",
+            "\r",
+            "a\rb\n",
+            "{\"k\":1}\n  \n{\"k\":2}\r\n\t\n{\"k\":3}",
+            "{\"k\":\"\u{3000}\"}\n\u{3000}\n\u{feff}\n",
+        ]
+        .iter()
+        .map(|s| s.as_bytes().to_vec())
+        .collect();
+        bodies.push(b"ok\n\xff\xfe\nafter\n".to_vec());
+        bodies.push(b"\xe4\xb8\n".to_vec());
+        bodies.push(b"tail \xe4\xb8".to_vec());
+        bodies.push(b"\xe4\xb8\r\nnext".to_vec());
+        // lines longer than BufReader's 8 KiB buffer, valid and invalid
+        bodies.push(format!("{long_line}\n{long_line}\r\nend").into_bytes());
+        bodies.push([long_line.as_bytes(), b"\xff\n", long_line.as_bytes()].concat());
+
+        for body in bodies {
+            let expected: Vec<Result<String, String>> =
+                std::io::BufReader::new(std::io::Cursor::new(bytes::Bytes::from(body.clone())))
+                    .lines()
+                    .map(|line| line.map_err(|e| format!("{e:?}")))
+                    .collect();
+            let mut lines = MultiLines::new(bytes::Bytes::from(body.clone()));
+            let mut actual = Vec::new();
+            while let Some(line) = lines.next_line() {
+                actual.push(line.map(str::to_string).map_err(|e| format!("{e:?}")));
+            }
+            assert_eq!(
+                actual,
+                expected,
+                "body {:?}",
+                String::from_utf8_lossy(&body)
+            );
+        }
     }
 }

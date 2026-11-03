@@ -15,7 +15,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{BufRead, Cursor, Read},
+    io::{Cursor, Read},
 };
 
 use axum::http;
@@ -55,7 +55,7 @@ use crate::{
     common::meta::ingestion::{
         AWSRecordType, BulkResponse, GCPIngestionResponse, IngestUser, IngestionData,
         IngestionDataIter, IngestionError, IngestionRequest, IngestionResponse, IngestionStatus,
-        IngestionValueType, KinesisFHIngestionResponse, StreamStatus,
+        IngestionValueType, KinesisFHIngestionResponse, MultiLines, StreamStatus,
     },
     service::{
         format_stream_name, get_formatted_stream_name,
@@ -194,10 +194,7 @@ pub async fn ingest(
     let json_req: Vec<json::Value>; // to hold json request because of borrow checker
     let (endpoint, usage_type, data) = match in_req {
         IngestionRequest::JSON(req) => {
-            json_req = json::from_slice(&req).unwrap_or({
-                let val: json::Value = json::from_slice(&req)?;
-                vec![val]
-            });
+            json_req = parse_json_records(&req)?;
             (
                 "/api/org/ingest/logs/_json",
                 UsageType::Json,
@@ -240,10 +237,7 @@ pub async fn ingest(
             IngestionData::Multi(req),
         ),
         IngestionRequest::Usage(req) => {
-            json_req = json::from_slice(&req).unwrap_or({
-                let val: json::Value = json::from_slice(&req)?;
-                vec![val]
-            });
+            json_req = parse_json_records(&req)?;
             (
                 "/api/org/ingest/logs/_usage",
                 UsageType::Json,
@@ -849,21 +843,32 @@ pub fn handle_timestamp(
     Ok(timestamp)
 }
 
+/// The records of a `_json`/`_usage` body: a top-level array's elements, or
+/// the body itself as the only record. One parse: the error for an invalid
+/// body is the `Value` parse error that the former array-then-value parse
+/// also returned, since that second parse always ran.
+fn parse_json_records(body: &[u8]) -> std::result::Result<Vec<json::Value>, json::Error> {
+    match json::from_slice::<json::Value>(body)? {
+        json::Value::Array(records) => Ok(records),
+        record => Ok(vec![record]),
+    }
+}
+
 impl Iterator for IngestionDataIter {
     type Item = Result<json::Value, IngestionError>;
 
     fn next(&mut self) -> Option<Result<json::Value, IngestionError>> {
         match self {
             IngestionDataIter::JSONIter(iter) => iter.next().map(Ok),
-            IngestionDataIter::MultiIter(iter) => loop {
-                match iter.next() {
+            IngestionDataIter::MultiIter(lines) => loop {
+                match lines.next_line() {
                     Some(Ok(line)) if line.trim().is_empty() => {
                         // If the line is empty, just continue to the next iteration.
                         continue;
                     }
                     Some(Ok(line)) => {
                         // If the line is not empty, attempt to parse it as JSON.
-                        return Some(json::from_str(&line).map_err(IngestionError::from));
+                        return Some(json::from_str(line).map_err(IngestionError::from));
                     }
                     Some(Err(e)) => {
                         // If there's an error reading the line, return it.
@@ -891,10 +896,7 @@ impl IngestionData {
     pub fn iter(self) -> IngestionDataIter {
         match self {
             IngestionData::JSON(vec) => IngestionDataIter::JSONIter(vec.into_iter()),
-            IngestionData::Multi(data) => {
-                let cursor = Cursor::new(data);
-                IngestionDataIter::MultiIter(std::io::BufReader::new(cursor).lines())
-            }
+            IngestionData::Multi(data) => IngestionDataIter::MultiIter(MultiLines::new(data)),
             IngestionData::GCP(request) => {
                 let data = &request.message.data;
                 let request_id = &request.message.message_id;

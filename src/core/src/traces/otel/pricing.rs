@@ -24,14 +24,34 @@
 use std::sync::LazyLock as Lazy;
 
 use regex::Regex;
-use tiktoken_rs::{get_bpe_from_model, o200k_base};
+use tiktoken_rs::{
+    CoreBPE, cl100k_base_singleton, o200k_base_singleton, o200k_harmony_singleton,
+    p50k_base_singleton, p50k_edit_singleton, r50k_base_singleton,
+    tokenizer::{Tokenizer, get_tokenizer},
+};
+
+/// Returns the shared encoder for `model_name`.
+///
+/// Building a `CoreBPE` decodes a 50k-200k entry vocabulary and compiles its
+/// split regex. Building one per call (the old `get_bpe_from_model` path) cost
+/// ~6% of a prod ingester's CPU while encoding itself was ~0.3%. The
+/// tiktoken-rs singletons build each encoder once per process.
+///
+/// The mapping mirrors `tiktoken_rs::get_bpe_from_tokenizer`; models without a
+/// known tokenizer fall back to o200k_base, as before.
+fn encoder_for_model(model_name: &str) -> &'static CoreBPE {
+    match get_tokenizer(model_name) {
+        Some(Tokenizer::O200kHarmony) => o200k_harmony_singleton(),
+        Some(Tokenizer::O200kBase) | None => o200k_base_singleton(),
+        Some(Tokenizer::Cl100kBase) => cl100k_base_singleton(),
+        Some(Tokenizer::R50kBase) | Some(Tokenizer::Gpt2) => r50k_base_singleton(),
+        Some(Tokenizer::P50kBase) => p50k_base_singleton(),
+        Some(Tokenizer::P50kEdit) => p50k_edit_singleton(),
+    }
+}
 
 pub fn calculate_token_count(model_name: &str, prompt: &str) -> i64 {
-    let encoding = match get_bpe_from_model(model_name) {
-        Ok(m) => m,
-        Err(_) => o200k_base().unwrap(),
-    };
-    let tokens = encoding.encode_with_special_tokens(prompt);
+    let tokens = encoder_for_model(model_name).encode_with_special_tokens(prompt);
     tokens.len() as i64
 }
 
@@ -481,5 +501,65 @@ mod tests {
         assert!(gpt4_count > 0);
         assert!(gpt35_count > 0);
         assert!(claude_count > 0);
+    }
+
+    /// The cached encoders must give the same counts as building the encoder
+    /// per call through `get_bpe_from_model` (the previous implementation), for
+    /// every `Tokenizer` variant and for the unknown-model fallback.
+    #[test]
+    fn test_calculate_token_count_matches_per_call_encoder() {
+        use std::collections::HashSet;
+
+        use tiktoken_rs::{get_bpe_from_model, o200k_base};
+
+        let models = [
+            "gpt-oss-20b",
+            "gpt-4o",
+            "o3-mini",
+            "gpt-4",
+            "gpt-3.5-turbo-0125",
+            "text-davinci-003",
+            "text-davinci-001",
+            "text-davinci-edit-001",
+            "gpt2",
+            "claude-sonnet-4-6",
+            "",
+        ];
+        let covered: HashSet<Option<Tokenizer>> = models.iter().map(|m| get_tokenizer(m)).collect();
+        for variant in [
+            Tokenizer::O200kHarmony,
+            Tokenizer::O200kBase,
+            Tokenizer::Cl100kBase,
+            Tokenizer::P50kBase,
+            Tokenizer::R50kBase,
+            Tokenizer::P50kEdit,
+            Tokenizer::Gpt2,
+        ] {
+            assert!(
+                covered.contains(&Some(variant)),
+                "no test model for {variant:?}"
+            );
+        }
+        assert!(covered.contains(&None), "no unknown-model case");
+
+        let prompts = [
+            String::new(),
+            "Hello, world!".to_string(),
+            "Hello! 你好 🌍 世界".to_string(),
+            "<|endoftext|> special <|fim_prefix|> tokens".to_string(),
+            r#"{"role":"user","content":"summarize\n\tthis","n":42}"#.to_string(),
+            "The quick brown fox jumps over the lazy dog. ".repeat(50),
+        ];
+        for model in models {
+            let per_call = get_bpe_from_model(model).unwrap_or_else(|_| o200k_base().unwrap());
+            for prompt in &prompts {
+                let expected = per_call.encode_with_special_tokens(prompt).len() as i64;
+                assert_eq!(
+                    calculate_token_count(model, prompt),
+                    expected,
+                    "model={model:?} prompt={prompt:?}"
+                );
+            }
+        }
     }
 }
