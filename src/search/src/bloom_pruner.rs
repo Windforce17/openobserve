@@ -50,7 +50,7 @@ use config::{
 };
 use futures::stream::{self, StreamExt};
 use infra::bloom::{
-    BLOOM_FOOTER_CACHE, BloomReader,
+    BLOOM_CAPABILITY_CACHE, BLOOM_FOOTER_CACHE, BloomCapabilityCache, BloomReader,
     path::bloom_path,
     sbbf::{BLOCK_BYTES, check_block_with_mask, mask_from_hash},
 };
@@ -93,6 +93,7 @@ const BLOOM_SUFFIX_PROBE_BYTES: u64 = 64 * 1024;
 /// v2 footer proving the file has no column for the predicate's field) —
 /// their tuples are all `false`, this set only tells the counters why.
 enum GroupResult {
+    NoInfo,
     Ok {
         outcomes: Vec<(usize, usize, usize, bool)>,
         absent: Vec<(usize, usize)>,
@@ -314,6 +315,7 @@ pub async fn prune(
     let mut absent_pairs: HashSet<(usize, usize)> = HashSet::new();
     for (_, result) in &results {
         match result {
+            GroupResult::NoInfo => {}
             GroupResult::Ok { outcomes, absent } => {
                 for (file_idx, pred_idx, value_idx, hit) in outcomes {
                     let entry = per_file_match.entry(*file_idx).or_insert_with(|| {
@@ -404,9 +406,13 @@ pub async fn prune(
             dropped_bloom += 1;
         }
     }
+    let summary_skipped = results
+        .iter()
+        .filter(|(_, result)| matches!(result, GroupResult::NoInfo))
+        .count();
     log::info!(
         "[trace_id {trace_id}] search->bloom: stream {org_id}/{stream_type}/{stream_name}, \
-         groups={total_groups}, input={total_input}, kept={} \
+         groups={total_groups}, summary_skipped={summary_skipped}, input={total_input}, kept={} \
          (predicate_hit={kept_predicate_hit}, no_info={kept_no_info}, \
          bucket_failed={kept_bucket_failed}, unparseable_key={kept_unparseable_key}, \
          no_bloom={}), dropped={} (bloom={dropped_bloom}, absent={dropped_absent})",
@@ -425,13 +431,70 @@ async fn run_group(
     predicates: &[Predicate],
     with_bloom: &[FileKey],
 ) -> GroupResult {
+    run_group_with_cache(
+        trace_id,
+        account,
+        path,
+        file_idxs,
+        predicates,
+        with_bloom,
+        &BLOOM_CAPABILITY_CACHE,
+        get_footer(account, path),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_group_with_cache(
+    trace_id: &str,
+    account: &str,
+    path: &str,
+    file_idxs: &[usize],
+    predicates: &[Predicate],
+    with_bloom: &[FileKey],
+    cache: &BloomCapabilityCache,
+    footer: impl std::future::Future<Output = Result<Arc<BloomReader>, FetchError>>,
+) -> GroupResult {
+    // Facts cover every footer member, not this query's file subset. The
+    // composite policy is evaluated now, not when the fact was learned.
+    if predicates.iter().all(|pred| {
+        cache
+            .get(account, path, &pred.field)
+            .is_some_and(|facts| facts.cannot_prune(pred.composite_fallback))
+    }) {
+        return GroupResult::NoInfo;
+    }
     // Step 1: footer (parsed cache → suffix GET + parse on miss). `.bf` is
     // immutable so the cache entry is valid for the file's lifetime.
-    let reader = match get_footer(account, path).await {
+    let reader = match footer.await {
         Ok(reader) => reader,
         Err(e) => return GroupResult::Err(path.to_string(), e),
     };
+    for pred in predicates {
+        if cache.get(account, path, &pred.field).is_none() {
+            cache.put(
+                account,
+                path,
+                &pred.field,
+                reader.field_capability(&pred.field, vortex_index::bloom::COMPOSITE_BLOOM_FIELD),
+            );
+        }
+    }
+    run_group_with_reader(
+        trace_id, account, path, file_idxs, predicates, with_bloom, &reader,
+    )
+    .await
+}
 
+async fn run_group_with_reader(
+    trace_id: &str,
+    account: &str,
+    path: &str,
+    file_idxs: &[usize],
+    predicates: &[Predicate],
+    with_bloom: &[FileKey],
+    reader: &BloomReader,
+) -> GroupResult {
     // Step 2: one block-ROW per (predicate, value) — shared across all files
     // in this group. This is the transposed-layout win: O(predicate×value)
     // reads per group instead of O(files).
@@ -2670,5 +2733,334 @@ mod tests {
             .expect("spawn small-stack thread")
             .join()
             .expect("deep OR chain must not overflow the stack");
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capability_summary_matches_old_group_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use infra::bloom::{BloomBuilder, BloomCapabilityCache, GroupMember};
+
+        let composite = vortex_index::bloom::COMPOSITE_BLOOM_FIELD;
+        for v2 in [false, true] {
+            for with_composite in [false, true] {
+                let mut b = BloomBuilder::new();
+                let i = b.begin_with_blocks(1, "auto_id", 8);
+                b.insert(i, b"hit");
+                if with_composite {
+                    let ci = b.begin_with_blocks(1, composite, 8);
+                    let mut buf = Vec::new();
+                    for probe in 0..vortex_index::bloom::COMPOSITE_GUARD_PROBES {
+                        let key = vortex_index::bloom::composite_guard_key(
+                            "service_name",
+                            probe,
+                            &mut buf,
+                        )
+                        .unwrap();
+                        b.insert(ci, key);
+                    }
+                    let key =
+                        vortex_index::bloom::composite_value_key("service_name", b"api", &mut buf)
+                            .unwrap();
+                    b.insert(ci, key);
+                }
+                let members = vec![
+                    GroupMember::new(
+                        1,
+                        vec![
+                            "service_name".into(),
+                            "auto_id".into(),
+                            "subset_field".into(),
+                        ],
+                    ),
+                    GroupMember::new(2, vec!["service_name".into()]),
+                    GroupMember::new(3, vec![]).with_complete(false),
+                    GroupMember::new(4, vec!["service_name".into()]),
+                ];
+                let blob = if v2 {
+                    BloomWriter::serialize_v2(&members, b.finish()).unwrap()
+                } else {
+                    BloomWriter::serialize(b.finish()).unwrap()
+                };
+                capability_group_case(&blob, v2, with_composite).await;
+            }
+        }
+
+        async fn capability_group_case(blob: &[u8], v2: bool, composite: bool) {
+            let path = format!(
+                "files/o/bloom/u4-tests_logs/2026/05/08/16/{}{}.bf",
+                u8::from(v2),
+                u8::from(composite)
+            );
+            let account = infra::storage::get_account("o", &path).unwrap_or_default();
+            infra::storage::put(&account, &path, bytes::Bytes::copy_from_slice(blob))
+                .await
+                .unwrap();
+            let reader = Arc::new(BloomReader::parse(blob).unwrap());
+            let cache = BloomCapabilityCache::new(4096);
+            let files: Vec<_> = (1..=5)
+                .map(|id| {
+                    let mut f = fk("unused", 1);
+                    f.id = id;
+                    f
+                })
+                .collect();
+            for field in ["service_name", "auto_id", "missing", "subset_field"] {
+                // A first query may see only a present member. The summary
+                // must still remember presence absence in another member.
+                for idxs in [&[0usize][..], &[1, 2, 3, 4][..], &[0, 1, 2, 3, 4][..]] {
+                    for policy in [false, true, false] {
+                        let predicates = vec![Predicate {
+                            field: field.into(),
+                            values: vec!["api".into(), "miss".into()],
+                            composite_fallback: policy,
+                            legacy_admitted: true,
+                        }];
+                        let old = run_group_with_reader(
+                            "u4-old",
+                            &account,
+                            &path,
+                            idxs,
+                            &predicates,
+                            &files,
+                            &reader,
+                        )
+                        .await;
+                        let gets = AtomicUsize::new(0);
+                        let new = run_group_with_cache(
+                            "u4-new",
+                            &account,
+                            &path,
+                            idxs,
+                            &predicates,
+                            &files,
+                            &cache,
+                            async {
+                                gets.fetch_add(1, Ordering::Relaxed);
+                                Ok(Arc::clone(&reader))
+                            },
+                        )
+                        .await;
+                        assert_eq!(
+                            capability_kept(&old, idxs, &predicates),
+                            capability_kept(&new, idxs, &predicates)
+                        );
+                        let before_repeat = gets.load(Ordering::Relaxed);
+                        let repeat = run_group_with_cache(
+                            "u4-repeat",
+                            &account,
+                            &path,
+                            idxs,
+                            &predicates,
+                            &files,
+                            &cache,
+                            async {
+                                gets.fetch_add(1, Ordering::Relaxed);
+                                Ok(Arc::clone(&reader))
+                            },
+                        )
+                        .await;
+                        assert_eq!(
+                            capability_kept(&old, idxs, &predicates),
+                            capability_kept(&repeat, idxs, &predicates)
+                        );
+                        let cannot = reader
+                            .field_capability(field, vortex_index::bloom::COMPOSITE_BLOOM_FIELD)
+                            .cannot_prune(policy);
+                        assert_eq!(matches!(repeat, GroupResult::NoInfo), cannot);
+                        if cannot {
+                            assert_eq!(gets.load(Ordering::Relaxed), before_repeat);
+                        } else {
+                            assert_eq!(gets.load(Ordering::Relaxed), 2);
+                        }
+                    }
+                }
+            }
+            let predicates = vec![
+                Predicate {
+                    field: "service_name".into(),
+                    values: vec!["api".into()],
+                    composite_fallback: false,
+                    legacy_admitted: true,
+                },
+                Predicate {
+                    field: "auto_id".into(),
+                    values: vec!["miss".into()],
+                    composite_fallback: false,
+                    legacy_admitted: true,
+                },
+            ];
+            let gets = AtomicUsize::new(0);
+            let idxs = &[0, 1, 2, 3, 4];
+            let old =
+                run_group_with_reader("old", &account, &path, idxs, &predicates, &files, &reader)
+                    .await;
+            let new = run_group_with_cache(
+                "new",
+                &account,
+                &path,
+                idxs,
+                &predicates,
+                &files,
+                &cache,
+                async {
+                    gets.fetch_add(1, Ordering::Relaxed);
+                    Ok(Arc::clone(&reader))
+                },
+            )
+            .await;
+            assert_eq!(
+                gets.load(Ordering::Relaxed),
+                1,
+                "one useful predicate must prevent a group skip"
+            );
+            assert_eq!(
+                capability_kept(&old, idxs, &predicates),
+                capability_kept(&new, idxs, &predicates)
+            );
+        }
+    }
+
+    fn capability_kept(
+        result: &GroupResult,
+        idxs: &[usize],
+        predicates: &[Predicate],
+    ) -> Vec<usize> {
+        let outcomes = match result {
+            GroupResult::Ok { outcomes, .. } => outcomes,
+            GroupResult::NoInfo => return idxs.to_vec(),
+            GroupResult::Err(path, error) => panic!("unexpected fetch failure for {path}: {error}"),
+        };
+        idxs.iter()
+            .copied()
+            .filter(|fi| {
+                predicates.iter().enumerate().all(|(pi, _)| {
+                    let hits: Vec<_> = outcomes
+                        .iter()
+                        .filter(|(f, p, ..)| f == fi && *p == pi)
+                        .collect();
+                    hits.is_empty() || hits.iter().any(|(_, _, _, hit)| *hit)
+                })
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn capability_summary_learns_cached_footer_and_reprobes_after_both_evictions() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use infra::bloom::BloomFooterCache;
+
+        let mut builder = BloomBuilder::new();
+        builder.begin_with_blocks(1, "trace_id", 8);
+        let blob = BloomWriter::serialize(builder.finish()).unwrap();
+        let reader = Arc::new(BloomReader::parse(&blob).unwrap());
+        let footers = BloomFooterCache::new(1 + reader.memory_size());
+        let cache = BloomCapabilityCache::new(4096);
+        let gets = AtomicUsize::new(0);
+        let predicates = vec![Predicate {
+            field: "service_name".into(),
+            values: vec!["api".into()],
+            composite_fallback: false,
+            legacy_admitted: true,
+        }];
+        let mut file = fk("unused", 1);
+        file.id = 1;
+        let files = vec![file];
+        let idxs = &[0];
+        let old =
+            run_group_with_reader("old", "local", "a", idxs, &predicates, &files, &reader).await;
+        footers.put("a".into(), Arc::clone(&reader));
+
+        // Learning must also work when no physical footer read occurs.
+        let first = run_group_with_cache(
+            "cached",
+            "local",
+            "a",
+            idxs,
+            &predicates,
+            &files,
+            &cache,
+            async { Ok(footers.get("a").expect("resident footer")) },
+        )
+        .await;
+        assert_eq!(
+            capability_kept(&first, idxs, &predicates),
+            capability_kept(&old, idxs, &predicates)
+        );
+        assert!(cache.get("local", "a", "service_name").is_some());
+        footers.put("b".into(), Arc::clone(&reader));
+        assert!(footers.get("a").is_none());
+        let repeat = run_group_with_cache(
+            "summary",
+            "local",
+            "a",
+            idxs,
+            &predicates,
+            &files,
+            &cache,
+            async {
+                gets.fetch_add(1, Ordering::Relaxed);
+                Ok(Arc::clone(&reader))
+            },
+        )
+        .await;
+        assert!(matches!(repeat, GroupResult::NoInfo));
+        assert_eq!(gets.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            capability_kept(&repeat, idxs, &predicates),
+            capability_kept(&old, idxs, &predicates)
+        );
+
+        let facts =
+            reader.field_capability("service_name", vortex_index::bloom::COMPOSITE_BLOOM_FIELD);
+        for index in 0..1000 {
+            cache.put("local", &format!("{index}.bf"), "service_name", facts);
+        }
+        assert!(cache.get("local", "a", "service_name").is_none());
+        assert!(footers.get("a").is_none());
+        let reprobe = run_group_with_cache(
+            "evicted",
+            "local",
+            "a",
+            idxs,
+            &predicates,
+            &files,
+            &cache,
+            async {
+                assert!(footers.get("a").is_none());
+                gets.fetch_add(1, Ordering::Relaxed);
+                let parsed = Arc::new(BloomReader::parse(&blob).unwrap());
+                footers.put("a".into(), Arc::clone(&parsed));
+                Ok(parsed)
+            },
+        )
+        .await;
+        assert!(!matches!(reprobe, GroupResult::NoInfo));
+        assert_eq!(gets.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            capability_kept(&reprobe, idxs, &predicates),
+            capability_kept(&old, idxs, &predicates)
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_summary_parse_failure_is_not_cached() {
+        use infra::bloom::BloomCapabilityCache;
+        let cache = BloomCapabilityCache::new(4096);
+        let predicates = vec![Predicate {
+            field: "service_name".into(),
+            values: vec!["api".into()],
+            composite_fallback: false,
+            legacy_admitted: true,
+        }];
+        for _ in 0..2 {
+            let result =
+                run_group_with_cache("u4", "", "bad.bf", &[], &predicates, &[], &cache, async {
+                    Err(FetchError::Parse(BloomReader::parse(b"bad").unwrap_err()))
+                })
+                .await;
+            assert!(matches!(result, GroupResult::Err(..)));
+            assert!(cache.get("", "bad.bf", "service_name").is_none());
+        }
     }
 }

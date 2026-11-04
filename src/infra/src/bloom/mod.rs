@@ -112,14 +112,16 @@
 //! where tantivy's sparse-index range pruning can't reject and it must
 //! touch every file.
 
+pub mod capability_cache;
 pub mod footer_cache;
 pub mod path;
 pub mod reader;
 pub mod sbbf;
 pub mod writer;
 
+pub use capability_cache::{BLOOM_CAPABILITY_CACHE, BloomCapabilityCache};
 pub use footer_cache::{BLOOM_FOOTER_CACHE, BloomFooterCache};
-pub use reader::{BloomReader, FieldInspect, ReadError, SectionLayout};
+pub use reader::{BloomFieldCapability, BloomReader, FieldInspect, ReadError, SectionLayout};
 pub use sbbf::{
     BLOCK_BYTES, Sbbf, block_index, check_block, check_block_with_mask, expand_bytes,
     false_positive_rate, hash_value, mask_from_hash, num_blocks_for,

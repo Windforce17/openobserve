@@ -131,6 +131,23 @@ pub struct BloomReader {
     group: Option<GroupFooter>,
 }
 
+/// Footer facts for one field, independent of a query's file subset and
+/// composite policy. These facts never prove that a data file lacks a field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BloomFieldCapability {
+    has_section: bool,
+    has_composite: bool,
+    has_absent: bool,
+}
+
+impl BloomFieldCapability {
+    /// True only when no file can produce a per-field, presence or allowed
+    /// composite verdict. A false answer must use the normal probe path.
+    pub fn cannot_prune(self, composite_fallback: bool) -> bool {
+        !(self.has_section || self.has_absent || (composite_fallback && self.has_composite))
+    }
+}
+
 impl std::fmt::Debug for BloomReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BloomReader")
@@ -444,6 +461,22 @@ impl BloomReader {
     /// the file.
     pub fn file_has_column(&self, file_id: u64, name: &str) -> Option<bool> {
         self.group.as_ref()?.file_has_column(file_id, name)
+    }
+
+    /// Summarize all members, including members outside the current query.
+    /// A section's existence is conservative even if none of its members is
+    /// queried. Only authoritative absence enables a presence verdict.
+    pub fn field_capability(&self, field: &str, composite_field: &str) -> BloomFieldCapability {
+        BloomFieldCapability {
+            has_section: self.by_field.contains_key(field),
+            has_composite: self.by_field.contains_key(composite_field),
+            has_absent: self.group.as_ref().is_some_and(|group| {
+                group
+                    .file_pos
+                    .keys()
+                    .any(|&file_id| group.file_has_column(file_id, field) == Some(false))
+            }),
+        }
     }
 
     /// Whether `field`'s section in this group covers `file_id` — i.e. the
@@ -960,5 +993,66 @@ mod tests {
             .unwrap_err(),
             WriteError::DuplicateMember(7)
         ));
+    }
+    #[test]
+    fn capability_matches_reader_for_all_members_and_policies() {
+        use super::super::writer::GroupMember;
+        let composite = "__composite_test";
+        for v2 in [false, true] {
+            for has_composite in [false, true] {
+                for complete in [false, true] {
+                    let mut b = BloomBuilder::new();
+                    let i = b.begin_with_blocks(1, "auto_id", 8);
+                    b.insert(i, b"hit");
+                    if has_composite {
+                        b.begin_with_blocks(2, composite, 8);
+                    }
+                    let members = vec![
+                        GroupMember::new(1, vec!["common".into(), "auto_id".into()]),
+                        GroupMember::new(2, vec!["common".into()]).with_complete(complete),
+                        GroupMember::new(3, vec![]).with_complete(false),
+                    ];
+                    let blob = if v2 {
+                        BloomWriter::serialize_v2(&members, b.finish()).unwrap()
+                    } else {
+                        BloomWriter::serialize(b.finish()).unwrap()
+                    };
+                    let reader = BloomReader::parse(&blob).unwrap();
+                    for field in ["common", "auto_id", "missing", composite] {
+                        let facts = reader.field_capability(field, composite);
+                        for policy in [false, true] {
+                            let old_can_answer = (1..=4).any(|id| {
+                                reader.file_has_column(id, field) == Some(false)
+                                    || reader.column_index(field, id).is_some()
+                                    || (policy && reader.column_index(composite, id).is_some())
+                            });
+                            assert_eq!(
+                                facts.cannot_prune(policy),
+                                !old_can_answer,
+                                "v2={v2}, composite={has_composite}, complete={complete}, field={field}, policy={policy}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capability_is_not_learned_from_query_subset() {
+        use super::super::writer::GroupMember;
+        let members = vec![
+            GroupMember::new(1, vec!["service_name".into()]),
+            GroupMember::new(2, vec![]),
+        ];
+        let blob = BloomWriter::serialize_v2(&members, vec![]).unwrap();
+        let reader = BloomReader::parse(&blob).unwrap();
+        assert_eq!(reader.file_has_column(1, "service_name"), Some(true));
+        assert_eq!(reader.file_has_column(2, "service_name"), Some(false));
+        assert!(
+            !reader
+                .field_capability("service_name", "composite")
+                .cannot_prune(false)
+        );
     }
 }
