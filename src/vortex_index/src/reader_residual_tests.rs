@@ -134,6 +134,71 @@ impl crate::VixReadOperation for ResidualParent {
         self.events.lock().push(Event::Check(bytes));
         Ok(())
     }
+    fn reserve_io(&self, _: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
+        panic!("residual IO must use its own pending owner, not the parent IO hook");
+    }
+}
+
+#[test]
+fn residual_cold_parent_scope_reuses_footer_and_charges_current_io_owner() {
+    let (data, _) = residual_fixture(20_001);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let source = Arc::new(ResidualSource {
+        bytes: data,
+        memory: Mutex::new(None),
+        events: events.clone(),
+    });
+    let parent = Arc::new(ResidualParent {
+        events: events.clone(),
+        cancelled: AtomicBool::new(false),
+    });
+    let reader = crate::with_read_operation(parent, || {
+        let mut reader = VixReader::open_ranged(source.clone()).unwrap();
+        let BlobHandle::Ranged(blob) = &mut reader.docs_blob else {
+            panic!("fixture must be ranged");
+        };
+        blob.source = source.clone();
+        let before = crate::container::native_open_counts();
+        reader.docs_schema().unwrap();
+        *source.memory.lock() = Some(Arc::downgrade(&reader.memory));
+        events.lock().clear();
+        let selected = BooleanBuffer::new_set(20_001);
+        let result = reader
+            .filter_docs_columns_rows(&["body"], &selected, 64 * 1024 * 1024, &mut |batch| {
+                Ok(arrow::array::BooleanArray::from(vec![
+                    true;
+                    batch.num_rows()
+                ]))
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, selected);
+        let after = crate::container::native_open_counts();
+        assert_eq!(after.1 - before.1, 1, "docs footer must parse exactly once");
+        assert_eq!(
+            after.0 - before.0,
+            1,
+            "same logical operation must share registries"
+        );
+        let events = events.lock();
+        let mut fetches = 0;
+        for pair in events.windows(2) {
+            if let Event::Fetch { before, bytes } = pair[0] {
+                fetches += 1;
+                assert!(
+                    matches!(pair[1], Event::Check(owned) if owned == before + bytes),
+                    "fresh payload must be charged exactly once through residual pending: {pair:?}"
+                );
+            }
+        }
+        assert!(fetches > 0, "cold fixture must fetch payload");
+        reader
+    });
+    assert_eq!(
+        reader.memory.total.load(Ordering::Acquire),
+        reader.memory.size(),
+        "all temporary owners must release when the parent scope exits"
+    );
 }
 
 #[test]

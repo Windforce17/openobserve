@@ -285,7 +285,7 @@ impl Drop for PendingMemory {
 
 /// Scan-local ownership for the same Vortex selection used by the scan fallback.
 /// IO and Arrow output are charged after materialization, just like that scan.
-struct ResidualReadOperation {
+pub(crate) struct ResidualReadOperation {
     parent: Option<Arc<dyn crate::VixReadOperation>>,
     memory: Arc<ReaderMemory>,
     max_bytes: u64,
@@ -3309,7 +3309,7 @@ impl VixReader {
         });
         let mut next = 0usize;
         let mut row_ids = selected.set_indices();
-        let result = crate::with_read_operation(operation.clone(), || {
+        let result = crate::source::with_residual_read_operation(operation.clone(), || {
             scan_blob_streaming(
                 &self.docs_blob,
                 Some(names),

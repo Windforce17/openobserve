@@ -40,6 +40,10 @@ use tokio::{
 use vortex_index::VixRangeSource;
 
 #[cfg(test)]
+#[path = "residual_route_tests.rs"]
+mod residual_route_tests;
+
+#[cfg(test)]
 mod warmup_tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

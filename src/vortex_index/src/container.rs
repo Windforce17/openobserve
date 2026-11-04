@@ -116,6 +116,13 @@ fn native_registry_workspace() -> Result<usize> {
 thread_local! {
     static NATIVE_READ_REGISTRIES: RefCell<Option<Rc<NativeReadRegistries>>> = const { RefCell::new(None) };
     static NATIVE_SCHEMA_FOOTER: RefCell<Option<Rc<NativeSchemaFooter>>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static NATIVE_OPEN_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn native_open_counts() -> (usize, usize) {
+    NATIVE_OPEN_COUNTS.with(std::cell::Cell::get)
 }
 
 pub(crate) struct NativeReadScope {
@@ -162,6 +169,11 @@ impl NativeReadRegistries {
     fn new(memory: Arc<crate::reader::ReaderMemory>) -> Result<Self> {
         let workspace = native_registry_workspace()?;
         let pending = memory.reserve(workspace)?;
+        #[cfg(test)]
+        NATIVE_OPEN_COUNTS.with(|counts| {
+            let (registries, footers) = counts.get();
+            counts.set((registries + 1, footers));
+        });
         // Match the builtin registry defaults in VortexSessionDefault without
         // constructing its RuntimeSession, allocator or MultiFileSession cache.
         let registries = Self {
@@ -2736,6 +2748,11 @@ fn open_blob_inner(
         }
         BlobHandle::Ranged(ranged) => {
             let (read, opening) = ranged.opening_read_at();
+            #[cfg(test)]
+            NATIVE_OPEN_COUNTS.with(|counts| {
+                let (registries, footers) = counts.get();
+                counts.set((registries, footers + 1));
+            });
             let options = if let Some(metadata_session) = metadata_session {
                 // Lazy layout children capture the deserialization session.
                 // Give them registries only, never a schema runtime or IO.

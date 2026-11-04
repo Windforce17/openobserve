@@ -263,6 +263,27 @@ impl Drop for PrefetchScope {
 /// Run synchronous work with operation-local cancellation, restoring the
 /// previous scope on normal return, nested calls, and unwinding.
 pub fn with_read_operation<T>(operation: Arc<dyn VixReadOperation>, work: impl FnOnce() -> T) -> T {
+    with_operation_binding(operation, || {
+        let _native_scope = crate::container::enter_native_read_scope();
+        work()
+    })
+}
+
+/// Residual verification is part of the enclosing logical operation. Preserve its
+/// registry and one-shot footer, but bind every newly opened IO bridge to the
+/// residual owner. Without an enclosing operation, own and clear a fresh scope.
+pub(crate) fn with_residual_read_operation<T>(
+    operation: Arc<crate::reader::ResidualReadOperation>,
+    work: impl FnOnce() -> T,
+) -> T {
+    if current_read_operation().is_some() {
+        with_operation_binding(operation, work)
+    } else {
+        with_read_operation(operation, work)
+    }
+}
+
+fn with_operation_binding<T>(operation: Arc<dyn VixReadOperation>, work: impl FnOnce() -> T) -> T {
     struct Restore(Option<Arc<dyn VixReadOperation>>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -271,7 +292,6 @@ pub fn with_read_operation<T>(operation: Arc<dyn VixReadOperation>, work: impl F
         }
     }
     let _restore = Restore(READ_OPERATION.with(|slot| slot.replace(Some(operation))));
-    let _native_scope = crate::container::enter_native_read_scope();
     work()
 }
 
