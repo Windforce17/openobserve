@@ -283,10 +283,74 @@ impl Drop for PendingMemory {
     }
 }
 
+/// Scan-local ownership for the same Vortex selection used by the scan fallback.
+/// IO and Arrow output are charged after materialization, just like that scan.
+struct ResidualReadOperation {
+    parent: Option<Arc<dyn crate::VixReadOperation>>,
+    memory: Arc<ReaderMemory>,
+    max_bytes: u64,
+    spent: std::sync::atomic::AtomicU64,
+    refused: std::sync::atomic::AtomicBool,
+}
+
+impl ResidualReadOperation {
+    fn reserve(&self, bytes: usize) -> Result<PendingMemory> {
+        let spent = self
+            .spent
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |spent| {
+                spent
+                    .checked_add(bytes as u64)
+                    .filter(|next| *next <= self.max_bytes)
+            });
+        if spent.is_err() {
+            self.refused.store(true, Ordering::Release);
+            return Err(VixError::InvalidQuery(
+                "docs filter byte budget exceeded".into(),
+            ));
+        }
+        self.memory.reserve_with(bytes, |owned| {
+            crate::VixReadOperation::check_memory(self, owned)
+        })
+    }
+}
+
+impl crate::VixReadOperation for ResidualReadOperation {
+    fn is_cancelled(&self) -> bool {
+        self.parent
+            .as_ref()
+            .is_some_and(|parent| parent.is_cancelled())
+    }
+
+    fn check_memory(&self, owned_bytes: usize) -> Result<()> {
+        match &self.parent {
+            Some(parent) => parent.check_memory(owned_bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn reserve_io(&self, bytes: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
+        Ok(Some(Arc::new(self.reserve(bytes)?)))
+    }
+}
+
 /// Temporary query ownership stays admitted until its value is discarded.
 struct Admitted<T> {
     value: T,
     _pending: PendingMemory,
+}
+
+fn residual_selection_bytes(selected: &BooleanBuffer) -> usize {
+    // roaring 0.11: array growth and array/bitmap/run replacement can coexist.
+    // Sixteen bytes per value cover both stores plus old/new reallocation buffers.
+    // Container Vec growth needs
+    // at most 256 bytes per 16-bit key; BTree nodes need at most 2048 bytes per
+    // 32-bit partition, including a split. Use the universe as an upper bound
+    // on occupied keys so this calculation itself does not allocate.
+    selected
+        .count_set_bits()
+        .saturating_mul(16)
+        .saturating_add(selected.len().div_ceil(1 << 16).saturating_mul(256))
+        .saturating_add(selected.len().div_ceil(1usize << 32).saturating_mul(2048))
 }
 
 impl<T> Admitted<Vec<T>> {
@@ -3207,86 +3271,103 @@ impl VixReader {
             .collect::<Result<Vec<_>>>()?;
         let projected_schema = schema.project(&indices)?;
         let count = selected.count_set_bits();
-        let scratch_bytes = count
-            .saturating_mul(2 * std::mem::size_of::<u64>())
-            .saturating_add(selected.len().div_ceil(8).saturating_mul(2));
+        let bitmap_bytes = selected.len().div_ceil(512).saturating_mul(64);
+        let selection_bytes = residual_selection_bytes(selected);
+        let scratch_bytes = selection_bytes.saturating_add(bitmap_bytes.saturating_mul(2));
         if scratch_bytes as u64 > max_bytes {
             return Ok(None);
         }
         let _scope = self.memory.enter();
-        // Both the alignment vector and Vortex's selection stay live during the scan.
-        let _scratch = self.memory.reserve(scratch_bytes)?;
-        let rows: Vec<u64> = selected.set_indices().map(|row| row as u64).collect();
+        // Admit selection construction, optimization and aligned output before allocation.
+        let mut _scratch = self.memory.reserve(scratch_bytes)?;
         let mut exact = BooleanBufferBuilder::new(selected.len());
         exact.append_n(selected.len(), false);
-        if rows.is_empty() {
+        let actual_scratch_bytes =
+            selection_bytes.saturating_add((exact.capacity() / 8).saturating_mul(2));
+        let capacity_extra = self
+            .memory
+            .reserve(actual_scratch_bytes.saturating_sub(scratch_bytes))?;
+        _scratch = _scratch.merge(capacity_extra);
+        let scratch_bytes = scratch_bytes.max(actual_scratch_bytes);
+        if scratch_bytes as u64 > max_bytes {
+            return Ok(None);
+        }
+        if count == 0 {
             return Ok(Some(exact.finish()));
         }
+        // Match scan_core_docs: IncludeRoaring is applied by native scan before
+        // Arrow conversion. In particular, do not widen sparse candidates to a Range.
+        let mut selection: roaring::RoaringTreemap =
+            selected.set_indices().map(|row| row as u64).collect();
+        selection.optimize();
+        let operation = Arc::new(ResidualReadOperation {
+            parent: crate::source::current_read_operation(),
+            memory: Arc::clone(&self.memory),
+            max_bytes,
+            spent: std::sync::atomic::AtomicU64::new(scratch_bytes as u64),
+            refused: std::sync::atomic::AtomicBool::new(false),
+        });
         let mut next = 0usize;
-        let mut decoded_bytes = scratch_bytes as u64;
-        let mut refused = false;
-        let result = scan_blob_streaming(
-            &self.docs_blob,
-            Some(names),
-            RowSelection::Indices(rows.clone()),
-            None,
-            None,
-            0,
-            &mut |batch| {
-                check_read_cancelled()?;
-                if batch.schema().fields() != projected_schema.fields()
-                    || batch.num_rows() > rows.len() - next
-                {
-                    return Err(VixError::Malformed(
-                        "docs filter returned unexpected schema or row count".into(),
-                    ));
-                }
-                let batch_bytes = batch.get_array_memory_size();
-                decoded_bytes = decoded_bytes.saturating_add(batch_bytes as u64);
-                if decoded_bytes > max_bytes {
-                    refused = true;
-                    return Err(VixError::InvalidQuery(
-                        "docs filter decoded-byte budget exceeded".into(),
-                    ));
-                }
-                // Keep the predicate's input and scratch admitted until both are dropped.
-                let pending = self.memory.reserve(
-                    batch_bytes
-                        .saturating_mul(2)
-                        .saturating_add(batch.num_rows().saturating_mul(2)),
-                )?;
-                let batch = Admitted {
-                    value: batch,
-                    _pending: pending,
-                };
-                let batch_ref = &batch.value;
-                let mask = predicate(batch_ref).map_err(VixError::Callback)?;
-                if mask.len() != batch_ref.num_rows() {
-                    return Err(VixError::Malformed(
-                        "docs filter predicate returned wrong row count".into(),
-                    ));
-                }
-                for (offset, row) in rows[next..next + batch_ref.num_rows()].iter().enumerate() {
-                    if mask.is_valid(offset) && mask.value(offset) {
-                        exact.set_bit(*row as usize, true);
+        let mut row_ids = selected.set_indices();
+        let result = crate::with_read_operation(operation.clone(), || {
+            scan_blob_streaming(
+                &self.docs_blob,
+                Some(names),
+                RowSelection::Vortex(vortex::scan::selection::Selection::IncludeRoaring(
+                    selection,
+                )),
+                None,
+                None,
+                0,
+                &mut |batch| {
+                    check_read_cancelled()?;
+                    if batch.schema().fields() != projected_schema.fields()
+                        || batch.num_rows() > count - next
+                    {
+                        return Err(VixError::Malformed(
+                            "docs filter returned unexpected schema or row count".into(),
+                        ));
                     }
-                }
-                next += batch_ref.num_rows();
-                drop(mask);
-                drop(batch);
-                check_read_cancelled()?;
-                Ok(())
-            },
-        );
+                    // The output and predicate scratch remain owned throughout
+                    // this synchronous callback; no batch escapes the operation.
+                    let pending = operation.reserve(
+                        batch
+                            .get_array_memory_size()
+                            .saturating_mul(2)
+                            .saturating_add(batch.num_rows().saturating_mul(2)),
+                    )?;
+                    let batch = Admitted {
+                        value: batch,
+                        _pending: pending,
+                    };
+                    let batch_ref = &batch.value;
+                    let mask = predicate(batch_ref).map_err(VixError::Callback)?;
+                    if mask.len() != batch_ref.num_rows() {
+                        return Err(VixError::Malformed(
+                            "docs filter predicate returned wrong row count".into(),
+                        ));
+                    }
+                    for (offset, row) in row_ids.by_ref().take(batch_ref.num_rows()).enumerate() {
+                        if mask.is_valid(offset) && mask.value(offset) {
+                            exact.set_bit(row, true);
+                        }
+                    }
+                    next += batch_ref.num_rows();
+                    drop(mask);
+                    drop(batch);
+                    check_read_cancelled()?;
+                    Ok(())
+                },
+            )
+        });
         check_read_cancelled()?;
-        if refused {
+        if operation.refused.load(Ordering::Acquire) {
             return Ok(None);
         }
         result?;
-        if next != rows.len() {
+        if next != count {
             return Err(VixError::Malformed(format!(
-                "docs filter returned {next} rows, expected {}",
-                rows.len()
+                "docs filter returned {next} candidates, expected {count}"
             ))
             .into());
         }
@@ -8114,6 +8195,9 @@ mod contains_any_tests;
 #[cfg(test)]
 #[path = "reader_dict_window_tests.rs"]
 mod dict_window_tests;
+#[cfg(test)]
+#[path = "reader_residual_tests.rs"]
+mod residual_tests;
 #[cfg(test)]
 #[path = "reader_term_count_tests.rs"]
 mod term_count_tests;

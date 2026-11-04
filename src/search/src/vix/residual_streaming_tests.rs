@@ -16,10 +16,14 @@ use super::super::residual::*;
 use crate::index::{Condition, IndexCondition};
 
 fn fixture(rows: usize) -> (Bytes, Bytes) {
+    fixture_with_string_type(rows, DataType::Utf8)
+}
+
+fn fixture_with_string_type(rows: usize, string_type: DataType) -> (Bytes, Bytes) {
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
-        Field::new("body", DataType::Utf8, true),
-        Field::new("other", DataType::Utf8, true),
+        Field::new("body", string_type.clone(), true),
+        Field::new("other", string_type.clone(), true),
     ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
@@ -29,21 +33,30 @@ fn fixture(rows: usize) -> (Bytes, Bytes) {
                     .map(|row| 1_000_000 - row as i64)
                     .collect::<Vec<_>>(),
             )),
-            Arc::new(StringArray::from(
-                (0..rows)
-                    .map(|row| match row % 13 {
-                        0 => None,
-                        1 => Some("你好 世界 alpha beta CAFÉ"),
-                        2 => Some("alpha gap beta"),
-                        _ => Some("beta alpha"),
-                    })
-                    .collect::<Vec<_>>(),
-            )),
-            Arc::new(StringArray::from(
-                (0..rows)
-                    .map(|row| (row % 29 == 0).then_some("ALPHA BETA 你好 世界"))
-                    .collect::<Vec<_>>(),
-            )),
+            arrow::compute::cast(
+                &StringArray::from(
+                    (0..rows)
+                        .map(|row| match row % 13 {
+                            0 => None,
+                            1 => Some("你好 世界 alpha beta CAFÉ"),
+                            2 => Some("alpha gap beta"),
+                            3 => Some("ALPHA BETA 你好 世界"),
+                            _ => Some("beta alpha"),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                &string_type,
+            )
+            .unwrap(),
+            arrow::compute::cast(
+                &StringArray::from(
+                    (0..rows)
+                        .map(|row| (row % 29 == 0).then_some("ALPHA BETA 你好 世界"))
+                        .collect::<Vec<_>>(),
+                ),
+                &string_type,
+            )
+            .unwrap(),
         ],
     )
     .unwrap();
@@ -156,10 +169,47 @@ fn streaming_phrase_topn_only_uses_verified_rows() {
 
 #[test]
 fn streaming_budget_refuses_without_publishing_prefix() {
-    // The projected layout must produce multiple callbacks, not just zone chunks.
     let count = 200_001;
-    let (data, index) = fixture(count);
-    let reader = VixReader::open_with_index(data, Some(index)).unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("body", DataType::Utf8, false),
+    ]));
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            docs_chunk_max_rows: 100_000,
+            docs_encode_sample_bytes: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    // A small constant first chunk fits the complete conversion envelope.
+    // Distinct longer strings in the next chunk must be refused, without
+    // returning the already verified first chunk as an exact answer.
+    for range in [0..100_000, 100_000..count] {
+        let values = StringArray::from_iter_values(range.clone().map(|row| {
+            if row < 100_000 {
+                "alpha beta".to_owned()
+            } else {
+                format!("alpha beta {row:08}")
+            }
+        }));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    range.clone().map(|row| row as i64 + 1),
+                )),
+                Arc::new(values),
+            ],
+        )
+        .unwrap();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; range.len()]), None)
+            .unwrap();
+    }
+    let (data, index) = writer.finish().unwrap();
+    let reader = VixReader::open_with_index(data.into(), index.map(Bytes::from)).unwrap();
     let rows = BooleanBuffer::new_set(count);
     let original = rows.clone();
     let scope = vec!["body".into(), "other".into()];
@@ -170,7 +220,6 @@ fn streaming_budget_refuses_without_publishing_prefix() {
         refine_select_streaming(&reader, &condition, &[0], &scope, &rows, 0).unwrap(),
         Err(Refusal::TooManyBytes)
     );
-    let scratch = count * 16 + count.div_ceil(8) * 2;
     let mut chunks = Vec::new();
     reader
         .filter_docs_columns_rows(&["body"], &rows, RESIDUAL_SELECT_MAX_BYTES, &mut |batch| {
@@ -185,15 +234,10 @@ fn streaming_budget_refuses_without_publishing_prefix() {
     );
     let mut visited = 0;
     let exact = reader
-        .filter_docs_columns_rows(
-            &["body"],
-            &rows,
-            (scratch + chunks[0].1) as u64,
-            &mut |batch| {
-                visited += batch.num_rows();
-                Ok(BooleanArray::from(vec![true; batch.num_rows()]))
-            },
-        )
+        .filter_docs_columns_rows(&["body"], &rows, 8 * 1024 * 1024, &mut |batch| {
+            visited += batch.num_rows();
+            Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+        })
         .unwrap();
     assert_eq!(
         visited, chunks[0].0,
@@ -394,4 +438,124 @@ fn streaming_sparse_rows_keep_absolute_positions() {
         .expect("sparse rows must stream past the old row cap");
     assert_eq!(actual, expected);
     assert_eq!(&actual & &selected, actual);
+}
+
+#[test]
+fn streaming_multiple_conjuncts_and_string_representations_match_both_paths() {
+    let rows = 8193;
+    let scope = vec!["body".into(), "other".into()];
+    for string_type in [DataType::Utf8, DataType::Utf8View, DataType::LargeUtf8] {
+        let (data, index) = fixture_with_string_type(rows, string_type.clone());
+        let reader = VixReader::open_with_index(data.clone(), Some(index)).unwrap();
+        assert_eq!(
+            reader
+                .docs_schema()
+                .unwrap()
+                .field_with_name("body")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8View,
+            "stored strings are read as Utf8View regardless of input representation"
+        );
+        let selected = BooleanBuffer::new_set(rows);
+        let mut counts = Vec::new();
+        for case_sensitive in [true, false] {
+            let condition = IndexCondition {
+                conditions: vec![
+                    Condition::MatchAll("alpha beta".into()),
+                    Condition::StrMatch("body".into(), "alpha".into(), case_sensitive),
+                ],
+            };
+            let expected = full_scan(data.clone(), &condition, &scope);
+            assert!(expected.count_set_bits() > 0);
+            assert_eq!(
+                refine_superset_within(
+                    &reader,
+                    &condition,
+                    &[0, 1],
+                    &scope,
+                    &selected,
+                    RESIDUAL_MAX_ROWS,
+                    usize::MAX,
+                    Shape::Select,
+                )
+                .unwrap(),
+                Err(Refusal::TooManyRows(rows)),
+            );
+            let old = refine_superset_within(
+                &reader,
+                &condition,
+                &[0, 1],
+                &scope,
+                &selected,
+                rows,
+                usize::MAX,
+                Shape::Select,
+            )
+            .unwrap()
+            .unwrap();
+            let streamed = refine_superset(
+                &reader,
+                &condition,
+                &[0, 1],
+                &scope,
+                &selected,
+                Shape::Select,
+            )
+            .unwrap()
+            .expect("must succeed beyond the old row cap");
+            assert_eq!(
+                old, expected,
+                "type={string_type:?}, sensitive={case_sensitive}"
+            );
+            assert_eq!(
+                streamed, expected,
+                "type={string_type:?}, sensitive={case_sensitive}"
+            );
+            counts.push(expected.count_set_bits());
+        }
+        assert!(counts[1] > counts[0], "fixture must distinguish case modes");
+    }
+}
+
+#[test]
+fn streaming_multiple_conjuncts_after_chunk_only_refusal() {
+    let rows = 4096;
+    let (data, index) = fixture(rows);
+    let reader = VixReader::open_with_index(data.clone(), Some(index)).unwrap();
+    let scope = vec!["body".into(), "other".into()];
+    let condition = IndexCondition {
+        conditions: vec![
+            Condition::MatchAll("alpha beta".into()),
+            Condition::StrMatch("body".into(), "alpha".into(), false),
+        ],
+    };
+    let selected = BooleanBuffer::new_set(rows);
+    assert!(matches!(
+        refine_superset_within(
+            &reader,
+            &condition,
+            &[0, 1],
+            &scope,
+            &selected,
+            RESIDUAL_MAX_ROWS,
+            0,
+            Shape::Select,
+        )
+        .unwrap(),
+        Err(Refusal::TooManyChunks(_))
+    ));
+    let expected = full_scan(data, &condition, &scope);
+    assert!(expected.count_set_bits() > 0);
+    let streamed = refine_select_streaming(
+        &reader,
+        &condition,
+        &[0, 1],
+        &scope,
+        &selected,
+        RESIDUAL_SELECT_MAX_BYTES,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(streamed, expected);
 }

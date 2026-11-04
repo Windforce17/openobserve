@@ -1316,6 +1316,133 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn residual_pool_refusal_falls_back_and_releases_high_water_lease() {
+        use arrow::{
+            array::{BooleanArray, BooleanBufferBuilder, Int64Array, RecordBatch, StringArray},
+            buffer::BooleanBuffer,
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixDocs, VixReader, VixWriter, VixWriterOptions};
+
+        use super::super::residual::{RESIDUAL_SELECT_MAX_BYTES, Refusal, refine_select_streaming};
+        use crate::index::{Condition, IndexCondition};
+        let rows = 8193;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..rows).map(|row| row as i64 + 1),
+                )),
+                Arc::new(StringArray::from_iter_values((0..rows).map(|row| {
+                    let phrase = if row % 3 == 0 {
+                        "alpha beta"
+                    } else {
+                        "alpha gap beta"
+                    };
+                    format!("{phrase} {row:08} {}", "payload".repeat(16))
+                }))),
+            ],
+        )
+        .unwrap();
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows]), None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let data = Bytes::from(data);
+        let reader = VixReader::open_with_index(data.clone(), index.map(Bytes::from)).unwrap();
+        reader.docs_schema().unwrap();
+        let selected = BooleanBuffer::new_set(rows);
+        let condition = IndexCondition {
+            conditions: vec![Condition::MatchAll("alpha beta".into())],
+        };
+        let scope = vec!["body".to_owned()];
+        let pool = ByteGate::new(reader.memory_peak() + 256 * 1024);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation = ReadOperation::new(Arc::new(FetchStats::default()), None);
+        let result = operation
+            .run_evaluation(&permit, || {
+                refine_select_streaming(
+                    &reader,
+                    &condition,
+                    &[0],
+                    &scope,
+                    &selected,
+                    RESIDUAL_SELECT_MAX_BYTES,
+                )
+            })
+            .unwrap();
+        assert_eq!(result, Err(Refusal::TooManyBytes));
+        let error = permit.check_refusal().unwrap_err();
+        assert!(super::super::requires_exact_scan(&error));
+        assert!(
+            pool.state.lock().used > 0,
+            "evaluation keeps the admitted high water until permit drop"
+        );
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+        assert_eq!(count.available_permits(), 1);
+        // Existing exact-scan fallback evaluates the complete unchanged candidate set.
+        let docs = VixDocs::open(data).unwrap();
+        let mut exact = BooleanBufferBuilder::new(rows);
+        docs.scan_docs_selection_opts(
+            None,
+            Some(vortex::scan::selection::Selection::IncludeRoaring(
+                (0..rows as u64).collect(),
+            )),
+            None,
+            &[],
+            None,
+            0,
+            &mut |batch| {
+                let values = condition
+                    .to_physical_expr(batch.schema().as_ref(), &scope)?
+                    .evaluate(&batch)?
+                    .into_array(batch.num_rows())?;
+                let values = values.as_any().downcast_ref::<BooleanArray>().unwrap();
+                for value in values.iter() {
+                    exact.append(value == Some(true));
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            exact.finish(),
+            BooleanBuffer::collect_bool(rows, |row| row % 3 == 0)
+        );
+        assert_eq!(selected.count_set_bits(), rows);
+        // Cancellation is an error, not a successful prefix or a budget refusal.
+        let pool = ByteGate::new(64 * 1024 * 1024);
+        let permit = evaluation_fixture(&pool, &count);
+        let operation = ReadOperation::new(Arc::new(FetchStats::default()), None);
+        let result = operation.run_evaluation(&permit, || {
+            reader.filter_docs_columns_rows(
+                &["body"],
+                &selected,
+                RESIDUAL_SELECT_MAX_BYTES,
+                &mut |batch| {
+                    operation.cancel();
+                    Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+                },
+            )
+        });
+        assert!(matches!(
+            result.unwrap_err().downcast_ref::<vortex_index::VixError>(),
+            Some(vortex_index::VixError::Cancelled)
+        ));
+        assert!(permit.check_refusal().is_ok());
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+        assert_eq!(count.available_permits(), 1);
+    }
+
     fn evaluation_fixture(pool: &Arc<ByteGate>, count: &Arc<Semaphore>) -> EvaluationPermit {
         evaluation_fixture_waiting(pool, count, Duration::from_millis(50))
     }

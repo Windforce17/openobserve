@@ -315,8 +315,20 @@ pub(super) fn refine_select_streaming(
             }
         }
         Ok(BooleanArray::new(matches.finish(), None))
-    })?;
-    Ok(exact.ok_or(Refusal::TooManyBytes))
+    });
+    match exact {
+        Ok(exact) => Ok(exact.ok_or(Refusal::TooManyBytes)),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<super::source::EvaluationMemoryExhausted>()) =>
+        {
+            // The evaluation permit retains its sticky refusal; its outer check
+            // still routes the file to the existing exact-scan fallback.
+            Ok(Err(Refusal::TooManyBytes))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// [`refine_superset`] with explicit candidate-row and touched-chunk caps.
