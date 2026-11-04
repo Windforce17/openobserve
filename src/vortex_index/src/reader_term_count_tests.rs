@@ -113,10 +113,14 @@ fn exact(token: &str) -> VixQuery {
 
 // The baseline's point-leaf path, kept only as a differential oracle.
 fn eager_count(reader: &VixReader, query: &VixQuery) -> u64 {
+    eager_count_result(reader, query).unwrap()
+}
+
+fn eager_count_result(reader: &VixReader, query: &VixQuery) -> Result<u64> {
     let mut prefetch = reader.begin_prefetch();
     let (fid, key) = match query {
         VixQuery::Exact { field, token } => {
-            let fid = reader.require_field_id(field).unwrap();
+            let fid = reader.require_field_id(field)?;
             (fid, reader.composite(token, fid))
         }
         VixQuery::KeyExists { path } => (
@@ -126,18 +130,16 @@ fn eager_count(reader: &VixReader, query: &VixQuery) -> u64 {
         _ => panic!("oracle accepts point leaves only"),
     };
     if let Some(prefetch) = prefetch.as_mut() {
-        reader
-            .prefetch_field_bundle(
-                prefetch,
-                &[(fid, key.as_slice())],
-                Some(PREFETCH_LEAF_CONCURRENCY),
-            )
-            .unwrap();
+        reader.prefetch_field_bundle(
+            prefetch,
+            &[(fid, key.as_slice())],
+            Some(PREFETCH_LEAF_CONCURRENCY),
+        )?;
     }
-    let ordinals = reader.collect_ordinals(query, None).unwrap();
+    let ordinals = reader.collect_ordinals(query, None)?;
     match ordinals.value.as_slice() {
-        [] => 0,
-        [ordinal] => reader.read_doc_count(*ordinal).unwrap(),
+        [] => Ok(0),
+        [ordinal] => reader.read_doc_count(*ordinal),
         _ => panic!("point resolved to multiple ordinals"),
     }
 }
@@ -436,4 +438,334 @@ fn count_leaf_planning_is_bounded_and_reusable_across_spans() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BlockResidence {
+    Mem,
+    Tail,
+    Cache,
+    Cold,
+}
+
+fn set_block_residence(reader: &mut VixReader, mode: BlockResidence) -> Option<Arc<Source>> {
+    match mode {
+        BlockResidence::Mem => None,
+        BlockResidence::Tail => Some(ranged_blob(&mut reader.dict_blocks_blob, true)),
+        BlockResidence::Cache | BlockResidence::Cold => {
+            let source = ranged_blob(&mut reader.dict_blocks_blob, false);
+            if matches!(mode, BlockResidence::Cache) {
+                let index = reader.dict_index().unwrap();
+                for block in 0..index.block_count() {
+                    reader.dict_block(index, block).unwrap();
+                }
+                source.reads.lock().clear();
+            }
+            Some(source)
+        }
+    }
+}
+
+fn synthetic_point_reader(
+    legacy: bool,
+    mode: BlockResidence,
+    blocks: Bytes,
+    directory: crate::dict_blocks::IndexBuilder,
+    term_count: u64,
+) -> (VixReader, Option<Arc<Source>>, Arc<Source>) {
+    let mut reader =
+        VixReader::open_with_index(FIXTURE.0.clone(), Some(FIXTURE.1.clone())).unwrap();
+    let (dict, pages) = directory.finish_with_pages();
+    reader.dict_blob = Some(BlobHandle::Mem(dict.into()));
+    reader.dict_field_pages = (!legacy).then_some(pages);
+    reader.dict_blocks_blob = Some(BlobHandle::Mem(blocks));
+    reader.term_count = term_count;
+    let source = set_block_residence(&mut reader, mode);
+    let terms = ranged_blob(&mut reader.terms_blob, false);
+    (reader, source, terms)
+}
+
+#[test]
+fn resident_point_probe_rejects_zero_and_one_byte_keys() {
+    for legacy in [false, true] {
+        for mode in [
+            BlockResidence::Mem,
+            BlockResidence::Tail,
+            BlockResidence::Cache,
+        ] {
+            for malformed in [vec![], vec![0xff]] {
+                for later in [false, true] {
+                    let make = |mode| {
+                        let (reader, ..) = open(legacy, false);
+                        let fid = reader.require_field_id("value").unwrap();
+                        let first = reader.composite(b"v0000", fid);
+                        let mut block = crate::dict_blocks::BlockBuilder::new();
+                        if later {
+                            block.push(&first).unwrap();
+                        }
+                        block.push(&malformed).unwrap();
+                        let mut directory = crate::dict_blocks::IndexBuilder::new();
+                        directory.push_block(&first, 0, 0).unwrap();
+                        synthetic_point_reader(
+                            legacy,
+                            mode,
+                            block.finish().into(),
+                            directory,
+                            1 + u64::from(later),
+                        )
+                    };
+                    let query = exact("v1023-missing");
+                    let (eager, ..) = make(BlockResidence::Mem);
+                    assert!(matches!(
+                        eager_count_result(&eager, &query),
+                        Err(VixError::Malformed(_))
+                    ));
+                    let (reader, blocks, terms) = make(mode);
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        reader.count(&query)
+                    }));
+                    assert!(
+                        result.is_ok(),
+                        "panic: {legacy} {mode:?} {malformed:?} {later}"
+                    );
+                    let result = result.unwrap();
+                    assert!(
+                        matches!(
+                            result
+                                .as_ref()
+                                .err()
+                                .and_then(|e| e.downcast_ref::<VixError>()),
+                            Some(VixError::Malformed(_))
+                        ),
+                        "expected Malformed: {legacy} {mode:?} {malformed:?} {later}: {result:?}"
+                    );
+                    assert!(blocks.is_none_or(|source| source.reads.lock().is_empty()));
+                    assert!(terms.reads.lock().is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn resident_point_probe_rejects_invalid_ranges_before_slicing() {
+    for legacy in [false, true] {
+        for mode in [
+            BlockResidence::Mem,
+            BlockResidence::Tail,
+            BlockResidence::Cold,
+        ] {
+            for offsets in [vec![5], vec![0, 5], vec![u64::MAX]] {
+                let make = |mode| {
+                    let (reader, ..) = open(legacy, false);
+                    let fid = reader.require_field_id("value").unwrap();
+                    let mut directory = crate::dict_blocks::IndexBuilder::new();
+                    for (ordinal, &offset) in offsets.iter().enumerate() {
+                        let key =
+                            reader.composite(if ordinal == 0 { b"v0000" } else { b"v2000" }, fid);
+                        directory.push_block(&key, offset, ordinal as u64).unwrap();
+                    }
+                    synthetic_point_reader(
+                        legacy,
+                        mode,
+                        Bytes::from_static(&[0; 4]),
+                        directory,
+                        offsets.len() as u64,
+                    )
+                };
+                // Mem blocks retain the baseline's checked point planner;
+                // ranged terms still activate the optimized count probe.
+                let (eager, ..) = make(BlockResidence::Mem);
+                let query = exact("v0000");
+                assert!(matches!(
+                    eager_count_result(&eager, &query),
+                    Err(VixError::Malformed(_))
+                ));
+                let (reader, blocks, terms) = make(mode);
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.count(&query)));
+                assert!(result.is_ok(), "panic: {legacy} {mode:?} {offsets:?}");
+                let result = result.unwrap();
+                assert!(
+                    matches!(
+                        result
+                            .as_ref()
+                            .err()
+                            .and_then(|e| e.downcast_ref::<VixError>()),
+                        Some(VixError::Malformed(_))
+                    ),
+                    "expected Malformed: {legacy} {mode:?} {offsets:?}: {result:?}"
+                );
+                assert!(blocks.is_none_or(|source| source.reads.lock().is_empty()));
+                assert!(terms.reads.lock().is_empty());
+            }
+        }
+    }
+}
+
+static MULTIBLOCK_FIXTURE: LazyLock<(Bytes, Bytes)> = LazyLock::new(|| {
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    let rows = 1200;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from_iter_values((1..=rows).map(i64::from))),
+            Arc::new(StringArray::from_iter_values(
+                (0..rows).map(|i| format!("v{i:04}{}", "x".repeat(1024))),
+            )),
+        ],
+    )
+    .unwrap();
+    let mut writer = crate::VixWriter::new(
+        &schema,
+        crate::VixWriterOptions {
+            encode_threads: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; rows as usize]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    (data.into(), index.unwrap().into())
+});
+
+#[test]
+fn resident_point_probe_matches_eval_across_dictionary_restart_boundaries() {
+    for legacy in [false, true] {
+        let make = |mode| {
+            let index = if legacy {
+                crate::test_support::strip_property_for_tests(
+                    &MULTIBLOCK_FIXTURE.1,
+                    crate::container::PROP_DICT_FIELD_PAGES,
+                )
+                .unwrap()
+                .into()
+            } else {
+                MULTIBLOCK_FIXTURE.1.clone()
+            };
+            let mut reader =
+                VixReader::open_with_index(MULTIBLOCK_FIXTURE.0.clone(), Some(index)).unwrap();
+            let blocks = set_block_residence(&mut reader, mode);
+            let terms = ranged_blob(&mut reader.terms_blob, false);
+            (reader, blocks, terms)
+        };
+        let (oracle, ..) = make(BlockResidence::Mem);
+        let fid = oracle.require_field_id("value").unwrap();
+        let index = oracle.field_index(fid).unwrap();
+        let mut boundaries = Vec::new();
+        for block in index.field_blocks() {
+            let bytes = oracle.dict_block(&index, block).unwrap();
+            let mut keys = Vec::new();
+            crate::dict_blocks::block_scan(&bytes, |_, key| {
+                let (token, field) = split_key(key).unwrap();
+                if field == fid {
+                    keys.push(token.to_vec());
+                }
+                true
+            })
+            .unwrap();
+            if !keys.is_empty() {
+                boundaries.push((keys.first().unwrap().clone(), keys.last().unwrap().clone()));
+            }
+        }
+        assert!(boundaries.len() > crate::dict_blocks::INDEX_RESTART_INTERVAL);
+        let mut cases = Vec::new();
+        for (first, last) in &boundaries {
+            cases.push((first.clone(), 1));
+            cases.push((last.clone(), 1));
+        }
+        for pair in boundaries.windows(2) {
+            let mut missing = pair[0].1.clone();
+            missing.push(0);
+            assert!(missing < pair[1].0);
+            cases.push((missing, 0));
+        }
+        cases.push((Vec::new(), 0));
+        cases.push((vec![0xff], 0));
+        for mode in [
+            BlockResidence::Mem,
+            BlockResidence::Tail,
+            BlockResidence::Cache,
+        ] {
+            let (reader, blocks, terms) = make(mode);
+            let (eager, eager_blocks, eager_terms) = make(mode);
+            for (token, expected) in &cases {
+                let query = VixQuery::Exact {
+                    field: "value".into(),
+                    token: token.clone(),
+                };
+                let block_before = blocks.as_ref().map(|s| s.reads.lock().len()).unwrap_or(0);
+                let terms_before = terms.reads.lock().len();
+                let eager_block_before = eager_blocks
+                    .as_ref()
+                    .map(|s| s.reads.lock().len())
+                    .unwrap_or(0);
+                let eager_terms_before = eager_terms.reads.lock().len();
+                assert_eq!(
+                    reader.count(&query).unwrap(),
+                    *expected,
+                    "{legacy} {mode:?}"
+                );
+                assert_eq!(eager_count(&eager, &query), *expected);
+                assert_eq!(
+                    oracle.eval(&query).unwrap().count_set_bits() as u64,
+                    *expected
+                );
+                if *expected > 0 {
+                    assert_eq!(
+                        blocks
+                            .as_ref()
+                            .map(|s| s.reads.lock()[block_before..].to_vec()),
+                        eager_blocks
+                            .as_ref()
+                            .map(|s| s.reads.lock()[eager_block_before..].to_vec()),
+                    );
+                    assert_eq!(
+                        terms.reads.lock()[terms_before..],
+                        eager_terms.reads.lock()[eager_terms_before..]
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "multiblock legacy={legacy} blocks={} cases={} residence_modes=3",
+            boundaries.len(),
+            cases.len()
+        );
+    }
+}
+
+#[test]
+fn resident_point_probe_preserves_point_scan_stop_boundary() {
+    for legacy in [false, true] {
+        for mode in [
+            BlockResidence::Mem,
+            BlockResidence::Tail,
+            BlockResidence::Cache,
+        ] {
+            for token in ["v0500", "v1000"] {
+                let make = || {
+                    let (reader, ..) = open(legacy, false);
+                    let fid = reader.require_field_id("value").unwrap();
+                    let mut block = crate::dict_blocks::BlockBuilder::new();
+                    block.push(&reader.composite(b"v1000", fid)).unwrap();
+                    block.push(&[0xff]).unwrap();
+                    let mut directory = crate::dict_blocks::IndexBuilder::new();
+                    directory
+                        .push_block(&reader.composite(b"v0000", fid), 0, 0)
+                        .unwrap();
+                    synthetic_point_reader(legacy, mode, block.finish().into(), directory, 2)
+                };
+                let (reader, ..) = make();
+                let (eager, ..) = make();
+                let query = exact(token);
+                assert_eq!(reader.count(&query).unwrap(), eager_count(&eager, &query));
+            }
+        }
+    }
 }

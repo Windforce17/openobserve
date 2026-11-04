@@ -5851,18 +5851,21 @@ impl VixReader {
         if !index.field_blocks().contains(&block) {
             return Ok(true);
         }
-        let range = index.block_range(block, self.dict_blocks_len()?);
+        let blob_len = self.dict_blocks_len()?;
+        let range = index.block_range(block, blob_len);
+        range
+            .end
+            .checked_sub(range.start)
+            .filter(|_| range.end <= blob_len)
+            .ok_or_else(|| VixError::Malformed("invalid point block range".into()))?;
+        let start = usize::try_from(range.start)
+            .map_err(|_| VixError::Malformed("point block offset overflow".into()))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| VixError::Malformed("point block offset overflow".into()))?;
         let resident = match self.dict_blocks_blob.as_ref() {
-            Some(BlobHandle::Mem(bytes)) => {
-                Some(bytes.slice(range.start as usize..range.end as usize))
-            }
+            Some(BlobHandle::Mem(bytes)) => Some(bytes.slice(start..end)),
             Some(BlobHandle::Ranged(blob)) => {
-                let cached = self
-                    .block_cache
-                    .lock()
-                    .0
-                    .get(&(range.start as usize))
-                    .cloned();
+                let cached = self.block_cache.lock().0.get(&start).cloned();
                 cached.or_else(|| {
                     blob.source
                         .resident(blob.range.start + range.start..blob.range.start + range.end)
@@ -5874,7 +5877,30 @@ impl VixReader {
             // Prefix decoding can grow its scratch key to the encoded
             // block length; reserve its doubled Vec capacity before scanning.
             let _scratch = self.memory.reserve(bytes.len().saturating_mul(2))?;
-            if crate::dict_blocks::block_find_exact(&bytes, &key)?.is_none() {
+            let mut found = false;
+            let mut failure = None;
+            crate::dict_blocks::block_scan(&bytes, |_, candidate| {
+                if let Err(error) = check_read_cancelled() {
+                    failure = Some(error);
+                    return false;
+                }
+                if split_key(candidate).is_none() {
+                    failure = Some(VixError::Malformed("invalid dictionary point key".into()));
+                    return false;
+                }
+                match candidate.cmp(&key) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Equal => {
+                        found = true;
+                        false
+                    }
+                    std::cmp::Ordering::Greater => false,
+                }
+            })?;
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if !found {
                 return Ok(true);
             }
         }
