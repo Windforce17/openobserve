@@ -1772,11 +1772,9 @@ async fn superset_select_prunes_files_the_window_has_not_answered() {
     }
 }
 
-/// A superset wider than the residual's row cap is refused: the select
-/// keeps today's contract (candidate rows to the scan, filter re-applied)
-/// instead of turning the index phase into a column scan of the file.
+/// A narrow predicate can verify a dense superset through bounded chunk reads.
 #[test]
-fn dense_superset_select_keeps_the_superset_contract() {
+fn dense_superset_select_streams_to_exact_candidates() {
     let rows = residual::RESIDUAL_MAX_ROWS + 8;
     let schema = Arc::new(Schema::new(vec![
         Field::new("_timestamp", DataType::Int64, false),
@@ -1833,15 +1831,10 @@ fn dense_superset_select_keeps_the_superset_contract() {
     )
     .unwrap()
     {
-        RawVixResult::Bitmap {
-            bitmap,
-            has_skipped,
-            ..
-        } => {
-            assert!(has_skipped, "the refused select stays a superset");
-            assert_eq!(bitmap.count_set_bits(), rows);
+        RawVixResult::SelectCandidates { candidates, .. } => {
+            assert_eq!(candidates, vec![(1_000_000, 0)]);
         }
-        other => panic!("expected the superset row-id result, got {other:?}"),
+        other => panic!("expected verified phrase rows, got {other:?}"),
     }
 }
 
@@ -2394,3 +2387,6 @@ fn prod_file_str_match_on_fts_body_cost() {
         &body_only,
     );
 }
+
+#[path = "residual_streaming_tests.rs"]
+mod residual_streaming_tests;

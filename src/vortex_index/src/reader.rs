@@ -3168,6 +3168,131 @@ impl VixReader {
         self.read_columns_rows_from(&self.docs_blob, &schema, names, row_ids)
     }
 
+    /// Filter selected docs rows without retaining decoded batches across chunks.
+    /// `None` refuses the entire operation when its decoded-byte budget is spent.
+    /// Only a completed scan publishes a bitmap; callback and read errors propagate.
+    pub fn filter_docs_columns_rows(
+        &self,
+        names: &[&str],
+        selected: &BooleanBuffer,
+        max_bytes: u64,
+        predicate: &mut dyn FnMut(&RecordBatch) -> anyhow::Result<arrow::array::BooleanArray>,
+    ) -> anyhow::Result<Option<BooleanBuffer>> {
+        check_read_cancelled()?;
+        if selected.len() as u64 != self.row_count() {
+            return Err(VixError::InvalidQuery(
+                "docs filter bitmap length differs from row count".into(),
+            )
+            .into());
+        }
+        if names.is_empty()
+            || names
+                .iter()
+                .enumerate()
+                .any(|(i, name)| names[..i].contains(name))
+        {
+            return Err(VixError::InvalidQuery(
+                "docs filter requires nonempty, distinct column names".into(),
+            )
+            .into());
+        }
+        let schema = self.docs_schema_inner()?;
+        let indices = names
+            .iter()
+            .map(|name| {
+                schema
+                    .index_of(name)
+                    .map_err(|_| VixError::ColumnNotFound((*name).to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projected_schema = schema.project(&indices)?;
+        let count = selected.count_set_bits();
+        let scratch_bytes = count
+            .saturating_mul(2 * std::mem::size_of::<u64>())
+            .saturating_add(selected.len().div_ceil(8).saturating_mul(2));
+        if scratch_bytes as u64 > max_bytes {
+            return Ok(None);
+        }
+        let _scope = self.memory.enter();
+        // Both the alignment vector and Vortex's selection stay live during the scan.
+        let _scratch = self.memory.reserve(scratch_bytes)?;
+        let rows: Vec<u64> = selected.set_indices().map(|row| row as u64).collect();
+        let mut exact = BooleanBufferBuilder::new(selected.len());
+        exact.append_n(selected.len(), false);
+        if rows.is_empty() {
+            return Ok(Some(exact.finish()));
+        }
+        let mut next = 0usize;
+        let mut decoded_bytes = scratch_bytes as u64;
+        let mut refused = false;
+        let result = scan_blob_streaming(
+            &self.docs_blob,
+            Some(names),
+            RowSelection::Indices(rows.clone()),
+            None,
+            None,
+            0,
+            &mut |batch| {
+                check_read_cancelled()?;
+                if batch.schema().fields() != projected_schema.fields()
+                    || batch.num_rows() > rows.len() - next
+                {
+                    return Err(VixError::Malformed(
+                        "docs filter returned unexpected schema or row count".into(),
+                    ));
+                }
+                let batch_bytes = batch.get_array_memory_size();
+                decoded_bytes = decoded_bytes.saturating_add(batch_bytes as u64);
+                if decoded_bytes > max_bytes {
+                    refused = true;
+                    return Err(VixError::InvalidQuery(
+                        "docs filter decoded-byte budget exceeded".into(),
+                    ));
+                }
+                // Keep the predicate's input and scratch admitted until both are dropped.
+                let pending = self.memory.reserve(
+                    batch_bytes
+                        .saturating_mul(2)
+                        .saturating_add(batch.num_rows().saturating_mul(2)),
+                )?;
+                let batch = Admitted {
+                    value: batch,
+                    _pending: pending,
+                };
+                let batch_ref = &batch.value;
+                let mask = predicate(batch_ref).map_err(VixError::Callback)?;
+                if mask.len() != batch_ref.num_rows() {
+                    return Err(VixError::Malformed(
+                        "docs filter predicate returned wrong row count".into(),
+                    ));
+                }
+                for (offset, row) in rows[next..next + batch_ref.num_rows()].iter().enumerate() {
+                    if mask.is_valid(offset) && mask.value(offset) {
+                        exact.set_bit(*row as usize, true);
+                    }
+                }
+                next += batch_ref.num_rows();
+                drop(mask);
+                drop(batch);
+                check_read_cancelled()?;
+                Ok(())
+            },
+        );
+        check_read_cancelled()?;
+        if refused {
+            return Ok(None);
+        }
+        result?;
+        if next != rows.len() {
+            return Err(VixError::Malformed(format!(
+                "docs filter returned {next} rows, expected {}",
+                rows.len()
+            ))
+            .into());
+        }
+        Ok(Some(exact.finish()))
+    }
+
     /// A docs-blob handle for bounded point reads that leaves NO trace in
     /// this reader. Opening the docs blob consumes its Vortex footer (~1 MB
     /// on wide, many-chunk production files: 2,233 columns × 65 chunks of

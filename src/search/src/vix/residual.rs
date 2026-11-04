@@ -161,6 +161,7 @@ pub(super) fn select_chunk_cap(reader: &VixReader) -> usize {
 pub(super) enum Refusal {
     TooManyRows(usize),
     TooManyChunks(usize),
+    TooManyBytes,
     /// A predicate column this file does not store as a docs column, or
     /// stores with a non-string type.
     UnsupportedColumn(String),
@@ -175,6 +176,7 @@ impl Refusal {
         match self {
             Refusal::TooManyRows(_) => "residual: too many candidate rows",
             Refusal::TooManyChunks(_) => "residual: too many candidate chunks",
+            Refusal::TooManyBytes => "residual: predicate byte budget exceeded",
             Refusal::UnsupportedColumn(_) => "residual: unsupported column",
             Refusal::UnsupportedCondition => "residual: unsupported condition",
             Refusal::NoFullTextColumn => "residual: no full-text column",
@@ -211,7 +213,7 @@ pub(super) fn refine_superset(
         Shape::Aggregate => RESIDUAL_MAX_CHUNKS,
         Shape::Select => select_chunk_cap(reader),
     };
-    refine_superset_within(
+    let result = refine_superset_within(
         reader,
         condition,
         inexact,
@@ -220,7 +222,101 @@ pub(super) fn refine_superset(
         RESIDUAL_MAX_ROWS,
         max_chunks,
         shape,
-    )
+    )?;
+    match result {
+        Err(Refusal::TooManyRows(_) | Refusal::TooManyChunks(_)) if shape == Shape::Select => {
+            refine_select_streaming(
+                reader,
+                condition,
+                inexact,
+                fts_fields,
+                bitmap,
+                RESIDUAL_SELECT_MAX_BYTES,
+            )
+        }
+        other => Ok(other),
+    }
+}
+
+/// Retry only selects refused by the old geometric caps. Aggregates and
+/// already-admitted selects keep their existing progressive point reads.
+pub(super) fn refine_select_streaming(
+    reader: &VixReader,
+    condition: &IndexCondition,
+    inexact: &[usize],
+    fts_fields: &[String],
+    bitmap: &BooleanBuffer,
+    max_bytes: u64,
+) -> anyhow::Result<Result<BooleanBuffer, Refusal>> {
+    vortex_index::check_read_cancelled()?;
+    let mut conjuncts = Vec::with_capacity(inexact.len());
+    for &index in inexact {
+        let Some(conjunct) = condition.conditions.get(index) else {
+            return Ok(Err(Refusal::UnsupportedCondition));
+        };
+        if !residual_supported_shape(conjunct) {
+            return Ok(Err(Refusal::UnsupportedCondition));
+        }
+        conjuncts.push(conjunct.clone());
+    }
+    let condition = IndexCondition {
+        conditions: conjuncts,
+    };
+    let schema = reader.docs_schema()?;
+    let present_fts: Vec<String> = fts_fields
+        .iter()
+        .filter(|field| schema.index_of(field).is_ok())
+        .cloned()
+        .collect();
+    if condition.conditions.iter().any(Condition::uses_full_text) && present_fts.is_empty() {
+        return Ok(Err(Refusal::NoFullTextColumn));
+    }
+    let mut fields: Vec<String> = condition
+        .get_schema_fields(&present_fts)
+        .into_iter()
+        .collect();
+    fields.sort_unstable();
+    if fields.is_empty() {
+        return Ok(Ok(bitmap.clone()));
+    }
+    let mut indices = Vec::with_capacity(fields.len());
+    for field in &fields {
+        match schema.index_of(field) {
+            Ok(index) if is_string_type(schema.field(index).data_type()) => indices.push(index),
+            _ => return Ok(Err(Refusal::UnsupportedColumn(field.clone()))),
+        }
+    }
+    let projected_schema = schema.project(&indices)?;
+    let Ok(expression) = condition.to_physical_expr(&projected_schema, &present_fts) else {
+        return Ok(Err(Refusal::UnsupportedCondition));
+    };
+    let columns: Vec<&str> = fields.iter().map(String::as_str).collect();
+    let exact = reader.filter_docs_columns_rows(&columns, bitmap, max_bytes, &mut |batch| {
+        let mut matches = BooleanBufferBuilder::new(batch.num_rows());
+        for start in (0..batch.num_rows()).step_by(RESIDUAL_MAX_ROWS) {
+            vortex_index::check_read_cancelled()?;
+            let window = batch.slice(start, RESIDUAL_MAX_ROWS.min(batch.num_rows() - start));
+            let values = expression
+                .evaluate(&window)?
+                .into_array(window.num_rows())?;
+            let mask = values
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("residual predicate did not evaluate to booleans")
+                })?;
+            if mask.len() != window.num_rows() {
+                return Err(anyhow::anyhow!(
+                    "residual predicate returned wrong row count"
+                ));
+            }
+            for i in 0..mask.len() {
+                matches.append(mask.is_valid(i) && mask.value(i));
+            }
+        }
+        Ok(BooleanArray::new(matches.finish(), None))
+    })?;
+    Ok(exact.ok_or(Refusal::TooManyBytes))
 }
 
 /// [`refine_superset`] with explicit candidate-row and touched-chunk caps.
