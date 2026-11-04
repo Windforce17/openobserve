@@ -174,6 +174,8 @@ impl CacheEntry {
 
 impl CacheEntry {
     pub fn get_memory_size(&self) -> usize {
+        #[cfg(test)]
+        tests::record_memory_size_scan();
         match self {
             CacheEntry::RowIds(packed, ..) => packed.memory_size(),
             CacheEntry::SelectCandidates(candidates, ..) => {
@@ -220,12 +222,13 @@ fn entry_footprint(key: &str, entry: &CacheEntry) -> usize {
     entry.get_memory_size()
         + key.len()
         + std::mem::size_of::<String>()
-        + std::mem::size_of::<usize>()
+        + 2 * std::mem::size_of::<usize>()
 }
 
 struct StoredEntry {
     value: CacheEntry,
     slot: usize,
+    footprint: usize,
 }
 
 const NO_SLOT: usize = usize::MAX;
@@ -390,14 +393,22 @@ impl VixResultCache {
         let mut fifo = self.cacher.lock();
         let before = fifo.memory_size();
         let old = if let Some(mut entry) = self.readers.get_mut(&key) {
-            fifo.entry_bytes -= entry_footprint(&key, &entry.value);
+            fifo.entry_bytes -= entry.footprint;
+            entry.footprint = new_footprint;
             Some(std::mem::replace(&mut entry.value, value))
         } else {
             // Cloning normalizes the map key capacity to its length. Keep the
             // original key in the FIFO and charge its actual allocation.
             let map_key = key.clone();
             let slot = fifo.push_back(key);
-            self.readers.insert(map_key, StoredEntry { value, slot });
+            self.readers.insert(
+                map_key,
+                StoredEntry {
+                    value,
+                    slot,
+                    footprint: new_footprint,
+                },
+            );
             None
         };
         fifo.entry_bytes += new_footprint;
@@ -406,8 +417,8 @@ impl VixResultCache {
         {
             let slot = fifo.first;
             let key = fifo.remove(slot);
-            if let Some((key, entry)) = self.readers.remove(&key) {
-                fifo.entry_bytes -= entry_footprint(&key, &entry.value);
+            if let Some((_, entry)) = self.readers.remove(&key) {
+                fifo.entry_bytes -= entry.footprint;
                 metrics::VIX_RESULT_CACHE_GC_TOTAL
                     .with_label_values::<&str>(&[])
                     .inc();
@@ -442,24 +453,27 @@ impl VixResultCache {
             })
             .collect();
         let mut removed = 0usize;
+        let mut removed_bytes = 0usize;
         for key in doomed {
             let mut fifo = self.cacher.lock();
             let before = fifo.memory_size();
             let entry = self.readers.remove(&key);
-            if let Some((key, entry)) = &entry {
-                fifo.remove(entry.slot);
-                fifo.entry_bytes -= entry_footprint(key, &entry.value);
+            let retired_key = entry.as_ref().map(|(_, entry)| {
+                fifo.entry_bytes -= entry.footprint;
                 removed += 1;
-            }
+                fifo.remove(entry.slot)
+            });
             let retired = fifo.release_if_empty();
             let after = fifo.memory_size();
             self.bytes.store(after, Ordering::Relaxed);
+            removed_bytes += before - after;
             drop(fifo);
-            drop(retired);
-            drop(entry);
+            drop((retired_key, entry, retired));
+        }
+        if removed_bytes != 0 {
             metrics::VIX_RESULT_CACHE_MEMORY_USAGE
                 .with_label_values::<&str>(&[])
-                .sub((before - after) as i64);
+                .sub(removed_bytes as i64);
         }
         removed
     }
@@ -494,6 +508,258 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    thread_local! {
+        static SIZE_SCAN_PROBE: std::cell::RefCell<Option<(Arc<VixResultCache>, usize)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn record_memory_size_scan() {
+        SIZE_SCAN_PROBE.with(|probe| {
+            if let Some((cache, scans)) = probe.borrow_mut().as_mut() {
+                *scans += 1;
+                assert!(
+                    cache.cacher.try_lock().is_some(),
+                    "value size scanned under FIFO lock"
+                );
+            }
+        });
+    }
+
+    struct SizeScanProbe;
+
+    impl SizeScanProbe {
+        fn new(cache: &Arc<VixResultCache>) -> Self {
+            SIZE_SCAN_PROBE.with(|probe| *probe.borrow_mut() = Some((Arc::clone(cache), 0)));
+            Self
+        }
+
+        fn take_scans(&self) -> usize {
+            SIZE_SCAN_PROBE
+                .with(|probe| std::mem::take(&mut probe.borrow_mut().as_mut().unwrap().1))
+        }
+    }
+
+    impl Drop for SizeScanProbe {
+        fn drop(&mut self) {
+            SIZE_SCAN_PROBE.with(|probe| *probe.borrow_mut() = None);
+        }
+    }
+
+    // Fixture dimensions independently specify the existing value accounting.
+    // Each bitmap container has one isolated u16, with no run containers.
+    fn mixed_fixture(kind: usize, n: usize) -> (CacheEntry, usize) {
+        match kind % 4 {
+            0 => (
+                CacheEntry::RowIds(
+                    Arc::new(RowIdBitmap::from_row_ids(
+                        n * 65536,
+                        (0..n).map(|i| (i as u32) * 65536 + 7),
+                    )),
+                    Some(1024),
+                ),
+                std::mem::size_of::<RowIdBitmap>() + 8 + n * (4 + 4 + 2),
+            ),
+            1 => (
+                CacheEntry::TopN(vec![(vec![Some("x".repeat(n)), None], 9)]),
+                std::mem::size_of::<Vec<(Vec<Option<String>>, u64)>>()
+                    + std::mem::size_of::<(Vec<Option<String>>, u64)>()
+                    + 2 * std::mem::size_of::<Option<String>>()
+                    + n,
+            ),
+            2 => (
+                CacheEntry::Distinct(HashSet::from(["d".repeat(n), "e".repeat(n + 1)])),
+                std::mem::size_of::<HashSet<String>>() + 2 * n + 1,
+            ),
+            _ => (
+                CacheEntry::MultiHistogram {
+                    width: 10,
+                    phase: 0,
+                    rows: vec![(0, "a".repeat(n), 2), (10, "b".repeat(n + 1), 3)],
+                },
+                std::mem::size_of::<Vec<(i64, String, u64)>>()
+                    + 2 * std::mem::size_of::<i64>()
+                    + 2 * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+                    + 2 * n
+                    + 1,
+            ),
+        }
+    }
+
+    #[test]
+    fn test_fifo_size_scans_overwrite() {
+        for kind in 0..4 {
+            let cache = Arc::new(VixResultCache::new(4));
+            let probe = SizeScanProbe::new(&cache);
+            cache.put("a|1|100|c".into(), mixed_fixture(kind, 16).0);
+            assert_eq!(probe.take_scans(), 1);
+            assert!(
+                cache
+                    .put("a|1|100|c".into(), mixed_fixture((kind + 1) % 4, 4).0)
+                    .is_some()
+            );
+            assert_eq!(probe.take_scans(), 1, "only the incoming value is scanned");
+        }
+    }
+
+    #[test]
+    fn test_fifo_size_scans_invalidation() {
+        let cache = Arc::new(VixResultCache::new(8));
+        let probe = SizeScanProbe::new(&cache);
+        for kind in 0..4 {
+            cache.put(format!("a|{kind}|100|c"), mixed_fixture(kind, 16).0);
+        }
+        assert_eq!(probe.take_scans(), 4);
+        assert_eq!(cache.remove_file_entries(["a"]), 4);
+        assert_eq!(probe.take_scans(), 0, "invalidation uses saved sizes");
+        assert_eq!(cache.memory_size(), 0);
+    }
+
+    #[test]
+    fn test_fifo_size_scans_eviction() {
+        for kind in 0..4 {
+            let cache = Arc::new(VixResultCache::new(1));
+            let probe = SizeScanProbe::new(&cache);
+            cache.put("a|1|100|c".into(), mixed_fixture(kind, 16).0);
+            assert_eq!(probe.take_scans(), 1);
+            cache.put("b|1|100|c".into(), mixed_fixture((kind + 1) % 4, 4).0);
+            assert_eq!(
+                probe.take_scans(),
+                1,
+                "eviction does not scan the retired value"
+            );
+            assert!(!cache.contains("a|1|100|c"));
+            assert!(cache.contains("b|1|100|c"));
+        }
+    }
+
+    fn assert_mixed_value(actual: &CacheEntry, expected: &CacheEntry) {
+        match (actual, expected) {
+            (CacheEntry::RowIds(a, ag), CacheEntry::RowIds(b, bg)) => {
+                assert_eq!(a, b);
+                assert_eq!(ag, bg);
+            }
+            (CacheEntry::TopN(a), CacheEntry::TopN(b)) => assert_eq!(a, b),
+            (CacheEntry::Distinct(a), CacheEntry::Distinct(b)) => assert_eq!(a, b),
+            (
+                CacheEntry::MultiHistogram {
+                    width: aw,
+                    phase: ap,
+                    rows: a,
+                },
+                CacheEntry::MultiHistogram {
+                    width: bw,
+                    phase: bp,
+                    rows: b,
+                },
+            ) => {
+                assert_eq!((aw, ap), (bw, bp));
+                assert_eq!(a, b);
+            }
+            _ => panic!("variant mismatch: {actual:?}, {expected:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fifo_mixed_independent_byte_budget_model() {
+        use std::collections::VecDeque;
+
+        // Keep at most four slots. Model capacity independently from the cache.
+        let slot_bytes = 4 * std::mem::size_of::<FifoSlot>();
+        let entry_overhead = std::mem::size_of::<String>() + 2 * std::mem::size_of::<usize>();
+        let budget = slot_bytes + 750;
+        let cache = VixResultCache::with_budget(3, budget);
+        let mut reference: VecDeque<(String, CacheEntry, usize, usize)> = VecDeque::new();
+        let mut evictions = 0;
+        let mut byte_evictions = 0;
+        let mut overwrites = 0;
+        let mut invalidations = 0;
+        let keys: Vec<String> = (0..12)
+            .map(|i| format!("file{}|{}|100|c", i % 4, i / 4))
+            .collect();
+        let mut seed = 19_u64;
+        for step in 0..1200 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let key = &keys[(seed >> 32) as usize % keys.len()];
+            if step % 7 == 0 {
+                let file = key.split('|').next().unwrap();
+                let before = reference.len();
+                reference.retain(|(key, ..)| key.split('|').next().unwrap() != file);
+                let removed = cache.remove_file_entries([file]);
+                assert_eq!(removed, before - reference.len());
+                invalidations += removed;
+            } else {
+                let (value, value_bytes) = mixed_fixture(step % 4, 4 + step % 29);
+                let footprint = value_bytes + key.len() + entry_overhead;
+                let expected_old = if let Some((_, old, bytes, _)) =
+                    reference.iter_mut().find(|(k, ..)| k == key)
+                {
+                    *bytes = footprint;
+                    overwrites += 1;
+                    Some(std::mem::replace(old, value.clone()))
+                } else {
+                    reference.push_back((key.clone(), value.clone(), footprint, key.len()));
+                    None
+                };
+                while reference.len() > 3
+                    || (!reference.is_empty()
+                        && slot_bytes
+                            + reference
+                                .iter()
+                                .map(|(_, _, bytes, capacity)| bytes + capacity)
+                                .sum::<usize>()
+                            > budget)
+                {
+                    if reference.len() <= 3 {
+                        byte_evictions += 1;
+                    }
+                    reference.pop_front();
+                    evictions += 1;
+                }
+                let old = cache.put(key.clone(), value);
+                match (&old, &expected_old) {
+                    (Some(actual), Some(expected)) => assert_mixed_value(actual, expected),
+                    (None, None) => {}
+                    _ => panic!("overwrite mismatch at step {step}"),
+                }
+            }
+            let expected_bytes = if reference.is_empty() {
+                0
+            } else {
+                slot_bytes
+                    + reference
+                        .iter()
+                        .map(|(_, _, bytes, capacity)| bytes + capacity)
+                        .sum::<usize>()
+            };
+            assert_eq!(
+                cache.memory_size(),
+                expected_bytes,
+                "accounting at step {step}"
+            );
+            assert_eq!(cache.len(), reference.len(), "length at step {step}");
+            for key in &keys {
+                let actual = cache.readers.get(key);
+                let expected = reference.iter().find(|(k, ..)| k == key);
+                match (actual, expected) {
+                    (Some(actual), Some((_, value, footprint, _))) => {
+                        assert_mixed_value(&actual.value, value);
+                        assert_eq!(actual.footprint, *footprint);
+                    }
+                    (None, None) => {}
+                    _ => panic!("visibility mismatch at step {step}, key {key}"),
+                }
+            }
+        }
+        assert!(evictions > 100);
+        assert!(byte_evictions > 20);
+        assert!(overwrites > 20);
+        assert!(invalidations > 20);
+        assert_eq!(
+            cache.remove_file_entries(["file0", "file1", "file2", "file3"]),
+            reference.len()
+        );
+        assert_eq!(cache.memory_size(), 0);
+    }
 
     fn create_test_row_ids_result() -> CacheEntry {
         CacheEntry::RowIds(
@@ -582,7 +848,7 @@ mod tests {
             assert_eq!(entry.slot, slot);
             assert_eq!(entry.key().capacity(), entry.key().len());
             key_bytes += key.capacity();
-            entry_bytes += entry_footprint(key, &entry.value);
+            entry_bytes += entry.footprint;
             previous = slot;
             slot = *next;
         }
