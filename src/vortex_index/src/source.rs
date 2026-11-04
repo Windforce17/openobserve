@@ -33,7 +33,7 @@ use std::{
     cell::{Cell, RefCell},
     fmt,
     ops::Range,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
 };
 
 use bytes::{Bytes, BytesMut};
@@ -735,6 +735,9 @@ struct FooterState {
     memory: OnceLock<Arc<crate::reader::ReaderMemory>>,
 }
 
+/// A weak identity keeps the allocation address unique without retaining bytes.
+pub(crate) struct FooterIdentity(Weak<FooterState>);
+
 impl FooterState {
     fn retained_bytes(ranges: &Vec<(Range<u64>, Bytes)>) -> usize {
         ranges.capacity() * std::mem::size_of::<(Range<u64>, Bytes)>()
@@ -890,6 +893,14 @@ impl RangedBlob {
     /// Blob length in bytes.
     pub fn len(&self) -> u64 {
         self.range.end - self.range.start
+    }
+
+    pub(crate) fn footer_identity(&self) -> FooterIdentity {
+        FooterIdentity(Arc::downgrade(&self.footer))
+    }
+
+    pub(crate) fn has_footer_identity(&self, identity: &FooterIdentity) -> bool {
+        std::ptr::eq(Arc::as_ptr(&self.footer), identity.0.as_ptr())
     }
 
     /// Identity of this blob for operation-scoped prefetch registration:

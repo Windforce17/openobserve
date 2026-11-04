@@ -64,12 +64,16 @@ use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, VortexSessionExecute},
     arrow::{ArrowSessionExt, FromArrowArray, FromArrowType, ToArrowType},
-    buffer::Buffer,
+    buffer::{Alignment, Buffer},
     compressor::BtrBlocksCompressorBuilder,
     dtype::DType,
     expr::{root, select},
-    file::{OpenOptionsSessionExt, VortexFile, VortexWriteOptions, WriteStrategyBuilder},
+    file::{
+        DeserializeStep, Footer, OpenOptionsSessionExt, VortexFile, VortexWriteOptions,
+        WriteStrategyBuilder,
+    },
     io::{
+        VortexReadAt,
         runtime::{BlockingRuntime, single::SingleThreadRuntime, tokio::TokioRuntime},
         session::RuntimeSessionExt,
     },
@@ -111,20 +115,29 @@ fn native_registry_workspace() -> Result<usize> {
 
 thread_local! {
     static NATIVE_READ_REGISTRIES: RefCell<Option<Rc<NativeReadRegistries>>> = const { RefCell::new(None) };
+    static NATIVE_SCHEMA_FOOTER: RefCell<Option<Rc<NativeSchemaFooter>>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct NativeReadScope(Option<Rc<NativeReadRegistries>>);
+pub(crate) struct NativeReadScope {
+    registries: Option<Rc<NativeReadRegistries>>,
+    footer: Option<Rc<NativeSchemaFooter>>,
+}
 
 impl Drop for NativeReadScope {
     fn drop(&mut self) {
         // Drop the inner owners outside the TLS borrow (also safe on unwind).
-        let inner = NATIVE_READ_REGISTRIES.with(|slot| slot.replace(self.0.take()));
+        let footer = NATIVE_SCHEMA_FOOTER.with(|slot| slot.replace(self.footer.take()));
+        drop(footer);
+        let inner = NATIVE_READ_REGISTRIES.with(|slot| slot.replace(self.registries.take()));
         drop(inner);
     }
 }
 
 pub(crate) fn enter_native_read_scope() -> NativeReadScope {
-    NativeReadScope(NATIVE_READ_REGISTRIES.with(|slot| slot.take()))
+    NativeReadScope {
+        registries: NATIVE_READ_REGISTRIES.with(|slot| slot.take()),
+        footer: NATIVE_SCHEMA_FOOTER.with(|slot| slot.take()),
+    }
 }
 
 /// Only registries may cross scans. VortexSession::clone shares a mutable
@@ -2604,9 +2617,16 @@ fn write_vortex_blob_inner(
     Ok(buf)
 }
 
-/// Open one embedded Vortex file for scanning. Ranged handles cache only
-/// encoded footer bytes: every open constructs a private native footer and
-/// layout tree without repeating the underlying footer reads.
+/// One schema footer, consumed by the next matching open in this operation.
+/// Do not retain the schema file's session, runtime, IO or layout readers.
+struct NativeSchemaFooter {
+    footer: vortex::file::Footer,
+    identity: crate::source::FooterIdentity,
+    range: std::ops::Range<u64>,
+    // Both the schema file and the consuming file share this original charge.
+    _pending: crate::reader::PendingMemory,
+}
+
 /// Native file plus opening/layout workspace. Drop the native owners before
 /// releasing their pending reservation; streamed chunks never enter it.
 pub(crate) struct OpenedBlob {
@@ -2615,6 +2635,7 @@ pub(crate) struct OpenedBlob {
     // and setup admission alive until that file is dropped too.
     _runtime: Option<SingleThreadRuntime>,
     _pending: Option<crate::reader::PendingMemory>,
+    _schema_footer: Option<Rc<NativeSchemaFooter>>,
     _setup: Option<NativeReadSetup>,
 }
 
@@ -2630,7 +2651,39 @@ pub(crate) fn open_blob(
     session: &VortexSession,
     blob: &BlobHandle,
 ) -> Result<OpenedBlob> {
+    open_blob_inner(runtime, session, blob, None)
+}
+
+fn open_blob_inner(
+    runtime: &SingleThreadRuntime,
+    session: &VortexSession,
+    blob: &BlobHandle,
+    metadata_session: Option<VortexSession>,
+) -> Result<OpenedBlob> {
     crate::check_read_cancelled()?;
+    // Every open consumes or evicts the single slot, including non-matches.
+    let cached = NATIVE_SCHEMA_FOOTER.with(|slot| slot.take());
+    if let (Some(cached), BlobHandle::Ranged(ranged)) = (&cached, blob)
+        && ranged.has_footer_identity(&cached.identity)
+        && ranged.range == cached.range
+    {
+        let _recheck = ranged.reader_memory().reserve(0)?;
+        let file = runtime.block_on(
+            session
+                .open_options()
+                .with_footer(cached.footer.clone())
+                .with_file_size(ranged.len())
+                .open_read(ranged.read_at()),
+        )?;
+        return Ok(OpenedBlob {
+            file,
+            _runtime: None,
+            _pending: None,
+            _schema_footer: Some(Rc::clone(cached)),
+            _setup: None,
+        });
+    }
+    drop(cached);
     match blob {
         BlobHandle::Mem(bytes) => {
             if crate::source::current_read_operation().is_none() {
@@ -2639,6 +2692,7 @@ pub(crate) fn open_blob(
                     _runtime: None,
                     _setup: None,
                     _pending: None,
+                    _schema_footer: None,
                 });
             }
             // Resolve metadata over bounded suffix reads, then retain the
@@ -2677,13 +2731,61 @@ pub(crate) fn open_blob(
                 _runtime: None,
                 _setup: None,
                 _pending: pending,
+                _schema_footer: None,
             })
         }
         BlobHandle::Ranged(ranged) => {
             let (read, opening) = ranged.opening_read_at();
+            let options = if let Some(metadata_session) = metadata_session {
+                // Lazy layout children capture the deserialization session.
+                // Give them registries only, never a schema runtime or IO.
+                let footer = runtime.block_on(async {
+                    let initial_size = usize::try_from(
+                        ranged
+                            .footer_initial_read_bytes()
+                            .max(
+                                vortex::file::MAX_POSTSCRIPT_SIZE as u64
+                                    + vortex::file::EOF_SIZE as u64,
+                            )
+                            .min(ranged.len()),
+                    )
+                    .expect("footer window fits usize");
+                    let bytes = read
+                        .read_at(
+                            ranged.len() - initial_size as u64,
+                            initial_size,
+                            Alignment::none(),
+                        )
+                        .await?
+                        .try_into_host()?
+                        .await?;
+                    let mut decoder =
+                        Footer::deserializer(bytes, metadata_session).with_size(ranged.len());
+                    loop {
+                        match decoder.deserialize()? {
+                            DeserializeStep::Done(footer) => return Ok::<_, VixError>(footer),
+                            DeserializeStep::NeedMoreData { offset, len } => {
+                                let bytes = read
+                                    .read_at(offset, len, Alignment::none())
+                                    .await?
+                                    .try_into_host()?
+                                    .await?;
+                                decoder.prefix_data(bytes);
+                            }
+                            DeserializeStep::NeedFileSize => {
+                                return Err(VixError::Malformed(
+                                    "footer requested known file size".into(),
+                                ));
+                            }
+                        }
+                    }
+                })?;
+                session.open_options().with_footer(footer)
+            } else {
+                session.open_options()
+            };
             let file = runtime.block_on(
-                session
-                    .open_options()
+                options
                     // One 256 KiB suffix read instead of the postscript
                     // window + a NeedMoreData prefix follow-up (two
                     // sequential reads on prod-sized blobs); once an open
@@ -2702,6 +2804,7 @@ pub(crate) fn open_blob(
                 _runtime: None,
                 _setup: None,
                 _pending: pending,
+                _schema_footer: None,
             })
         }
     }
@@ -2712,11 +2815,38 @@ pub(crate) fn open_blob(
 /// Keep native metadata admission alive through the caller's schema
 /// publication rather than dropping it at the return boundary.
 pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, OpenedBlob)> {
+    // A new schema replaces the previous one before admitting its allocation.
+    drop(NATIVE_SCHEMA_FOOTER.with(|slot| slot.take()));
     let mut setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
     let session = setup.session(runtime.handle());
-    let mut file = open_blob(&runtime, &session, blob)?;
+    let reuse = if crate::source::current_read_operation().is_some()
+        && let BlobHandle::Ranged(ranged) = blob
+    {
+        let extra = ranged.reader_memory().reserve(
+            NATIVE_SESSION_WORKSPACE
+                + std::mem::size_of::<NativeSchemaFooter>()
+                + 2 * std::mem::size_of::<usize>(),
+        )?;
+        Some((ranged, extra))
+    } else {
+        None
+    };
+    let metadata_session = reuse.as_ref().map(|_| setup.registries.session());
+    let mut file = open_blob_inner(&runtime, &session, blob, metadata_session)?;
     let schema = file.dtype().to_arrow_schema()?;
+    if let Some((ranged, extra)) = reuse
+        && let Some(pending) = file._pending.take()
+    {
+        let footer = Rc::new(NativeSchemaFooter {
+            footer: file.footer().clone(),
+            identity: ranged.footer_identity(),
+            range: ranged.range.clone(),
+            _pending: pending.merge(extra),
+        });
+        NATIVE_SCHEMA_FOOTER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&footer)));
+        file._schema_footer = Some(footer);
+    }
     // Only owned reservations/runtime escape this helper, never its TLS scope.
     drop(setup.memory_scope.take());
     file._runtime = Some(runtime);
@@ -3987,11 +4117,13 @@ pub(crate) fn probe_column_encodings(docs: &crate::VixDocs, name: &str) {
         println!("   ({count} nodes)");
     }
 }
+#[cfg(test)]
+#[path = "container_footer_tests.rs"]
+mod footer_reuse_tests;
 
 #[cfg(test)]
 mod json_compat_tests {
     use super::*;
-
     #[derive(serde::Deserialize)]
     struct LegacyFieldEntry {
         name: String,
