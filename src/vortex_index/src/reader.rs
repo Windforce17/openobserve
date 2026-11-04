@@ -4657,7 +4657,97 @@ impl VixReader {
         Ok(())
     }
 
+    /// Adjacent positive, case-sensitive Contains leaves on one named field.
+    /// Keep boolean boundaries and evaluation order intact.
+    fn contains_run_end(subs: &[VixQuery], start: usize) -> Result<usize> {
+        let VixQuery::Contains {
+            field: Some(field),
+            case_insensitive: false,
+            ..
+        } = &subs[start]
+        else {
+            return Ok(start);
+        };
+        let mut end = start;
+        while end < subs.len() {
+            check_read_cancelled()?;
+            if !matches!(&subs[end], VixQuery::Contains {
+                field: Some(other), case_insensitive: false, ..
+            } if other == field)
+            {
+                break;
+            }
+            end += 1;
+        }
+        Ok(end)
+    }
+
+    /// One ContainsAny stage: borrow bounded SIMD finders, walk the dictionary
+    /// once, and retain each matching ordinal once. Unsupported groups keep
+    /// their original per-leaf evaluation, including legacy FTS and partials.
+    fn collect_contains_any(&self, subs: &[VixQuery]) -> Result<Option<Admitted<Vec<u64>>>> {
+        const MAX_PATTERNS: usize = 16;
+        const MAX_PATTERN_BYTES: usize = 4096;
+        if !(2..=MAX_PATTERNS).contains(&subs.len()) {
+            return Ok(None);
+        }
+        let VixQuery::Contains {
+            field: Some(field), ..
+        } = &subs[0]
+        else {
+            return Ok(None);
+        };
+        let Some(fid) = self.field_id(field) else {
+            return Ok(None);
+        };
+        if self.fts_fields.contains(field) || self.partial_fields.contains(field) {
+            return Ok(None);
+        }
+        let mut bytes = 0usize;
+        for sub in subs {
+            check_read_cancelled()?;
+            let VixQuery::Contains {
+                field: Some(other),
+                needle,
+                case_insensitive: false,
+            } = sub
+            else {
+                return Ok(None);
+            };
+            bytes = bytes.saturating_add(needle.len());
+            if other != field || bytes > MAX_PATTERN_BYTES {
+                return Ok(None);
+            }
+        }
+        // Finder::new borrows its needle and has no heap allocation. Admit
+        // the finder array before construction; scan_all_tokens admits ordinals.
+        let mut finders = self.query_vec(subs.len())?;
+        for sub in subs {
+            check_read_cancelled()?;
+            let VixQuery::Contains { needle, .. } = sub else {
+                unreachable!("validated Contains run");
+            };
+            finders.value.push(memchr::memmem::Finder::new(needle));
+        }
+        self.scan_all_tokens(Some(fid), None, |token| {
+            finders
+                .value
+                .iter()
+                .any(|finder| finder.find(token).is_some())
+        })
+        .map(Some)
+    }
+
     fn eval_query(&self, query: &VixQuery, scope: Option<&[u16]>) -> Result<BooleanBuffer> {
+        self.eval_query_inner(query, scope, true)
+    }
+
+    fn eval_query_inner(
+        &self,
+        query: &VixQuery,
+        scope: Option<&[u16]>,
+        fuse_contains: bool,
+    ) -> Result<BooleanBuffer> {
         check_read_cancelled()?;
         let len = self.row_count as usize;
         if !self.index_enabled && !matches!(query, VixQuery::All) {
@@ -4668,15 +4758,37 @@ impl VixReader {
         match query {
             VixQuery::FullText { fields, query } => {
                 let fields = self.fulltext_scope(fields)?;
-                self.eval_query(query, Some(&fields.value))
+                self.eval_query_inner(query, Some(&fields.value), fuse_contains)
             }
             VixQuery::All => Ok(BooleanBuffer::new_set(len)),
-            VixQuery::And(subs) => self.eval_and(subs, scope),
+            VixQuery::And(subs) => self.eval_and(subs, scope, fuse_contains),
             VixQuery::Or(subs) => {
                 let mut acc = BooleanBuffer::new_unset(len);
                 let mut next = 0;
                 while next < subs.len() {
                     check_read_cancelled()?;
+                    let end = if fuse_contains {
+                        Self::contains_run_end(subs, next)?
+                    } else {
+                        next
+                    };
+                    if end > next + 1 {
+                        match self.collect_contains_any(&subs[next..end])? {
+                            Some(ordinals) => {
+                                acc = &acc | &self.postings_union_inner(ordinals.value, false)?;
+                            }
+                            None => {
+                                // Refused runs fall back as a whole, rather than
+                                // repeatedly reconsidering smaller suffixes.
+                                for sub in &subs[next..end] {
+                                    acc =
+                                        &acc | &self.eval_query_inner(sub, scope, fuse_contains)?;
+                                }
+                            }
+                        }
+                        next = end;
+                        continue;
+                    }
                     let end = Self::point_run_end(subs, next, true)?;
                     if end > next {
                         let resolved = self.resolve_point_run(&subs[next..end], scope)?;
@@ -4685,13 +4797,13 @@ impl VixReader {
                         }
                         next = end;
                     } else {
-                        acc = &acc | &self.eval_query(&subs[next], scope)?;
+                        acc = &acc | &self.eval_query_inner(&subs[next], scope, fuse_contains)?;
                         next += 1;
                     }
                 }
                 Ok(acc)
             }
-            VixQuery::Not(sub) => Ok(!&self.eval_query(sub, scope)?),
+            VixQuery::Not(sub) => Ok(!&self.eval_query_inner(sub, scope, false)?),
             leaf => {
                 let ordinals = self.collect_ordinals(leaf, scope)?;
                 self.postings_union(ordinals.value)
@@ -4724,7 +4836,12 @@ impl VixReader {
     /// ([`Self::walk_verify_plan`], [`Self::verify_walk_leaf`]). Composite
     /// children (`Or`/`Not`, other `FullText` shapes) evaluate last. An
     /// empty child list is `All`.
-    fn eval_and(&self, subs: &[VixQuery], scope: Option<&[u16]>) -> Result<BooleanBuffer> {
+    fn eval_and(
+        &self,
+        subs: &[VixQuery],
+        scope: Option<&[u16]>,
+        fuse_contains: bool,
+    ) -> Result<BooleanBuffer> {
         let len = self.row_count as usize;
         // scopes[0] is the inherited scope; flattened `FullText` children
         // append theirs and reference it by index
@@ -4935,7 +5052,7 @@ impl VixReader {
             acc = Some(next);
         }
         for &(sub, scope_index) in composites.value.iter() {
-            let bitmap = self.eval_query(sub, scope_of(scope_index))?;
+            let bitmap = self.eval_query_inner(sub, scope_of(scope_index), fuse_contains)?;
             let next = match &acc {
                 Some(prev) => prev & &bitmap,
                 None => bitmap,
@@ -6036,6 +6153,8 @@ impl VixReader {
             let first_ordinal = index.meta(b).1;
             let mut done = false;
             crate::dict_blocks::block_scan(&block, |pos, key| {
+                #[cfg(test)]
+                contains_any_tests::key_decoded();
                 if key < lower {
                     return true;
                 }
@@ -6437,8 +6556,21 @@ impl VixReader {
     /// Point-read the postings of the given ordinals and union them into a
     /// per-document bitmap. Dense-elided terms (`doc_count == row_count`,
     /// empty blob) short-circuit to the all-ones bitmap.
-    fn postings_union(&self, mut ordinals: Vec<u64>) -> Result<BooleanBuffer> {
+    fn postings_union(&self, ordinals: Vec<u64>) -> Result<BooleanBuffer> {
+        self.postings_union_inner(ordinals, true)
+    }
+
+    /// A fused OR cannot let one leaf's dense term hide another leaf's
+    /// malformed postings. Validate all selected records before returning
+    /// its all-ones bitmap. Ordinary per-leaf unions keep their shortcut.
+    fn postings_union_inner(
+        &self,
+        mut ordinals: Vec<u64>,
+        allow_dense_shortcut: bool,
+    ) -> Result<BooleanBuffer> {
         check_read_cancelled()?;
+        #[cfg(test)]
+        contains_any_tests::postings_union();
         let len = self.row_count as usize;
         let mut builder = BooleanBufferBuilder::new(len);
         builder.append_n(len, false);
@@ -6501,7 +6633,8 @@ impl VixReader {
                 }
                 // out-of-row postings: the threshold — never the cell bytes
                 // — selects the pointer
-                if !saw_dense && self.plist_pointer_cell(doc_count, blob) {
+                if (!saw_dense || !allow_dense_shortcut) && self.plist_pointer_cell(doc_count, blob)
+                {
                     pointer_windows.push(self.plist_pointer_window(blob)?);
                 }
             }
@@ -6512,7 +6645,7 @@ impl VixReader {
                 "terms point read returned {seen_rows} rows, expected {expected_rows}"
             )));
         }
-        if saw_dense {
+        if saw_dense && allow_dense_shortcut {
             return Ok(BooleanBuffer::new_set(len));
         }
         let records = self.plist_records_batch(&pointer_windows)?;
@@ -6525,7 +6658,7 @@ impl VixReader {
             for (row, &doc_count) in doc_counts.iter().enumerate() {
                 let cell = postings.value(row);
                 if cell.is_empty() {
-                    // doc_count == 0 (validated in pass 1): nothing to decode
+                    // Zero-count or dense-elided (validated in pass 1).
                     continue;
                 }
                 let blob = if self.plist_pointer_cell(doc_count, cell) {
@@ -6552,7 +6685,11 @@ impl VixReader {
                 })?;
             }
         }
-        Ok(builder.finish())
+        if saw_dense {
+            Ok(BooleanBuffer::new_set(len))
+        } else {
+            Ok(builder.finish())
+        }
     }
 
     /// Count projection over the native streaming scan, with a scan-local
@@ -7800,3 +7937,6 @@ mod memory_regressions;
 #[cfg(test)]
 #[path = "reader_term_count_tests.rs"]
 mod term_count_tests;
+#[cfg(test)]
+#[path = "reader_contains_any_tests.rs"]
+mod contains_any_tests;
