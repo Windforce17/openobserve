@@ -5637,12 +5637,14 @@ impl VixReader {
             // (exact — one term's postings hold distinct docs), multiple
             // terms may share documents and need the postings union
             leaf => {
-                // Cold read plan: fetch the leaf's key block(s), the terms
-                // footer and (when it is resident) the field's doc_count
-                // leaves in one batch before the point lookup below.
+                // A resident dictionary can prove a point missing before
+                // opening terms. Unknown points keep the original bundle:
+                // fetching their key first would add a serial round trip.
                 let mut prefetch = self.begin_prefetch();
-                if let Some(prefetch) = prefetch.as_mut() {
-                    self.prefetch_point_leaf(prefetch, leaf)?;
+                if let Some(prefetch) = prefetch.as_mut()
+                    && self.prefetch_point_leaf(prefetch, leaf)?
+                {
+                    return Ok(0);
                 }
                 let mut ordinals = self.collect_ordinals(leaf, scope)?;
                 match ordinals.value.len() {
@@ -5707,25 +5709,64 @@ impl VixReader {
         Ok(Some(count))
     }
 
-    /// The stage-1 bundle for one point leaf: the composite key of an exact
-    /// value term or a key-exists path. Other leaves scan dictionaries and
-    /// plan nothing ahead.
-    fn prefetch_point_leaf(&self, prefetch: &mut FieldPrefetch, leaf: &VixQuery) -> Result<()> {
+    /// Return true only when the field index or a resident candidate block
+    /// proves a point absent. Otherwise preserve the bounded cold bundle.
+    fn prefetch_point_leaf(&self, prefetch: &mut FieldPrefetch, leaf: &VixQuery) -> Result<bool> {
         let (fid, key) = match leaf {
             VixQuery::Exact { field, token } => match self.field_id(field) {
                 Some(fid) => (fid, self.composite(token, fid)),
-                None => return Ok(()),
+                None => return Ok(false),
             },
             VixQuery::KeyExists { path } => {
                 (KEY_FIELD_ID, self.composite(path.as_bytes(), KEY_FIELD_ID))
             }
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
+        if self.term_count == 0 {
+            return Ok(true);
+        }
+        // The bundle also resolves this index before fetching blocks or
+        // terms, so this probe does not add a metadata fetch wave.
+        let index = self.field_index(fid)?;
+        let Some(block) = index.predecessor_block(&key)? else {
+            return Ok(true);
+        };
+        if !index.field_blocks().contains(&block) {
+            return Ok(true);
+        }
+        let range = index.block_range(block, self.dict_blocks_len()?);
+        let resident = match self.dict_blocks_blob.as_ref() {
+            Some(BlobHandle::Mem(bytes)) => {
+                Some(bytes.slice(range.start as usize..range.end as usize))
+            }
+            Some(BlobHandle::Ranged(blob)) => {
+                let cached = self
+                    .block_cache
+                    .lock()
+                    .0
+                    .get(&(range.start as usize))
+                    .cloned();
+                cached.or_else(|| {
+                    blob.source
+                        .resident(blob.range.start + range.start..blob.range.start + range.end)
+                })
+            }
+            None => None,
+        };
+        if let Some(bytes) = resident {
+            // Prefix decoding can grow its scratch key to the encoded
+            // block length; reserve its doubled Vec capacity before scanning.
+            let _scratch = self.memory.reserve(bytes.len().saturating_mul(2))?;
+            if crate::dict_blocks::block_find_exact(&bytes, &key)?.is_none() {
+                return Ok(true);
+            }
+        }
         self.prefetch_field_bundle(
             prefetch,
             &[(fid, key.as_slice())],
             Some(PREFETCH_LEAF_CONCURRENCY),
-        )
+        )?;
+        Ok(false)
     }
 
     fn sum_disjoint_doc_counts(&self, ordinals: &[u64]) -> Result<u64> {
@@ -7755,3 +7796,7 @@ mod tests {
 #[cfg(test)]
 #[path = "reader_memory_regressions.rs"]
 mod memory_regressions;
+
+#[cfg(test)]
+#[path = "reader_term_count_tests.rs"]
+mod term_count_tests;
