@@ -6155,26 +6155,40 @@ impl VixReader {
         if start > last {
             return Ok(());
         }
-        // The walk streams the field's blocks in preload windows (8 MiB
-        // each, `load_dict_block_span`): when the current window runs out,
-        // the next one is loaded from the block at hand. Falling back to one
-        // round trip per 64 KiB block past the first window made a substring
-        // match over a wide field a serial read chain (prod 2026-10-02,
-        // apisix `str_match(request.body)`: ~500 MiB of dictionary per file
-        // as 7,996 sequential single-block fetches, 45 s for two files).
-        let mut span = self.load_dict_block_span(index, start, last)?;
+        let mut span: Option<Admitted<std::collections::HashMap<usize, Bytes>>> = None;
         for b in start..=last {
             check_read_cancelled()?;
-            let block = match span.as_ref().and_then(|blocks| blocks.get(&b)) {
-                Some(bytes) => bytes.clone(),
-                None => {
-                    span = self.load_dict_block_span(index, b, last)?;
-                    match span.as_ref().and_then(|blocks| blocks.get(&b)) {
-                        Some(bytes) => bytes.clone(),
-                        // cached already, or a lone block: the plain cached read
-                        None => self.dict_block(index, b)?,
-                    }
+            let mut prefetched = span.as_mut().and_then(|blocks| blocks.value.remove(&b));
+            let cached = if prefetched.is_none() {
+                self.block_cache
+                    .lock()
+                    .0
+                    .get(&(index.meta(b).0 as usize))
+                    .cloned()
+            } else {
+                None
+            };
+            if prefetched.is_none()
+                && cached.is_none()
+                && span.as_ref().is_none_or(|blocks| blocks.value.is_empty())
+            {
+                // Release the previous window before admitting another one.
+                drop(span.take());
+                span = self.load_dict_block_span(index, b, last)?;
+                prefetched = span.as_mut().and_then(|blocks| blocks.value.remove(&b));
+            }
+            let block = match (prefetched, cached) {
+                (Some(bytes), _) => {
+                    // Publish only consumed blocks. Future blocks remain owned
+                    // by the bounded window, independently of FIFO eviction.
+                    let mut cache = self.block_cache.lock();
+                    let result = self.cache_dict_block(&mut cache, index.meta(b).0 as usize, bytes);
+                    drop(cache);
+                    self.memory.notify();
+                    result?
                 }
+                (None, Some(bytes)) => bytes,
+                (None, None) => self.dict_block(index, b)?,
             };
             let first_ordinal = index.meta(b).1;
             let mut done = false;
@@ -6203,20 +6217,16 @@ impl VixReader {
         Ok(())
     }
 
-    /// Bulk-load the missing dictionary blocks of `start..=last` for one
-    /// range walk (ranged readers only; in-memory readers slice for free).
-    /// Runs of consecutive missing blocks resolve through ONE
-    /// `block_fetch_many`, retaining at most 8 MiB across the entire batch;
-    /// `scan_key_range` calls again from the first block past the window.
-    /// Small spans are also published to the shared block cache.
+    /// Retain one bounded window until its blocks are consumed by the walk.
+    /// Prefetch does not publish to the FIFO cache or evict future blocks.
     fn load_dict_block_span(
         &self,
         index: &crate::dict_blocks::DictIndex,
         start: usize,
         last: usize,
-    ) -> Result<Option<std::collections::HashMap<usize, Bytes>>> {
+    ) -> Result<Option<Admitted<std::collections::HashMap<usize, Bytes>>>> {
         const SPAN_FETCH_MAX_BYTES: u64 = 8 * 1024 * 1024;
-        const SPAN_CACHE_MAX_BLOCKS: usize = 512;
+        const SPAN_MAX_BLOCKS: usize = 512;
         let Some(BlobHandle::Ranged(ranged)) = self.dict_blocks_blob.as_ref() else {
             return Ok(None);
         };
@@ -6224,13 +6234,28 @@ impl VixReader {
             return Ok(None);
         }
         let blob_len = self.dict_blocks_len()?;
-        // runs of consecutive MISSING blocks, cut at the fetch-size cap
-        let mut runs: Vec<(std::ops::Range<usize>, std::ops::Range<u64>)> = Vec::new();
+        let max_blocks = (last - start).saturating_add(1).min(SPAN_MAX_BLOCKS);
+        // Admit planning vectors and the result table before allocating them.
+        let planning = self.memory.reserve(
+            hash_table_bytes::<(usize, Bytes)>(max_blocks).saturating_add(
+                max_blocks.saturating_mul(
+                    std::mem::size_of::<(std::ops::Range<usize>, std::ops::Range<u64>)>()
+                        + std::mem::size_of::<std::ops::Range<u64>>()
+                        + std::mem::size_of::<Bytes>(),
+                ),
+            ),
+        )?;
+        let mut runs: Vec<(std::ops::Range<usize>, std::ops::Range<u64>)> =
+            Vec::with_capacity(max_blocks);
         let mut fetch_bytes = 0u64;
+        let mut total_blocks = 0usize;
         {
             let cache = self.block_cache.lock();
             for b in start..=last.min(index.block_count().saturating_sub(1)) {
                 check_read_cancelled()?;
+                if total_blocks == SPAN_MAX_BLOCKS {
+                    break;
+                }
                 if cache.0.contains_key(&(index.meta(b).0 as usize)) {
                     continue;
                 }
@@ -6239,6 +6264,7 @@ impl VixReader {
                     break;
                 }
                 fetch_bytes += range.end - range.start;
+                total_blocks += 1;
                 match runs.last_mut() {
                     Some((blocks, bytes))
                         if blocks.end == b && range.end - bytes.start <= SPAN_FETCH_MAX_BYTES =>
@@ -6250,18 +6276,22 @@ impl VixReader {
                 }
             }
         }
-        // nothing missing, or a single block: the plain cached read is as good
-        if runs.is_empty() || (runs.len() == 1 && runs[0].0.len() == 1) {
+        if total_blocks <= 1 {
             return Ok(None);
         }
+        // Cover fetched payloads and their detached copies simultaneously.
+        let pending = self
+            .memory
+            .reserve((fetch_bytes as usize).saturating_mul(2))?
+            .merge(planning);
         let ranges: Vec<std::ops::Range<u64>> = runs
             .iter()
             .map(|(_, bytes)| ranged.range.start + bytes.start..ranged.range.start + bytes.end)
             .collect();
         let fetched = crate::source::block_fetch_many(ranged.source.as_ref(), ranges)?;
-        let total_blocks: usize = runs.iter().map(|(blocks, _)| blocks.len()).sum();
         let mut blocks_map = std::collections::HashMap::with_capacity(total_blocks);
         for ((blocks, bytes), run) in runs.into_iter().zip(fetched) {
+            let run = compact_bytes(run);
             for b in blocks {
                 let range = index.block_range(b, blob_len);
                 blocks_map.insert(
@@ -6272,17 +6302,10 @@ impl VixReader {
                 );
             }
         }
-        if blocks_map.len() <= SPAN_CACHE_MAX_BLOCKS {
-            let mut cache = self.block_cache.lock();
-            let result = blocks_map.drain().try_for_each(|(b, bytes)| {
-                self.cache_dict_block(&mut cache, index.meta(b).0 as usize, bytes)
-                    .map(drop)
-            });
-            drop(cache);
-            self.memory.notify();
-            result?;
-        }
-        Ok(Some(blocks_map))
+        Ok(Some(Admitted {
+            value: blocks_map,
+            _pending: pending,
+        }))
     }
 
     /// Bulk-load an arbitrary ASCENDING list of dictionary blocks (ranged
@@ -7963,6 +7986,9 @@ mod memory_regressions;
 #[cfg(test)]
 #[path = "reader_contains_any_tests.rs"]
 mod contains_any_tests;
+#[cfg(test)]
+#[path = "reader_dict_window_tests.rs"]
+mod dict_window_tests;
 #[cfg(test)]
 #[path = "reader_term_count_tests.rs"]
 mod term_count_tests;
