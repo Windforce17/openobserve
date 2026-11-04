@@ -793,29 +793,56 @@ pub fn validate_spliceable(
 /// plain name (M1 files — presence unknown) or a `[name, present_rows]`
 /// pair (stats-era files).
 pub(crate) fn parse_columns_prop(raw: &str) -> Result<Vec<(String, Option<u64>)>> {
-    let value: serde_json::Value = serde_json::from_str(raw)
-        .map_err(|e| VixError::Malformed(format!("columns property: {e}")))?;
-    let Some(entries) = value.as_array() else {
-        return Err(VixError::Malformed(
-            "columns property is not an array".to_string(),
-        ));
-    };
-    entries
-        .iter()
-        .map(|entry| {
-            if let Some(name) = entry.as_str() {
-                return Ok((name.to_string(), None));
+    struct ColumnEntry((String, Option<u64>));
+
+    impl<'de> serde::Deserialize<'de> for ColumnEntry {
+        fn deserialize<D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> std::result::Result<Self, D::Error> {
+            struct EntryVisitor;
+            impl<'de> serde::de::Visitor<'de> for EntryVisitor {
+                type Value = ColumnEntry;
+
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a column name or an array starting with a column name")
+                }
+
+                fn visit_str<E: serde::de::Error>(
+                    self,
+                    name: &str,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(ColumnEntry((name.to_owned(), None)))
+                }
+
+                fn visit_string<E: serde::de::Error>(
+                    self,
+                    name: String,
+                ) -> std::result::Result<Self::Value, E> {
+                    Ok(ColumnEntry((name, None)))
+                }
+
+                fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                    self,
+                    mut seq: A,
+                ) -> std::result::Result<Self::Value, A::Error> {
+                    let name = seq
+                        .next_element::<String>()?
+                        .ok_or_else(|| serde::de::Error::custom("missing column name"))?;
+                    let count = seq
+                        .next_element::<serde_json::Value>()?
+                        .and_then(|value| value.as_u64());
+                    // Retain Value's validation for extensions, including depth and numbers.
+                    while seq.next_element::<serde_json::Value>()?.is_some() {}
+                    Ok(ColumnEntry((name, count)))
+                }
             }
-            if let Some(pair) = entry.as_array()
-                && let Some(name) = pair.first().and_then(|n| n.as_str())
-            {
-                return Ok((name.to_string(), pair.get(1).and_then(|c| c.as_u64())));
-            }
-            Err(VixError::Malformed(format!(
-                "columns property entry is neither a name nor a [name, count] pair: {entry}"
-            )))
-        })
-        .collect()
+            deserializer.deserialize_any(EntryVisitor)
+        }
+    }
+
+    serde_json::from_str::<Vec<ColumnEntry>>(raw)
+        .map(|entries| entries.into_iter().map(|entry| entry.0).collect())
+        .map_err(|e| VixError::Malformed(format!("columns property: {e}")))
 }
 
 /// Serialize the `columns` property: `[name, count]` pairs when the count
@@ -834,6 +861,93 @@ pub(crate) fn encode_columns_prop(entries: &[(String, Option<u64>)]) -> Result<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Preserve the Value-based parser as an independent compatibility oracle.
+    fn legacy_columns_prop(raw: &str) -> std::result::Result<Vec<(String, Option<u64>)>, ()> {
+        let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| ())?;
+        value
+            .as_array()
+            .ok_or(())?
+            .iter()
+            .map(|entry| {
+                if let Some(name) = entry.as_str() {
+                    return Ok((name.to_string(), None));
+                }
+                if let Some(pair) = entry.as_array()
+                    && let Some(name) = pair.first().and_then(|n| n.as_str())
+                {
+                    return Ok((name.to_string(), pair.get(1).and_then(|c| c.as_u64())));
+                }
+                Err(())
+            })
+            .collect()
+    }
+
+    fn assert_columns_compat(raw: &str) {
+        let expected = legacy_columns_prop(raw);
+        let actual = parse_columns_prop(raw);
+        assert_eq!(expected.is_ok(), actual.is_ok(), "{raw}");
+        if let Ok(expected) = expected {
+            assert_eq!(expected, actual.unwrap(), "{raw}");
+        } else {
+            assert!(matches!(actual, Err(VixError::Malformed(_))), "{raw}");
+        }
+    }
+
+    #[test]
+    fn columns_json_compat_counts_and_extensions() {
+        for raw in [
+            "[]",
+            r#"["legacy",["known",7],["missing"],["null",null]]"#,
+            r#"["",["same",0],["same",9],["escaped\"\\\n\u65e5",1]]"#,
+            r#"[["negative",-1],["float",1.0],["exponent",1e0],["zero",-0]]"#,
+            r#"[["text","1"],["bool",true],["array",[1]],["object",{"a":1}]]"#,
+            r#"[["max",18446744073709551615],["overflow",18446744073709551616]]"#,
+            r#"[["underflow",-9223372036854775809],["tiny",1e-9999]]"#,
+            r#"[["extra",7,null,true,"tail",[1],{"x":2}]]"#,
+            r#"[["extra",{"same":1,"same":2},["tail"]]]"#,
+        ] {
+            assert_columns_compat(raw);
+        }
+    }
+
+    #[test]
+    fn columns_json_compat_rejects_malformed_input() {
+        for raw in [
+            "",
+            "null",
+            "true",
+            "1",
+            "{}",
+            r#""name""#,
+            "[1]",
+            "[null]",
+            "[{}]",
+            "[[]]",
+            "[[1,2]]",
+            "[[null,2]]",
+            r#"[["name",1e9999]]"#,
+            r#"[["name",1,1e9999]]"#,
+            r#"[["name",1,{"n":1e9999}]]"#,
+            r#"[["name",01]]"#,
+            r#"[["name",1,]]"#,
+            r#"["name",]"#,
+            r#"[["name",1,"\uD800"]]"#,
+            r#"["\x"]"#,
+            r#"["name"] true"#,
+        ] {
+            assert_columns_compat(raw);
+        }
+    }
+
+    #[test]
+    fn columns_json_compat_preserves_depth_limit() {
+        for depth in [1, 32, 124, 125, 126, 127, 128, 129, 256] {
+            let nested = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+            assert_columns_compat(&format!(r#"[["count",{nested}]]"#));
+            assert_columns_compat(&format!(r#"[["extra",1,{nested}]]"#));
+        }
+    }
 
     #[test]
     fn string_bounds_are_valid_and_bounded() {

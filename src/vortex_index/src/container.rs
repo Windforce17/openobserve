@@ -674,6 +674,26 @@ impl serde::Serialize for FieldTypeFlags {
 
 impl<'de> serde::Deserialize<'de> for FieldTypeFlags {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct WireType(FieldTypeFlags);
+
+        impl<'de> serde::Deserialize<'de> for WireType {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct TypeVisitor;
+                impl<'de> serde::de::Visitor<'de> for TypeVisitor {
+                    type Value = WireType;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a field type string")
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                        Ok(WireType(FieldTypeFlags::from_wire(value)))
+                    }
+                }
+                deserializer.deserialize_str(TypeVisitor)
+            }
+        }
+
         struct V;
         impl<'de> serde::de::Visitor<'de> for V {
             type Value = FieldTypeFlags;
@@ -685,8 +705,8 @@ impl<'de> serde::Deserialize<'de> for FieldTypeFlags {
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut flags = 0u16;
-                while let Some(ty) = seq.next_element::<String>()? {
-                    flags |= FieldTypeFlags::from_wire(&ty).0;
+                while let Some(WireType(ty)) = seq.next_element()? {
+                    flags |= ty.0;
                 }
                 Ok(FieldTypeFlags(flags))
             }
@@ -3965,5 +3985,82 @@ pub(crate) fn probe_column_encodings(docs: &crate::VixDocs, name: &str) {
             }
         }
         println!("   ({count} nodes)");
+    }
+}
+
+#[cfg(test)]
+mod json_compat_tests {
+    use super::*;
+
+    #[derive(serde::Deserialize)]
+    struct LegacyFieldEntry {
+        name: String,
+        types: Vec<String>,
+    }
+
+    fn assert_fields_compat(raw: &str) {
+        let expected: Result<Vec<LegacyFieldEntry>, _> = serde_json::from_str(raw);
+        let actual: Result<Vec<FieldEntry>, _> = serde_json::from_str(raw);
+        assert_eq!(expected.is_ok(), actual.is_ok(), "{raw}");
+        if let Ok(expected) = expected {
+            let actual = actual.unwrap();
+            assert_eq!(expected.len(), actual.len(), "{raw}");
+            for (expected, actual) in expected.iter().zip(&actual) {
+                assert_eq!(expected.name, actual.name, "{raw}");
+                let flags = expected
+                    .types
+                    .iter()
+                    .fold(0, |bits, ty| bits | FieldTypeFlags::from_wire(ty).0);
+                assert_eq!(flags, actual.types.0, "{raw}");
+                assert_eq!(
+                    serde_json::to_string(&FieldTypeFlags(flags)).unwrap(),
+                    serde_json::to_string(&actual.types).unwrap(),
+                    "{raw}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fields_json_compat_known_unknown_and_escaped_types() {
+        for raw in [
+            "[]",
+            r#"[{"name":"legacy","types":[]}]"#,
+            r#"[{"name":"x","types":["term","fts","cs","bloom","bf"]}]"#,
+            r#"[{"name":"x","types":["term","term","unknown","","TERM"]}]"#,
+            r#"[{"name":"\u65e5\"\\\n","types":["\u0074erm","f\u0074s","c\u0073","\u0062loom","b\u0066","new\nflag"]}]"#,
+            r#"[{"name":"same","types":["cs"]},{"name":"same","types":["fts"]}]"#,
+            r#"[{"types":["term"],"extra":{"future":[1,2]},"name":"x"}]"#,
+            r#"[["sequence",["term","cs"]]]"#,
+        ] {
+            assert_fields_compat(raw);
+        }
+    }
+
+    #[test]
+    fn fields_json_compat_rejects_malformed_input() {
+        for raw in [
+            "",
+            "null",
+            "{}",
+            "[null]",
+            "[{}]",
+            r#"[{"name":"x"}]"#,
+            r#"[{"types":[]}]"#,
+            r#"[{"name":null,"types":[]}]"#,
+            r#"[{"name":"x","types":null}]"#,
+            r#"[{"name":"x","types":"term"}]"#,
+            r#"[{"name":"x","types":[1]}]"#,
+            r#"[{"name":"x","types":[null]}]"#,
+            r#"[{"name":"x","types":[{}]}]"#,
+            r#"[{"name":"x","types":[[]]}]"#,
+            r#"[{"name":"x","types":["\uD800"]}]"#,
+            r#"[{"name":"x","name":"y","types":[]}]"#,
+            r#"[{"name":"x","types":[],"types":["cs"]}]"#,
+            r#"[{"name":"x","types":["term",]}]"#,
+            r#"[] false"#,
+        ] {
+            assert_fields_compat(raw);
+        }
     }
 }
