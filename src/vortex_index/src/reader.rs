@@ -7961,8 +7961,8 @@ mod tests {
 mod memory_regressions;
 
 #[cfg(test)]
-#[path = "reader_term_count_tests.rs"]
-mod term_count_tests;
-#[cfg(test)]
 #[path = "reader_contains_any_tests.rs"]
 mod contains_any_tests;
+#[cfg(test)]
+#[path = "reader_term_count_tests.rs"]
+mod term_count_tests;
