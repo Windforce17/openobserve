@@ -97,6 +97,13 @@ pub fn create_session_config(
         .with_target_partitions(target_partitions)
         .with_information_schema(true);
 
+    // DF 54's shared Repartition SpillPool can lose an unfinished file when
+    // concurrent writers replace current_write_file (upstream #23447/#24883).
+    // Finish every non-empty spilled batch before sending its channel marker.
+    // A small positive threshold is insufficient for batches below that size.
+    // This affects only Repartition spills, not aggregation/sort spill files.
+    config.options_mut().execution.max_spill_file_size_bytes = 0;
+
     config
         .options_mut()
         .execution

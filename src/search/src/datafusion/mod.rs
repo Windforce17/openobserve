@@ -88,3 +88,6 @@ mod tests {
         assert!("pool".parse::<MemoryPoolType>().is_err());
     }
 }
+
+#[cfg(test)]
+mod repartition_spill_tests;
