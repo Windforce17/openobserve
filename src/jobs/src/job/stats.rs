@@ -105,6 +105,20 @@ async fn update_node_memory_usage() -> Result<(), anyhow::Error> {
         config::metrics::NODE_MEMORY_USAGE
             .with_label_values::<&str>(&[])
             .set(mem_usage as i64);
+        let cgroup = config::utils::sysinfo::cgroup_memory::read();
+        for (kind, bytes) in [
+            ("current", cgroup.as_ref().map(|v| v.current)),
+            ("working_set", cgroup.as_ref().and_then(|v| v.working_set)),
+        ] {
+            if let Some(bytes) = bytes {
+                config::metrics::NODE_CGROUP_MEMORY_BYTES
+                    .with_label_values(&[kind])
+                    .set(bytes.min(i64::MAX as u64) as i64);
+            } else {
+                // Do not expose a stale sample or claim that unreadable means zero.
+                let _ = config::metrics::NODE_CGROUP_MEMORY_BYTES.remove_label_values(&[kind]);
+            }
+        }
         tokio::time::sleep(time::Duration::from_secs(1)).await;
     }
 }

@@ -26,6 +26,7 @@ pub mod meta;
 pub mod metrics;
 pub mod prebuilt_loader;
 pub mod router;
+pub mod search_admission;
 pub mod stats;
 pub mod text_tokenizer;
 pub mod utils;

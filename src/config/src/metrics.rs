@@ -16,8 +16,8 @@
 use std::{collections::HashMap, sync::LazyLock as Lazy};
 
 use prometheus::{
-    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec, Opts,
-    Registry, TextEncoder,
+    CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec, Opts, Registry, TextEncoder,
 };
 
 pub const NAMESPACE: &str = "zo";
@@ -1465,13 +1465,90 @@ pub static NODE_MEMORY_TOTAL: Lazy<IntGaugeVec> = Lazy::new(|| {
 });
 pub static NODE_MEMORY_USAGE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
-        Opts::new("node_memory_usage", "Memory usage")
+        Opts::new("node_memory_usage", "Process resident memory (RSS), bytes")
             .namespace(NAMESPACE)
             .const_labels(create_const_labels()),
         &[],
     )
     .expect("Metric created")
 });
+
+/// Process-wide shared-query pool only; per-context wrappers must not double count.
+pub static DATAFUSION_SHARED_RESERVED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "datafusion_shared_reserved_bytes",
+            "Bytes reserved in the process shared query pool",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+pub static DATAFUSION_SHARED_REJECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "datafusion_shared_rejections_total",
+            "Shared query pool try_grow refusals, including inner fair-share refusals",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+pub static NODE_CGROUP_MEMORY_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(Opts::new("node_cgroup_memory_bytes", "Current cgroup memory usage and usage minus inactive_file; unavailable samples omitted")
+        .namespace(NAMESPACE).const_labels(create_const_labels()), &["kind"]).expect("Metric created")
+});
+pub static FOLLOWER_ADMISSION_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "follower_admission_active",
+            "Follower requests holding execution admission, including setup and response streaming",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class"],
+    )
+    .expect("Metric created")
+});
+pub static FOLLOWER_ADMISSION_QUEUED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "follower_admission_queued",
+            "Follower requests awaiting weighted budget or low memory watermark",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class"],
+    )
+    .expect("Metric created")
+});
+pub static FOLLOWER_ADMISSION_WAIT_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    HistogramVec::new(
+        HistogramOpts::new(
+            "follower_admission_wait_seconds",
+            "Follower admission wait including failed and cancelled waits",
+        )
+        .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0])
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["class"],
+    )
+    .expect("Metric created")
+});
+pub static FOLLOWER_ADMISSION_TIMEOUTS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "follower_admission_timeouts_total",
+            "Follower heavy admission waits that expired and proceeded without a permit",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
 pub static NODE_DISK_TOTAL: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new("node_disk_total", "Total disk space")
@@ -2968,6 +3045,27 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(NODE_MEMORY_USAGE.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(DATAFUSION_SHARED_RESERVED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(DATAFUSION_SHARED_REJECTIONS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(NODE_CGROUP_MEMORY_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FOLLOWER_ADMISSION_ACTIVE.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FOLLOWER_ADMISSION_QUEUED.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FOLLOWER_ADMISSION_WAIT_SECONDS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FOLLOWER_ADMISSION_TIMEOUTS_TOTAL.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(NODE_DISK_TOTAL.clone()))

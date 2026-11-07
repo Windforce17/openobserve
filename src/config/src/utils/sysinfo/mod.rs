@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub mod cgroup;
+pub mod cgroup_memory;
 pub mod cpu;
 pub mod disk;
 pub mod mem;

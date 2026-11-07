@@ -185,6 +185,7 @@ struct LimitedMemoryPool {
     limit: usize,
     reserved: AtomicUsize,
     inner: Arc<dyn MemoryPool>,
+    shared_metrics: bool,
 }
 
 impl LimitedMemoryPool {
@@ -194,7 +195,13 @@ impl LimitedMemoryPool {
             limit,
             reserved: AtomicUsize::new(0),
             inner,
+            shared_metrics: false,
         }
+    }
+
+    fn with_shared_metrics(mut self) -> Self {
+        self.shared_metrics = true;
+        self
     }
 
     fn reserve(&self, additional: usize) -> std::result::Result<(), usize> {
@@ -224,15 +231,24 @@ impl MemoryPool for LimitedMemoryPool {
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         self.reserved.fetch_add(additional, Ordering::Relaxed);
         self.inner.grow(reservation, additional);
+        if self.shared_metrics {
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.add(additional as i64);
+        }
     }
 
     fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
         self.inner.shrink(reservation, shrink);
         self.reserved.fetch_sub(shrink, Ordering::Relaxed);
+        if self.shared_metrics {
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.sub(shrink as i64);
+        }
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> Result<()> {
         self.reserve(additional).map_err(|reserved| {
+            if self.shared_metrics {
+                config::metrics::DATAFUSION_SHARED_REJECTIONS_TOTAL.inc();
+            }
             DataFusionError::ResourcesExhausted(format!(
                 "{} memory pool cannot reserve {additional} additional bytes: \
                  {reserved} of {} bytes already reserved",
@@ -241,7 +257,13 @@ impl MemoryPool for LimitedMemoryPool {
         })?;
         if let Err(e) = self.inner.try_grow(reservation, additional) {
             self.reserved.fetch_sub(additional, Ordering::AcqRel);
+            if self.shared_metrics {
+                config::metrics::DATAFUSION_SHARED_REJECTIONS_TOTAL.inc();
+            }
             return Err(e);
+        }
+        if self.shared_metrics {
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.add(additional as i64);
         }
         Ok(())
     }
@@ -349,11 +371,10 @@ static SHARED_QUERY_POOL: std::sync::LazyLock<Arc<dyn MemoryPool>> =
                     settings.pool_type
                 )
             });
-        let pool: Arc<dyn MemoryPool> = Arc::new(LimitedMemoryPool::new(
-            "shared-query-global",
-            memory_size,
-            tracked_pool,
-        ));
+        let pool: Arc<dyn MemoryPool> = Arc::new(
+            LimitedMemoryPool::new("shared-query-global", memory_size, tracked_pool)
+                .with_shared_metrics(),
+        );
         log::info!("[DATAFUSION] shared query memory pool created: {memory_size_mib} MiB");
         pool
     });
@@ -1248,6 +1269,53 @@ mod tests {
     use super::*;
 
     static SHARED_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn shared_pool_metrics_match_reservations_and_count_refusals_once() {
+        let _lock = SHARED_POOL_TEST_LOCK.lock();
+        let before = config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.get();
+        let rejected = config::metrics::DATAFUSION_SHARED_REJECTIONS_TOTAL.get();
+        let global: Arc<dyn MemoryPool> = Arc::new(
+            LimitedMemoryPool::new("metrics-global", 100, Arc::new(GreedyMemoryPool::new(80)))
+                .with_shared_metrics(),
+        );
+        let local: Arc<dyn MemoryPool> =
+            Arc::new(LimitedMemoryPool::new("metrics-local", 100, global.clone()));
+        let r = MemoryConsumer::new("metrics-test").register(&local);
+        r.try_grow(70).unwrap();
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.get(),
+            before + 70
+        );
+        assert!(r.try_grow(20).is_err()); // inner refusal, rolled back
+        assert_eq!(global.reserved(), 70);
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_REJECTIONS_TOTAL.get(),
+            rejected + 1
+        );
+        let global_r = MemoryConsumer::new("metrics-global-test").register(&global);
+        assert!(global_r.try_grow(31).is_err()); // hard global cap
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_REJECTIONS_TOTAL.get(),
+            rejected + 2
+        );
+        r.grow(50); // infallible grow remains legal and observable above the cap
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.get(),
+            before + 120
+        );
+        r.shrink(20);
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.get(),
+            before + 100
+        );
+        drop((r, global_r));
+        assert_eq!(global.reserved(), 0);
+        assert_eq!(
+            config::metrics::DATAFUSION_SHARED_RESERVED_BYTES.get(),
+            before
+        );
+    }
 
     fn create_test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
