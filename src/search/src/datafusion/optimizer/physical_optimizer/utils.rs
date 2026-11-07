@@ -164,7 +164,14 @@ pub fn min_max_column_aggregate(expr: &AggregateFunctionExpr) -> Option<(String,
 pub fn is_count_rows_aggregate(expr: &AggregateFunctionExpr) -> bool {
     // The display/output name is not an aggregate identity. In particular, an
     // alias named `count(Int64(1))` must not make another expression count rows.
-    if expr.fun().inner().downcast_ref::<Count>().is_none() || expr.is_distinct() {
+    if (expr.fun().inner().downcast_ref::<Count>().is_none()
+        && expr
+            .fun()
+            .inner()
+            .downcast_ref::<crate::datafusion::udaf::shared_count::SharedCount>()
+            .is_none())
+        || expr.is_distinct()
+    {
         return false;
     }
     let args = expr.expressions();

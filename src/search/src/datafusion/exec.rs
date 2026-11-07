@@ -613,7 +613,12 @@ impl<'a> DataFusionContextBuilder<'a> {
         if cfg.common.feature_join_match_one_enabled {
             builder = builder.with_query_planner(Arc::new(OpenobserveQueryPlanner::new()));
         }
-        Ok(SessionContext::new_with_state(builder.build()))
+        let ctx = SessionContext::new_with_state(builder.build());
+        // The same name and state fields are used by physical-plan protobuf decoding.
+        ctx.register_udaf(AggregateUDF::from(
+            super::udaf::shared_count::SharedCount::default(),
+        ));
+        Ok(ctx)
     }
 }
 
