@@ -13,14 +13,18 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use std::{collections::VecDeque, pin::Pin, task::Poll};
+use std::{collections::VecDeque, pin::Pin, sync::Arc, task::Poll};
 
 use arrow::ipc::writer::IpcWriteOptions;
 use arrow_flight::{FlightData, error::FlightError};
 use config::metrics;
 use datafusion::execution::SendableRecordBatchStream;
-use flight::{common::PreCustomMessage, encoder::FlightDataEncoder};
-use futures::{Stream, StreamExt};
+use flight::{
+    budget::{FLIGHT_CONTROL_BUDGET, FlightDataBudget},
+    common::PreCustomMessage,
+    encoder::FlightDataEncoder,
+};
+use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, ready};
 #[cfg(feature = "enterprise")]
 use o2_enterprise::enterprise::common::config::get_config as get_o2_config;
 use tokio::{sync::mpsc, task::JoinSet};
@@ -93,11 +97,16 @@ impl FlightEncoderStreamBuilder {
         let child_span = info_span!("grpc:search:flight:execute_physical_plan");
         let _ = child_span.set_parent(span.context());
 
+        let budget = Arc::new(FlightDataBudget::default());
         let (source, tasks) = if partitions.len() == 1 {
             // one partition: no parallelism to gain, poll inline (no task, no channel)
             let inner = partitions.into_iter().next().unwrap();
-            let stream =
-                PartitionEncoderStream::new(inner, self.options.clone(), self.max_flight_data_size);
+            let stream = PartitionEncoderStream::new(
+                inner,
+                self.options.clone(),
+                self.max_flight_data_size,
+                Arc::clone(&budget),
+            );
             (FlightSource::Inline(Box::new(stream)), JoinSet::new())
         } else {
             // one task per partition, merged over the channel
@@ -110,6 +119,7 @@ impl FlightEncoderStreamBuilder {
                     inner,
                     self.options.clone(),
                     self.max_flight_data_size,
+                    Arc::clone(&budget),
                 );
                 tasks.spawn(async move {
                     while let Some(item) = stream.next().await {
@@ -128,9 +138,11 @@ impl FlightEncoderStreamBuilder {
 
         FlightEncoderStream {
             source,
-            encoder: FlightDataEncoder::new(self.options, self.max_flight_data_size),
             queue: VecDeque::new(),
             custom_messages: self.custom_messages,
+            control_messages: VecDeque::new(),
+            control_encoding: None,
+            control_budget: Arc::new(FlightDataBudget::new(FLIGHT_CONTROL_BUDGET)),
             first_data: true,
             done: false,
             ctx: StreamContext {
@@ -152,15 +164,17 @@ impl FlightEncoderStreamBuilder {
 enum FlightSource {
     Channel(mpsc::Receiver<Result<Vec<FlightData>, FlightError>>),
     Inline(Box<PartitionEncoderStream>),
+    Done,
 }
 
 pub struct FlightEncoderStream {
     /// one coalesced chunk (dictionary + records) per item
     source: FlightSource,
-    /// Only used to encode custom messages (scan stats, peak memory, ...).
-    encoder: FlightDataEncoder,
     queue: VecDeque<FlightData>,
     custom_messages: Vec<PreCustomMessage>,
+    control_messages: VecDeque<PreCustomMessage>,
+    control_encoding: Option<BoxFuture<'static, Result<Option<FlightData>, FlightError>>>,
+    control_budget: Arc<FlightDataBudget>,
     first_data: bool,
     done: bool,
     /// query context + resources consumed by the stream's `Drop` teardown.
@@ -223,32 +237,53 @@ impl EventLog {
 }
 
 impl FlightEncoderStream {
-    fn encode_custom_messages(&mut self) -> Result<(), FlightError> {
-        let custom_messages = std::mem::take(&mut self.custom_messages);
-        for message in custom_messages.into_iter() {
-            if let Some(message) = message.get_custom_message() {
-                let flight_data = self.encoder.encode_custom(&message)?;
-                self.queue.push_back(flight_data);
-            }
-        }
-        Ok(())
+    fn enqueue_custom_messages(&mut self) {
+        self.control_messages
+            .extend(std::mem::take(&mut self.custom_messages));
     }
 
-    fn encode_early_emit_messages(&mut self) -> Result<(), FlightError> {
+    fn enqueue_early_emit_messages(&mut self) {
         let custom_messages = std::mem::take(&mut self.custom_messages);
         let mut remainder_messages = Vec::new();
         for message in custom_messages.into_iter() {
             if message.is_early_emit() {
-                if let Some(message) = message.get_custom_message() {
-                    let flight_data = self.encoder.encode_custom(&message)?;
-                    self.queue.push_back(flight_data);
-                }
+                self.control_messages.push_back(message);
             } else {
                 remainder_messages.push(message);
             }
         }
         self.custom_messages = remainder_messages;
-        Ok(())
+    }
+
+    fn poll_control(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<FlightData>, FlightError>> {
+        loop {
+            if let Some(encoding) = &mut self.control_encoding {
+                let result = ready!(encoding.poll_unpin(cx));
+                self.control_encoding = None;
+                match result {
+                    Ok(None) => continue,
+                    other => return Poll::Ready(other),
+                }
+            }
+            let Some(message) = self.control_messages.pop_front() else {
+                return Poll::Ready(Ok(None));
+            };
+            let budget = Arc::clone(&self.control_budget);
+            self.control_encoding = Some(Box::pin(async move {
+                // Acquire the whole control lane BEFORE materializing/serializing metrics. Its
+                // size is unknown, so allow one oversized message without blocking the data lane.
+                let reservation = budget.reserve(usize::MAX).await;
+                let Some(message) = message.get_custom_message() else {
+                    return Ok(None);
+                };
+                let encoder = FlightDataEncoder::new(IpcWriteOptions::default(), 0);
+                let data = encoder.encode_custom(&message)?;
+                Ok(reservation.attach(vec![data])?.pop())
+            }));
+        }
     }
 
     fn fail(
@@ -257,6 +292,10 @@ impl FlightEncoderStream {
     ) -> Poll<Option<Result<FlightData, tonic::Status>>> {
         self.done = true;
         self.queue.clear();
+        self.control_messages.clear();
+        self.control_encoding = None;
+        self.ctx.tasks.abort_all();
+        self.source = FlightSource::Done;
         Poll::Ready(Some(Err(tonic::Status::internal(e.to_string()))))
     }
 
@@ -268,6 +307,7 @@ impl FlightEncoderStream {
         match &mut self.source {
             FlightSource::Channel(rx) => rx.poll_recv(cx),
             FlightSource::Inline(stream) => stream.poll_next_unpin(cx),
+            FlightSource::Done => Poll::Ready(None),
         }
     }
 }
@@ -281,6 +321,11 @@ impl Stream for FlightEncoderStream {
     ) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            // fail() already reported the terminal error and aborted all producers. Their
+            // cancellation JoinErrors must not turn subsequent polls into additional errors.
+            if matches!(this.source, FlightSource::Done) {
+                return Poll::Ready(None);
+            }
             // 1. reap completed encoder tasks and surface panics promptly.
             while let Poll::Ready(Some(result)) = this.ctx.tasks.poll_join_next(cx) {
                 if let Err(e) = result {
@@ -295,6 +340,14 @@ impl Stream for FlightEncoderStream {
             }
 
             // 2. yield any already-encoded output
+            match ready!(this.poll_control(cx)) {
+                Ok(Some(data)) => {
+                    this.log.on_message(&this.ctx.trace_id, this.ctx.is_super);
+                    return Poll::Ready(Some(Ok(data)));
+                }
+                Err(e) => return this.fail(e),
+                Ok(None) => {}
+            }
             if let Some(data) = this.queue.pop_front() {
                 this.log.on_message(&this.ctx.trace_id, this.ctx.is_super);
                 return Poll::Ready(Some(Ok(data)));
@@ -312,11 +365,7 @@ impl Stream for FlightEncoderStream {
                     // before the first data, emit early-emit custom messages
                     if this.first_data {
                         this.first_data = false;
-                        if !this.custom_messages.is_empty()
-                            && let Err(e) = this.encode_early_emit_messages()
-                        {
-                            return this.fail(e);
-                        }
+                        this.enqueue_early_emit_messages();
                     }
                     // enqueue the whole group so the chunk's dictionary and records stay contiguous
                     this.queue.extend(group);
@@ -336,9 +385,7 @@ impl Stream for FlightEncoderStream {
                     if !this.ctx.tasks.is_empty() {
                         return Poll::Pending;
                     }
-                    if let Err(e) = this.encode_custom_messages() {
-                        return this.fail(e);
-                    }
+                    this.enqueue_custom_messages();
                     this.done = true;
                     continue;
                 }
@@ -413,6 +460,97 @@ mod tests {
 
     fn make_builder() -> FlightEncoderStreamBuilder {
         FlightEncoderStreamBuilder::new(IpcWriteOptions::default(), 4096)
+    }
+
+    #[tokio::test]
+    async fn test_control_lane_preserves_early_and_final_partial_messages() {
+        use flight::common::CustomMessage;
+        use parking_lot::Mutex;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let partial = Arc::new(Mutex::new("early".to_string()));
+        let inner = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(vec![Ok(batch)]),
+        ));
+        let mut stream = make_builder()
+            .with_custom_message(PreCustomMessage::PartialErrRefEarly(Some(partial.clone())))
+            .with_custom_message(PreCustomMessage::ScanStats(ScanStats::new()))
+            .with_custom_message(PreCustomMessage::PartialErrRef(Some(partial.clone())))
+            .build(vec![inner], tracing::Span::none());
+        // Force every control message to be oversized. It must still make progress while
+        // the data group is already retained, without taking the data group's permits.
+        stream.control_budget = Arc::new(FlightDataBudget::new(1));
+        let budget = stream.control_budget.clone();
+        let first = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<CustomMessage>(&first.app_metadata).unwrap(),
+            CustomMessage::PartialErr(value) if value == "early"
+        ));
+        assert!(!stream.queue.is_empty());
+        assert!(stream.next().now_or_never().is_none());
+        *partial.lock() = "final".to_string();
+        drop(first);
+
+        let stats = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<CustomMessage>(&stats.app_metadata).unwrap(),
+            CustomMessage::ScanStats(_)
+        ));
+        drop(stats);
+        let data = stream.next().await.unwrap().unwrap();
+        assert!(data.app_metadata.is_empty());
+        drop(data);
+        let final_message = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<CustomMessage>(&final_message.app_metadata).unwrap(),
+            CustomMessage::PartialErr(value) if value == "final"
+        ));
+        drop(final_message);
+        assert!(stream.next().await.is_none());
+        assert_eq!(budget.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_empty_response_still_emits_custom_messages() {
+        let mut stream = make_builder()
+            .with_custom_message(PreCustomMessage::Metrics(None))
+            .with_custom_message(PreCustomMessage::ScanStats(ScanStats::new()))
+            .build(vec![], tracing::Span::none());
+        let budget = stream.control_budget.clone();
+        let data = stream.next().await.unwrap().unwrap();
+        assert!(!data.app_metadata.is_empty());
+        drop(data);
+        assert!(stream.next().await.is_none());
+        assert_eq!(budget.retained_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failure_releases_queued_groups_before_stream_drop() {
+        let mut stream = make_builder().build(vec![], tracing::Span::none());
+        let budget = Arc::new(FlightDataBudget::new(100));
+        let group = budget
+            .reserve(100)
+            .await
+            .attach(vec![FlightData::new().with_data_body(vec![0; 100])])
+            .unwrap();
+        stream.queue.extend(group);
+        assert_eq!(budget.retained_bytes(), 100);
+        assert!(matches!(
+            stream.fail("upstream failed"),
+            Poll::Ready(Some(Err(_)))
+        ));
+        assert_eq!(budget.retained_bytes(), 0);
+        assert!(stream.next().await.is_none());
     }
 
     #[test]

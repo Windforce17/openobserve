@@ -169,6 +169,35 @@ impl ChunkCoalescer {
     }
 }
 
+/// Conservative IPC payload bound for the exact slices the encoder will produce.
+/// Arrow IPC writes input buffers (including whole view buffers), synthesizes validity bits,
+/// and uses at most 8 compression-prefix bytes plus 63 padding bytes per buffer. Compression
+/// falls back to the original buffer when it expands. The 256-byte per-buffer allowance also
+/// covers its flatbuffer descriptor; 1024 bytes per node cover field/message/dictionary headers.
+/// Count full backing buffers and dictionary children for EVERY slice, intentionally overcounting
+/// shared buffers and dictionaries rather than assuming that a row slice shrinks their storage.
+pub fn encoded_size_bound(batch: &RecordBatch, max_flight_data_size: usize) -> usize {
+    fn array_bound(data: &arrow::array::ArrayData) -> usize {
+        let own = data.buffers().iter().fold(
+            1024usize
+                .saturating_add(data.len().div_ceil(8))
+                .saturating_add(data.buffers().len().saturating_add(1).saturating_mul(256)),
+            |sum, buffer| sum.saturating_add(buffer.len()),
+        );
+        data.child_data()
+            .iter()
+            .fold(own, |sum, child| sum.saturating_add(array_bound(child)))
+    }
+
+    split_batch_for_grpc_response(batch.clone(), max_flight_data_size)
+        .iter()
+        .fold(0usize, |sum, slice| {
+            sum.saturating_add(slice.columns().iter().fold(1024usize, |sum, column| {
+                sum.saturating_add(array_bound(&column.to_data()))
+            }))
+        })
+}
+
 fn split_batch_for_grpc_response(
     batch: RecordBatch,
     max_flight_data_size: usize,
@@ -283,9 +312,19 @@ mod tests {
         chunks
             .into_iter()
             .flat_map(|c| {
-                FlightDataEncoder::new(options.clone(), max_flight_data_size)
+                let bound = encoded_size_bound(&c, max_flight_data_size);
+                let encoded = FlightDataEncoder::new(options.clone(), max_flight_data_size)
                     .encode_chunk(c)
-                    .unwrap()
+                    .unwrap();
+                let actual = encoded
+                    .iter()
+                    .map(crate::budget::flight_data_size)
+                    .sum::<usize>();
+                assert!(
+                    actual <= bound,
+                    "IPC payload {actual} exceeds bound {bound}"
+                );
+                encoded
             })
             .collect()
     }

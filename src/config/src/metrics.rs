@@ -104,6 +104,41 @@ pub static GRPC_RESPONSE_TIME: Lazy<HistogramVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+// Flight transport stats
+pub static FLIGHT_ENCODE_RESERVED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "flight_encode_reserved_bytes",
+            "Flight IPC byte permits held by encoders and queued or active groups",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+pub static FLIGHT_ENCODED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "flight_encoded_bytes",
+            "Retained Arrow Flight IPC payload bytes, including queued and active groups",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+pub static FLIGHT_ENCODED_PEAK_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "flight_encoded_peak_bytes",
+            "Process high-water mark of retained Arrow Flight IPC payload bytes",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
 // ingester stats
 pub static INGEST_RECORDS: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
@@ -2586,6 +2621,15 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(GRPC_RESPONSE_TIME.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FLIGHT_ENCODE_RESERVED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FLIGHT_ENCODED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(FLIGHT_ENCODED_PEAK_BYTES.clone()))
         .expect("Metric registered");
 
     // ingester stats
