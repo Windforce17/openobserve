@@ -1339,3 +1339,271 @@ mod tests {
         assert!(create_distinct_arrow_array(&bad_schema, distinct_values).is_err());
     }
 }
+
+#[cfg(test)]
+mod precomputed_compatibility_tests {
+    use std::collections::BTreeMap;
+
+    use arrow::array::StringArray;
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
+    use config::meta::stream::StreamType;
+    use datafusion::{datasource::MemTable, prelude::SessionContext};
+    use futures::TryStreamExt;
+
+    use super::*;
+    use crate::vix::MultiResultBuilder;
+
+    fn query_params() -> Arc<QueryParams> {
+        Arc::new(QueryParams {
+            trace_id: "precomputed-compatibility".into(),
+            org_id: "test".into(),
+            stream: "test".into(),
+            stream_type: StreamType::Logs,
+            stream_name: "test".into(),
+            time_range: (-100, 100),
+            work_group: None,
+            use_inverted_index: true,
+            full_text_fields: None,
+        })
+    }
+
+    async fn materialize(
+        ctx: &SessionContext,
+        schema: SchemaRef,
+        mode: IndexOptimizeMode,
+        result: MultiResult,
+    ) -> Vec<RecordBatch> {
+        IndexOptimizeExec::new(query_params(), schema, vec![], result, mode)
+            .execute(0, ctx.task_ctx())
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap()
+    }
+
+    // A local runner-up can become the global winner. NULL and empty string
+    // must remain different groups; the SQL supplies explicit tie-break keys.
+    #[tokio::test]
+    async fn topn_global_limit_null_composite_and_tie_order() {
+        let mode = IndexOptimizeMode::SimpleTopN(vec!["a".into(), "b".into()], 1, false);
+        let mut builder = MultiResultBuilder::new(&Some(mode.clone()), &[]);
+        let mut expected = BTreeMap::<Vec<Option<String>>, u64>::new();
+        let mut seed = 17u64;
+        for file in 0..31 {
+            let mut rows = vec![
+                (vec![Some(format!("local-{file}")), None], 100),
+                (vec![Some("global".into()), None], 99),
+                (vec![None, Some("tie".into())], 2),
+                (vec![Some(String::new()), Some("tie".into())], 2),
+            ];
+            for _ in 0..64 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                rows.push((
+                    vec![
+                        match seed % 7 {
+                            0 => None,
+                            1 => Some(String::new()),
+                            _ => Some(format!("key-{}", seed % 13)),
+                        },
+                        Some(format!("{}", (seed >> 20) % 5)),
+                    ],
+                    1 + seed % 7,
+                ));
+            }
+            for (key, count) in &rows {
+                *expected.entry(key.clone()).or_default() += count;
+            }
+            builder.add_top_n(rows);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("b", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let batches = materialize(
+            &ctx,
+            schema.clone(),
+            mode,
+            builder.build("test", &mut hashbrown::HashMap::new()),
+        )
+        .await;
+        ctx.register_table(
+            "partials",
+            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        )
+        .unwrap();
+        let mut ranked: Vec<_> = expected.into_iter().collect();
+        ranked.sort_by(|(ka, na), (kb, nb)| nb.cmp(na).then(ka.cmp(kb)));
+        assert_eq!(ranked[0].0, vec![Some("global".into()), None]);
+        for limit in [1, 10000] {
+            let result = ctx
+                .sql(&format!(
+                    "SELECT a, b, sum(n) AS n FROM partials GROUP BY a, b \
+                     ORDER BY n DESC, a ASC NULLS FIRST, b ASC NULLS FIRST LIMIT {limit}"
+                ))
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let mut actual = Vec::new();
+            for batch in result {
+                let a = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let b = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let n = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                actual.extend(a.iter().zip(b.iter()).zip(n.values()).map(|((a, b), n)| {
+                    (vec![a.map(str::to_owned), b.map(str::to_owned)], *n as u64)
+                }));
+            }
+            assert_eq!(
+                actual,
+                ranked.iter().take(limit).cloned().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_histogram_preserves_buckets_and_literal_overflow_key() {
+        let mode = IndexOptimizeMode::SimpleMultiHistogram(-10, 10, 3, 1, "key".into());
+        let mut builder = MultiResultBuilder::new(&Some(mode.clone()), &[]);
+        let mut expected = BTreeMap::new();
+        for file in 0..31 {
+            let rows: Vec<(i64, String, u64)> = vec![
+                (-10, String::new(), 2),
+                (0, "same".into(), 3),
+                (10, "same".into(), 4),
+                (0, "__overflow__".into(), file),
+            ];
+            for (ts, key, n) in &rows {
+                *expected.entry((*ts, key.clone())).or_insert(0u64) += n;
+            }
+            builder.add_multi_histogram(rows);
+        }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("key", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let batches = materialize(
+            &ctx,
+            schema.clone(),
+            mode,
+            builder.build("test", &mut hashbrown::HashMap::new()),
+        )
+        .await;
+        ctx.register_table(
+            "partials",
+            Arc::new(MemTable::try_new(schema, vec![batches]).unwrap()),
+        )
+        .unwrap();
+        let batches = ctx
+            .sql("SELECT ts, key, sum(n) AS n FROM partials GROUP BY ts, key")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        let mut actual = BTreeMap::new();
+        for batch in batches {
+            let ts = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            let key = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let n = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                actual.insert((ts.value(i), key.value(i).to_owned()), n.value(i) as u64);
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn topn_unmergeable_u64_contributions_retain_exact_total() {
+        let mode = IndexOptimizeMode::SimpleTopN(vec!["key".into()], 1, false);
+        let mut builder = MultiResultBuilder::new(&Some(mode.clone()), &[]);
+        builder.add_top_n(vec![(vec![None], u64::MAX), (vec![Some("x".into())], 7)]);
+        builder.add_top_n(vec![(vec![None], 1)]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, true),
+            Field::new("n", DataType::UInt64, false),
+        ]));
+        let batches = materialize(
+            &SessionContext::new(),
+            schema,
+            mode,
+            builder.build("test", &mut hashbrown::HashMap::new()),
+        )
+        .await;
+        let mut actual = BTreeMap::<Option<String>, u128>::new();
+        for batch in batches {
+            let key = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let n = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+            for (key, n) in key.iter().zip(n.values()) {
+                *actual.entry(key.map(str::to_owned)).or_default() += u128::from(*n);
+            }
+        }
+        assert_eq!(actual.get(&None), Some(&(u128::from(u64::MAX) + 1)));
+        assert_eq!(actual.get(&Some("x".into())), Some(&7));
+    }
+
+    #[tokio::test]
+    async fn empty_histogram_still_validates_bucket_width() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let exec = IndexOptimizeExec::new(
+            query_params(),
+            schema,
+            vec![],
+            MultiResult::Histogram(vec![]),
+            IndexOptimizeMode::SimpleHistogram(0, 0, 0, 0),
+        );
+        let error = match exec.execute(0, ctx.task_ctx()) {
+            Err(error) => error,
+            Ok(stream) => stream.try_collect::<Vec<_>>().await.unwrap_err(),
+        };
+        assert!(error.to_string().contains("bucket width cannot be zero"));
+    }
+}
