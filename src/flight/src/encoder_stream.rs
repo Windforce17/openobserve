@@ -22,7 +22,9 @@ use futures::{FutureExt, Stream, StreamExt, future::BoxFuture, ready};
 
 use crate::{
     budget::FlightDataBudget,
-    encoder::{ChunkCoalescer, FlightDataEncoder, encoded_size_bound},
+    encoder::{
+        ChunkCoalescer, FlightDataEncoder, encoded_size_bound, split_batch_for_grpc_response,
+    },
 };
 
 type Encoding = BoxFuture<'static, (FlightDataEncoder, Result<Vec<FlightData>, FlightError>)>;
@@ -82,10 +84,16 @@ impl Stream for PartitionEncoderStream {
                 let mut encoder = this.encoder.take().expect("one encoding at a time");
                 let max_size = this.max_flight_data_size;
                 this.encoding = Some(Box::pin(async move {
-                    let reservation = budget.reserve(encoded_size_bound(&chunk, max_size)).await;
-                    let result = encoder
-                        .encode_chunk(chunk)
-                        .and_then(|group| reservation.attach(group));
+                    // Split once: the reservation bound and the encoder see the same slices.
+                    let result = match split_batch_for_grpc_response(chunk, max_size) {
+                        Ok(slices) => {
+                            let reservation = budget.reserve(encoded_size_bound(&slices)).await;
+                            encoder
+                                .encode_slices(slices)
+                                .and_then(|group| reservation.attach(group))
+                        }
+                        Err(e) => Err(e),
+                    };
                     (encoder, result)
                 }));
                 continue;

@@ -13,10 +13,16 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::sync::Arc;
+
 use arrow::{
-    array::RecordBatch,
+    array::{
+        Array, ArrayRef, AsArray, FixedSizeListArray, GenericListArray, MapArray, OffsetSizeTrait,
+        RecordBatch, RecordBatchOptions, StructArray,
+    },
+    buffer::OffsetBuffer,
     compute::BatchCoalescer,
-    datatypes::DataType,
+    datatypes::{DataType, FieldRef},
     ipc::{
         MessageHeader,
         writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
@@ -27,6 +33,17 @@ use bytes::Bytes;
 use flatbuffers::FlatBufferBuilder;
 
 use crate::common::CustomMessage;
+
+/// Largest per-message payload target, used when the transport limit is large.
+const MAX_FLIGHT_DATA_TARGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Per-message payload target for a transport that rejects messages larger than
+/// `grpc_max_message_bytes`. The payload estimate excludes IPC metadata, buffer padding,
+/// compression prefixes and synthesized validity bitmaps, so a quarter of the limit is left
+/// for them.
+pub fn flight_data_target_for_grpc_limit(grpc_max_message_bytes: usize) -> usize {
+    (grpc_max_message_bytes / 4 * 3).min(MAX_FLIGHT_DATA_TARGET_BYTES)
+}
 
 /// Encodes CustomMessages and RecordBatch chunks into FlightData (coalescing is separate — see
 /// [`ChunkCoalescer`]). Owns the zstd compressor, so it's not `Clone`: use one per thread.
@@ -64,13 +81,23 @@ impl FlightDataEncoder {
 
     /// Encode one chunk into FlightData message(s): split by `max_flight_data_size`, then IPC +
     /// ZSTD.
+    pub fn encode_chunk(&mut self, chunk: RecordBatch) -> Result<Vec<FlightData>> {
+        let slices = split_batch_for_grpc_response(chunk, self.max_flight_data_size)?;
+        self.encode_slices(slices)
+    }
+
+    /// Encode the slices that [`split_batch_for_grpc_response`] produced for this encoder's
+    /// `max_flight_data_size`, one record-batch message per slice.
     ///
     /// Uses a fresh [`DictionaryTracker`] so each chunk re-sends its dictionaries; chunks from
     /// different partitions can interleave while sharing the same dict ids.
-    pub fn encode_chunk(&mut self, chunk: RecordBatch) -> Result<Vec<FlightData>> {
+    pub fn encode_slices(&mut self, slices: Vec<RecordBatch>) -> Result<Vec<FlightData>> {
+        let Some(first) = slices.first() else {
+            return Ok(Vec::new());
+        };
         let data_gen = IpcDataGenerator::default();
         let mut dictionary_tracker = DictionaryTracker::new(false);
-        let schema = chunk.schema();
+        let schema = first.schema();
         let has_dict = *self.schema_has_dict.get_or_insert_with(|| {
             schema
                 .fields()
@@ -86,7 +113,7 @@ impl FlightDataEncoder {
             );
         }
         let mut flight_data = Vec::new();
-        for batch in split_batch_for_grpc_response(chunk, self.max_flight_data_size) {
+        for batch in slices {
             let (encoded_dictionaries, encoded_batch) = data_gen.encode(
                 &batch,
                 &mut dictionary_tracker,
@@ -169,14 +196,14 @@ impl ChunkCoalescer {
     }
 }
 
-/// Conservative IPC payload bound for the exact slices the encoder will produce.
+/// Conservative IPC payload bound for the slices [`split_batch_for_grpc_response`] produced.
 /// Arrow IPC writes input buffers (including whole view buffers), synthesizes validity bits,
 /// and uses at most 8 compression-prefix bytes plus 63 padding bytes per buffer. Compression
 /// falls back to the original buffer when it expands. The 256-byte per-buffer allowance also
 /// covers its flatbuffer descriptor; 1024 bytes per node cover field/message/dictionary headers.
 /// Count full backing buffers and dictionary children for EVERY slice, intentionally overcounting
 /// shared buffers and dictionaries rather than assuming that a row slice shrinks their storage.
-pub fn encoded_size_bound(batch: &RecordBatch, max_flight_data_size: usize) -> usize {
+pub fn encoded_size_bound(slices: &[RecordBatch]) -> usize {
     fn array_bound(data: &arrow::array::ArrayData) -> usize {
         let own = data.buffers().iter().fold(
             1024usize
@@ -189,23 +216,90 @@ pub fn encoded_size_bound(batch: &RecordBatch, max_flight_data_size: usize) -> u
             .fold(own, |sum, child| sum.saturating_add(array_bound(child)))
     }
 
-    split_batch_for_grpc_response(batch.clone(), max_flight_data_size)
-        .iter()
-        .fold(0usize, |sum, slice| {
-            sum.saturating_add(slice.columns().iter().fold(1024usize, |sum, column| {
-                sum.saturating_add(array_bound(&column.to_data()))
-            }))
-        })
+    slices.iter().fold(0usize, |sum, slice| {
+        sum.saturating_add(slice.columns().iter().fold(1024usize, |sum, column| {
+            sum.saturating_add(array_bound(&column.to_data()))
+        }))
+    })
 }
 
-fn split_batch_for_grpc_response(
+/// Splits `batch` into row slices whose record-batch payload estimate stays within
+/// `max_flight_data_size` (0 = no splitting). A single row above the target is returned alone.
+///
+/// Arrow IPC writes every data buffer of a view array, not only the bytes a slice references,
+/// so a slice that only fits once its views are compacted is compacted instead of split.
+pub fn split_batch_for_grpc_response(
+    batch: RecordBatch,
+    max_flight_data_size: usize,
+) -> Result<Vec<RecordBatch>> {
+    if max_flight_data_size == 0 {
+        return Ok(vec![batch]);
+    }
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .all(|f| payload_scales_with_rows(f.data_type()))
+    {
+        return Ok(split_evenly_by_slice_memory(batch, max_flight_data_size));
+    }
+    let compact = schema
+        .fields()
+        .iter()
+        .any(|f| has_compactable_view(f.data_type()));
+    let mut out = Vec::new();
+    push_slices_within(batch, max_flight_data_size, compact, &mut out)?;
+    Ok(out)
+}
+
+fn push_slices_within(
+    batch: RecordBatch,
+    max_flight_data_size: usize,
+    compact: bool,
+    out: &mut Vec<RecordBatch>,
+) -> Result<()> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return Ok(());
+    }
+    let as_is = batch_payload_estimate(&batch, ViewBytes::Buffers);
+    if as_is <= max_flight_data_size {
+        out.push(batch);
+        return Ok(());
+    }
+    let compacted = if compact {
+        batch_payload_estimate(&batch, ViewBytes::Referenced)
+    } else {
+        as_is
+    };
+    if compacted <= max_flight_data_size || rows == 1 {
+        out.push(if compact {
+            compact_view_buffers(&batch)?
+        } else {
+            batch
+        });
+        return Ok(());
+    }
+    let rows_per_piece = rows.div_ceil(compacted.div_ceil(max_flight_data_size).min(rows));
+    let mut offset = 0;
+    while offset < rows {
+        let length = rows_per_piece.min(rows - offset);
+        push_slices_within(
+            batch.slice(offset, length),
+            max_flight_data_size,
+            compact,
+            out,
+        )?;
+        offset += length;
+    }
+    Ok(())
+}
+
+/// Single-pass split for layouts whose payload estimate does not shrink with row slices.
+fn split_evenly_by_slice_memory(
     batch: RecordBatch,
     max_flight_data_size: usize,
 ) -> Vec<RecordBatch> {
-    if max_flight_data_size == 0 {
-        return vec![batch];
-    }
-
     let size = batch
         .columns()
         .iter()
@@ -230,6 +324,220 @@ fn split_batch_for_grpc_response(
     }
 
     out
+}
+
+/// Whether [`payload_estimate`] shrinks with row slices of this type once view buffers are
+/// compacted.
+fn payload_scales_with_rows(dt: &DataType) -> bool {
+    match dt {
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => payload_scales_with_rows(f.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|f| payload_scales_with_rows(f.data_type())),
+        DataType::ListView(_)
+        | DataType::LargeListView(_)
+        | DataType::Union(..)
+        | DataType::RunEndEncoded(..) => false,
+        _ => true,
+    }
+}
+
+/// True if the type has a view array that [`compact_array`] rebuilds.
+fn has_compactable_view(dt: &DataType) -> bool {
+    match dt {
+        DataType::Utf8View | DataType::BinaryView => true,
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => has_compactable_view(f.data_type()),
+        DataType::Struct(fields) => fields.iter().any(|f| has_compactable_view(f.data_type())),
+        _ => false,
+    }
+}
+
+/// How [`payload_estimate`] counts the out-of-line bytes of view arrays.
+#[derive(Clone, Copy)]
+enum ViewBytes {
+    /// Every data buffer the array holds, as Arrow IPC writes it.
+    Buffers,
+    /// Only the bytes the views reference, as after [`compact_view_buffers`].
+    Referenced,
+}
+
+fn batch_payload_estimate(batch: &RecordBatch, view_bytes: ViewBytes) -> usize {
+    batch
+        .columns()
+        .iter()
+        .map(|column| payload_estimate(column.as_ref(), view_bytes))
+        .sum()
+}
+
+/// Bytes Arrow IPC writes into the record-batch message for this slice: view out-of-line bytes
+/// per `view_bytes`, list and map children limited to the slice's offsets, and dictionary keys
+/// only (dictionary values travel in separate dictionary messages).
+fn payload_estimate(array: &dyn Array, view_bytes: ViewBytes) -> usize {
+    let validity = array.nulls().map_or(0, |_| array.len().div_ceil(8));
+    match array.data_type() {
+        DataType::Utf8View => {
+            let views = array.as_string_view();
+            validity + view_payload(views.views(), views.data_buffers(), view_bytes)
+        }
+        DataType::BinaryView => {
+            let views = array.as_binary_view();
+            validity + view_payload(views.views(), views.data_buffers(), view_bytes)
+        }
+        DataType::List(_) => validity + list_payload(array.as_list::<i32>(), view_bytes),
+        DataType::LargeList(_) => validity + list_payload(array.as_list::<i64>(), view_bytes),
+        DataType::Map(..) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let start = offsets[0] as usize;
+            let end = offsets[offsets.len() - 1] as usize;
+            validity
+                + std::mem::size_of_val(offsets)
+                + payload_estimate(&map.entries().slice(start, end - start), view_bytes)
+        }
+        DataType::FixedSizeList(..) => {
+            validity + payload_estimate(array.as_fixed_size_list().values().as_ref(), view_bytes)
+        }
+        DataType::Struct(_) => {
+            validity
+                + array
+                    .as_struct()
+                    .columns()
+                    .iter()
+                    .map(|column| payload_estimate(column.as_ref(), view_bytes))
+                    .sum::<usize>()
+        }
+        DataType::Dictionary(key, _) => {
+            validity + array.len() * key.primitive_width().unwrap_or(std::mem::size_of::<u64>())
+        }
+        _ => array
+            .to_data()
+            .get_slice_memory_size()
+            .unwrap_or_else(|_| array.get_buffer_memory_size()),
+    }
+}
+
+/// Views of at most this many bytes store their value inline.
+const MAX_INLINE_VIEW_LEN: usize = 12;
+
+fn view_payload(
+    views: &[u128],
+    data_buffers: &[arrow::buffer::Buffer],
+    view_bytes: ViewBytes,
+) -> usize {
+    let out_of_line = match view_bytes {
+        ViewBytes::Buffers => data_buffers
+            .iter()
+            .map(|buffer| buffer.len())
+            .sum::<usize>(),
+        ViewBytes::Referenced => views
+            .iter()
+            .map(|view| *view as u32 as usize)
+            .filter(|len| *len > MAX_INLINE_VIEW_LEN)
+            .sum(),
+    };
+    std::mem::size_of_val(views) + out_of_line
+}
+
+fn list_payload<O: OffsetSizeTrait>(list: &GenericListArray<O>, view_bytes: ViewBytes) -> usize {
+    let offsets = list.value_offsets();
+    let start = offsets[0].as_usize();
+    let end = offsets[offsets.len() - 1].as_usize();
+    std::mem::size_of_val(offsets)
+        + payload_estimate(list.values().slice(start, end - start).as_ref(), view_bytes)
+}
+
+/// Rebuilds view arrays (including those nested in lists, maps and structs) so their data
+/// buffers hold only the bytes this slice references.
+fn compact_view_buffers(batch: &RecordBatch) -> Result<RecordBatch> {
+    let columns = batch
+        .columns()
+        .iter()
+        .map(compact_array)
+        .collect::<Result<Vec<_>>>()?;
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        batch.schema(),
+        columns,
+        &options,
+    )?)
+}
+
+fn compact_array(array: &ArrayRef) -> Result<ArrayRef> {
+    if !has_compactable_view(array.data_type()) {
+        return Ok(Arc::clone(array));
+    }
+    Ok(match array.data_type() {
+        DataType::Utf8View => Arc::new(array.as_string_view().gc()),
+        DataType::BinaryView => Arc::new(array.as_binary_view().gc()),
+        DataType::List(field) => compact_list(array.as_list::<i32>(), field)?,
+        DataType::LargeList(field) => compact_list(array.as_list::<i64>(), field)?,
+        DataType::FixedSizeList(field, size) => {
+            let list = array.as_fixed_size_list();
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(field),
+                *size,
+                compact_array(list.values())?,
+                list.nulls().cloned(),
+            )?)
+        }
+        DataType::Map(field, ordered) => {
+            let map = array.as_map();
+            let offsets = map.value_offsets();
+            let start = offsets[0];
+            let end = offsets[offsets.len() - 1];
+            let entries: ArrayRef =
+                Arc::new(map.entries().slice(start as usize, (end - start) as usize));
+            Arc::new(MapArray::try_new(
+                Arc::clone(field),
+                rebased_offsets(offsets, start),
+                compact_array(&entries)?.as_struct().clone(),
+                map.nulls().cloned(),
+                *ordered,
+            )?)
+        }
+        DataType::Struct(fields) => {
+            let structs = array.as_struct();
+            let columns = structs
+                .columns()
+                .iter()
+                .map(compact_array)
+                .collect::<Result<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                fields.clone(),
+                columns,
+                structs.nulls().cloned(),
+            )?)
+        }
+        _ => Arc::clone(array),
+    })
+}
+
+fn compact_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    field: &FieldRef,
+) -> Result<ArrayRef> {
+    let offsets = list.value_offsets();
+    let start = offsets[0];
+    let end = offsets[offsets.len() - 1];
+    let values = list
+        .values()
+        .slice(start.as_usize(), (end - start).as_usize());
+    Ok(Arc::new(GenericListArray::<O>::try_new(
+        Arc::clone(field),
+        rebased_offsets(offsets, start),
+        compact_array(&values)?,
+        list.nulls().cloned(),
+    )?))
+}
+
+fn rebased_offsets<O: OffsetSizeTrait>(offsets: &[O], start: O) -> OffsetBuffer<O> {
+    OffsetBuffer::new(offsets.iter().map(|offset| *offset - start).collect())
 }
 
 pub fn header_none() -> Bytes {
@@ -312,7 +620,9 @@ mod tests {
         chunks
             .into_iter()
             .flat_map(|c| {
-                let bound = encoded_size_bound(&c, max_flight_data_size);
+                let bound = encoded_size_bound(
+                    &split_batch_for_grpc_response(c.clone(), max_flight_data_size).unwrap(),
+                );
                 let encoded = FlightDataEncoder::new(options.clone(), max_flight_data_size)
                     .encode_chunk(c)
                     .unwrap();
@@ -589,7 +899,7 @@ mod tests {
         let batch = create_test_record_batch();
         let max_size = 1024 * 1024; // Large enough to not split
 
-        let batches = split_batch_for_grpc_response(batch.clone(), max_size);
+        let batches = split_batch_for_grpc_response(batch.clone(), max_size).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), batch.num_rows());
@@ -601,7 +911,7 @@ mod tests {
         let batch = create_test_record_batch();
         let max_size = 1; // Very small to force splitting
 
-        let batches = split_batch_for_grpc_response(batch.clone(), max_size);
+        let batches = split_batch_for_grpc_response(batch.clone(), max_size).unwrap();
 
         assert!(batches.len() > 1);
 
@@ -623,7 +933,7 @@ mod tests {
         let empty_batch =
             RecordBatch::try_new(schema, vec![empty_id_array, empty_name_array]).unwrap();
 
-        let batches = split_batch_for_grpc_response(empty_batch, 1024);
+        let batches = split_batch_for_grpc_response(empty_batch, 1024).unwrap();
 
         // Empty batches return empty vector since the while loop condition (offset <
         // batch.num_rows()) is false when num_rows() is 0
@@ -637,7 +947,7 @@ mod tests {
         let name_array = Arc::new(StringArray::from(vec![Some("Test")]));
         let single_row_batch = RecordBatch::try_new(schema, vec![id_array, name_array]).unwrap();
 
-        let batches = split_batch_for_grpc_response(single_row_batch, 1);
+        let batches = split_batch_for_grpc_response(single_row_batch, 1).unwrap();
 
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].num_rows(), 1);
@@ -657,7 +967,7 @@ mod tests {
             .sum::<usize>();
 
         let max_size = size / 2; // Should create 2 batches
-        let batches = split_batch_for_grpc_response(batch, max_size);
+        let batches = split_batch_for_grpc_response(batch, max_size).unwrap();
 
         // Should create at least 2 batches due to splitting
         assert!(batches.len() >= 2);
@@ -691,7 +1001,7 @@ mod tests {
             .sum();
         let max_size = slice_size + 1;
 
-        let batches = split_batch_for_grpc_response(small_batch, max_size);
+        let batches = split_batch_for_grpc_response(small_batch, max_size).unwrap();
         assert_eq!(
             batches.len(),
             1,
@@ -720,14 +1030,14 @@ mod tests {
         );
         let max_size = (slice_size + full_size) / 2;
 
-        let large_out = split_batch_for_grpc_response(batch.clone(), max_size);
+        let large_out = split_batch_for_grpc_response(batch.clone(), max_size).unwrap();
         assert!(large_out.len() > 1);
         assert_eq!(
             large_out.iter().map(|b| b.num_rows()).sum::<usize>(),
             batch.num_rows()
         );
 
-        let small_out = split_batch_for_grpc_response(small, max_size);
+        let small_out = split_batch_for_grpc_response(small, max_size).unwrap();
         assert_eq!(small_out.len(), 1);
     }
 
@@ -829,5 +1139,111 @@ mod tests {
             }
             _ => panic!("Expected PeakMemory variant"),
         }
+    }
+
+    /// A count(DISTINCT) partial state is a `List<Utf8View>` whose values share view data
+    /// buffers. Arrow IPC writes those buffers whole for every slice, so each message must be
+    /// measured with them and compacted, or it exceeds the gRPC limit and repeats the data.
+    #[test]
+    fn test_list_of_shared_utf8_view_fits_grpc_limit_without_resending_buffers() {
+        let grpc_limit = 4 * 1024 * 1024;
+        let target = flight_data_target_for_grpc_limit(grpc_limit);
+        let (groups, per_group, value_len) = (256usize, 512usize, 32usize);
+        let values = StringViewArray::from_iter_values(
+            (0..groups * per_group).map(|i| format!("{i:0value_len$x}")),
+        );
+        let state = ListArray::new(
+            Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths(std::iter::repeat_n(per_group, groups)),
+            Arc::new(values),
+            None,
+        );
+        let keys = StringViewArray::from_iter_values(
+            (0..groups).map(|g| format!("service-{g:04}-longer-than-inline")),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("service_name", DataType::Utf8View, false),
+            Field::new("trace_id_state", state.data_type().clone(), true),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(keys), Arc::new(state)]).unwrap();
+
+        let encoded = encode_all(&IpcWriteOptions::default(), target, vec![batch.clone()]);
+
+        let record_messages = encoded.iter().filter(|d| !d.data_body.is_empty()).count();
+        assert!(record_messages > 1, "state above the target must be split");
+        for data in &encoded {
+            let size = crate::budget::flight_data_size(data);
+            assert!(
+                size + 1024 <= grpc_limit,
+                "message {size} bytes exceeds gRPC limit {grpc_limit}"
+            );
+        }
+        let total: usize = encoded.iter().map(crate::budget::flight_data_size).sum();
+        let logical = groups * per_group * (value_len + std::mem::size_of::<u128>());
+        assert!(
+            total < logical * 3 / 2,
+            "slices resent shared view buffers: {total} bytes for {logical} logical bytes"
+        );
+        let decoded = decode_all(encoded, schema.clone());
+        assert_eq!(
+            arrow::compute::concat_batches(&schema, &decoded).unwrap(),
+            batch
+        );
+    }
+
+    /// Views nested in structs and maps are compacted per slice without changing values,
+    /// including slices that start at a non-zero child offset.
+    #[test]
+    fn test_split_compacts_views_in_struct_and_map_round_trip() {
+        use arrow::array::{MapBuilder, StringViewBuilder};
+
+        let rows = 2000usize;
+        let names = StringViewArray::from_iter_values(
+            (0..rows).map(|i| format!("struct-value-{i:08}-longer-than-inline")),
+        );
+        let ids = Int32Array::from_iter_values(0..rows as i32);
+        let structs = StructArray::new(
+            Fields::from(vec![
+                Field::new("name", DataType::Utf8View, false),
+                Field::new("id", DataType::Int32, false),
+            ]),
+            vec![Arc::new(names) as ArrayRef, Arc::new(ids)],
+            None,
+        );
+        let mut maps = MapBuilder::new(None, StringViewBuilder::new(), StringViewBuilder::new());
+        for i in 0..rows {
+            for j in 0..(i % 4) {
+                maps.keys()
+                    .append_value(format!("label-key-{j}-longer-than-inline"));
+                maps.values()
+                    .append_value(format!("label-value-{i:08}-{j}-longer-than-inline"));
+            }
+            maps.append(i % 7 != 0).unwrap();
+        }
+        let maps = maps.finish();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", structs.data_type().clone(), false),
+            Field::new("m", maps.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(structs), Arc::new(maps)])
+            .unwrap()
+            .slice(37, rows - 74);
+        let target = batch_payload_estimate(&batch, ViewBytes::Referenced) / 5;
+
+        let slices = split_batch_for_grpc_response(batch.clone(), target).unwrap();
+        assert!(slices.len() >= 5);
+        for slice in &slices {
+            assert!(
+                slice.num_rows() == 1
+                    || batch_payload_estimate(slice, ViewBytes::Buffers) <= target
+            );
+        }
+        let encoded = encode_all(&IpcWriteOptions::default(), target, vec![batch.clone()]);
+        let decoded = decode_all(encoded, schema.clone());
+        assert_eq!(
+            arrow::compute::concat_batches(&schema, &decoded).unwrap(),
+            batch
+        );
     }
 }

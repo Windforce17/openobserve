@@ -281,22 +281,27 @@ impl FlightService for FlightServiceImpl {
             })
             .collect();
 
-        let mut stream = FlightEncoderStreamBuilder::new(write_options, 33554432)
-            .with_trace_id(trace_id.to_string())
-            .with_is_super(is_super_cluster)
-            .with_defer_lock(lock)
-            .with_start(start)
-            .with_custom_message(PreCustomMessage::ScanStats(scan_stats))
-            .with_custom_message(PreCustomMessage::ScanStatsRef(scan_stats_ref))
-            .with_custom_message(PreCustomMessage::Metrics(metrics))
-            .with_custom_message(PreCustomMessage::MetricsRef(metrics_ref))
-            .with_custom_message(PreCustomMessage::PeakMemoryRef(Some(peak_memory)))
-            .with_custom_message(PreCustomMessage::PeakMemoryRef(peak_memory_ref))
-            .with_custom_message(PreCustomMessage::PartialErrRefEarly(
-                partial_err_ref.clone(),
-            ))
-            .with_custom_message(PreCustomMessage::PartialErrRef(partial_err_ref))
-            .build(streams, span);
+        let mut stream = FlightEncoderStreamBuilder::new(
+            write_options,
+            flight::encoder::flight_data_target_for_grpc_limit(
+                cfg.grpc.max_message_size * 1024 * 1024,
+            ),
+        )
+        .with_trace_id(trace_id.to_string())
+        .with_is_super(is_super_cluster)
+        .with_defer_lock(lock)
+        .with_start(start)
+        .with_custom_message(PreCustomMessage::ScanStats(scan_stats))
+        .with_custom_message(PreCustomMessage::ScanStatsRef(scan_stats_ref))
+        .with_custom_message(PreCustomMessage::Metrics(metrics))
+        .with_custom_message(PreCustomMessage::MetricsRef(metrics_ref))
+        .with_custom_message(PreCustomMessage::PeakMemoryRef(Some(peak_memory)))
+        .with_custom_message(PreCustomMessage::PeakMemoryRef(peak_memory_ref))
+        .with_custom_message(PreCustomMessage::PartialErrRefEarly(
+            partial_err_ref.clone(),
+        ))
+        .with_custom_message(PreCustomMessage::PartialErrRef(partial_err_ref))
+        .build(streams, span);
 
         let stream = async_stream::stream! {
             let _admission = admission;
