@@ -330,6 +330,15 @@ const QUERIES: &[(&str, &str)] = &[
         "exists_subquery",
         "SELECT service_name FROM \"default\" a WHERE EXISTS (SELECT 1 FROM \"apisix\" b WHERE b.user_id = a.trace_id) LIMIT 10",
     ),
+    // apache/datafusion#27219 shapes: MATERIALIZED CTE under ORDER BY ... LIMIT
+    (
+        "cte_materialized_top",
+        "WITH c AS MATERIALIZED (SELECT service_name, count(*) AS n FROM \"default\" GROUP BY service_name) SELECT service_name, n FROM c WHERE n > 1 ORDER BY service_name LIMIT 10",
+    ),
+    (
+        "cte_materialized_shared",
+        "WITH c AS MATERIALIZED (SELECT service_name FROM \"default\" GROUP BY service_name) SELECT c.service_name, m.n FROM c CROSS JOIN (SELECT count(*) AS n FROM c) m ORDER BY c.service_name LIMIT 10",
+    ),
 ];
 
 async fn init_streams() {
@@ -487,6 +496,11 @@ async fn leader_plans_pass_the_final_plan_check() {
                             assert!(
                                 count_remote_scans(&plan) > 0,
                                 "{case}: leader plan has no RemoteScanExec:\n{shown}"
+                            );
+                            // DataFusion 54 never materialized CTEs (apache/datafusion#27219)
+                            assert!(
+                                !shown.contains("MaterializedCte"),
+                                "{case}: leader plan materializes a CTE:\n{shown}"
                             );
                             if shown.contains(SHARED_PERCENTILES_NAME) {
                                 fused_percentile_plans += 1;

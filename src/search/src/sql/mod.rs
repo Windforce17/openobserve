@@ -41,8 +41,8 @@ use sqlparser::{ast::VisitMut, dialect::PostgreSqlDialect, parser::Parser};
 use crate::sql::{
     rewriter::{
         add_o2_id::AddO2IdVisitor, add_timestamp::AddTimestampVisitor,
-        dotted_fields::rewrite_dotted_fields, match_all_raw::MatchAllRawVisitor,
-        remove_dashboard_placeholder::RemoveDashboardAllVisitor,
+        cte_materialized::InlineMaterializedCteVisitor, dotted_fields::rewrite_dotted_fields,
+        match_all_raw::MatchAllRawVisitor, remove_dashboard_placeholder::RemoveDashboardAllVisitor,
         track_total_hits::TrackTotalHitsVisitor,
     },
     schema::{generate_schema_fields, generate_select_star_schema, has_original_column},
@@ -633,6 +633,9 @@ impl Sql {
         let mut limit = query.size as i64;
 
         //********************Change the sql start*********************************//
+        // 1. plan every CTE inline like DataFusion 54 (apache/datafusion#27219)
+        let _ = statement.visit(&mut InlineMaterializedCteVisitor);
+
         // 2. rewrite track_total_hits
         if query.track_total_hits {
             let mut trace_total_hits_visitor = TrackTotalHitsVisitor::new();
