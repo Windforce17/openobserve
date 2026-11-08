@@ -5885,20 +5885,27 @@ impl VixReader {
         builder: &mut BooleanBufferBuilder,
     ) -> Result<()> {
         let mut decoded = 0usize;
-        postings::decode_each(blob, doc_count as usize, |doc| {
-            if decoded % 4096 == 0 {
-                check_read_cancelled()?;
-            }
-            decoded += 1;
-            if u64::from(doc) >= self.row_count {
-                return Err(VixError::Malformed(format!(
-                    "postings doc id {doc} out of range (row_count {})",
-                    self.row_count
-                )));
-            }
-            builder.set_bit(doc as usize, true);
-            Ok(())
-        })
+        // Keep the per-id bitmap update in the decode loop even when dependency
+        // changes alter LLVM's inlining heuristics. Error/cancel paths stay intact.
+        postings::decode_each(
+            blob,
+            doc_count as usize,
+            #[inline(always)]
+            |doc| {
+                if decoded % 4096 == 0 {
+                    check_read_cancelled()?;
+                }
+                decoded += 1;
+                if u64::from(doc) >= self.row_count {
+                    return Err(VixError::Malformed(format!(
+                        "postings doc id {doc} out of range (row_count {})",
+                        self.row_count
+                    )));
+                }
+                builder.set_bit(doc as usize, true);
+                Ok(())
+            },
+        )
     }
 
     /// Fetch plist-blob byte windows in one batched round trip (records,
@@ -6924,20 +6931,25 @@ impl VixReader {
                     cell
                 };
                 let mut decoded = 0usize;
-                postings::decode_each(blob, doc_count as usize, |doc| {
-                    if decoded % 4096 == 0 {
-                        check_read_cancelled()?;
-                    }
-                    decoded += 1;
-                    if u64::from(doc) >= self.row_count {
-                        return Err(VixError::Malformed(format!(
-                            "postings doc id {doc} out of range (row_count {})",
-                            self.row_count
-                        )));
-                    }
-                    builder.set_bit(doc as usize, true);
-                    Ok(())
-                })?;
+                postings::decode_each(
+                    blob,
+                    doc_count as usize,
+                    #[inline(always)]
+                    |doc| {
+                        if decoded % 4096 == 0 {
+                            check_read_cancelled()?;
+                        }
+                        decoded += 1;
+                        if u64::from(doc) >= self.row_count {
+                            return Err(VixError::Malformed(format!(
+                                "postings doc id {doc} out of range (row_count {})",
+                                self.row_count
+                            )));
+                        }
+                        builder.set_bit(doc as usize, true);
+                        Ok(())
+                    },
+                )?;
             }
         }
         if saw_dense {
@@ -7098,7 +7110,10 @@ pub(crate) fn schema_memory_size(schema: &SchemaRef) -> usize {
             .iter()
             .map(|field| field.size() + 2 * std::mem::size_of::<usize>())
             .sum::<usize>()
-        + hash_table_bytes::<(String, String)>(schema.metadata().capacity())
+        + // Arrow 60 metadata is an Arc<BTreeMap>, not a HashMap. Charge a
+        // full leaf plus child pointers per live entry, including a sparse root.
+        schema.metadata().len() * (11 * std::mem::size_of::<(String, String)>()
+            + 14 * std::mem::size_of::<usize>())
         + schema
             .metadata()
             .iter()
@@ -7993,11 +8008,20 @@ mod tests {
         let file = crate::container::open_blob(&runtime, &session, terms).unwrap();
         let footer = file.footer();
         let root = footer.layout();
-        let postings_index = root
-            .child_names()
-            .position(|name| name.as_ref() == "postings")
+        // child_names() omits absent children, while slot() uses logical
+        // slots (struct slot 0 is reserved for validity even when absent).
+        let postings_index = (0..root.nslots())
+            .find(|&slot| {
+                root.slot_type(slot)
+                    .is_some_and(|ty| ty.name().as_ref() == "postings")
+            })
             .unwrap();
-        let mut stack = vec![root.child(postings_index).unwrap()];
+        let postings_layout = root.slot(postings_index).unwrap().unwrap();
+        assert!(matches!(
+            postings_layout.dtype(),
+            vortex::dtype::DType::Binary(_)
+        ));
+        let mut stack = vec![postings_layout];
         let mut postings_ranges = Vec::new();
         while let Some(layout) = stack.pop() {
             for id in layout.segment_ids() {
@@ -8006,6 +8030,13 @@ mod tests {
             }
             stack.extend(layout.children().unwrap());
         }
+        eprintln!(
+            "postings_ranges={postings_ranges:?}; total_bytes={}",
+            postings_ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>()
+        );
         assert!(
             postings_ranges
                 .iter()
@@ -8067,6 +8098,7 @@ mod tests {
             ROWS as u64
         );
         let reads = source.reads.lock();
+        eprintln!("metadata_count_reads={reads:?}");
         for read in reads.iter() {
             assert!(
                 postings_ranges

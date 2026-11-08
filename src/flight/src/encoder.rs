@@ -25,7 +25,7 @@ use arrow::{
     datatypes::{DataType, FieldRef},
     ipc::{
         MessageHeader,
-        writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
+        writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions},
     },
 };
 use arrow_flight::{FlightData, error::Result};
@@ -53,7 +53,7 @@ pub struct FlightDataEncoder {
     max_flight_data_size: usize,
     /// Reused across chunks; lazily initialised, so a custom-message-only encoder never allocates
     /// it.
-    compression_context: CompressionContext,
+    compression_context: IpcWriteContext,
     /// Whether the chunk schema contains any Dictionary column
     schema_has_dict: Option<bool>,
 }
@@ -63,7 +63,7 @@ impl FlightDataEncoder {
         Self {
             options,
             max_flight_data_size,
-            compression_context: CompressionContext::default(),
+            compression_context: IpcWriteContext::default(),
             schema_has_dict: None,
         }
     }
@@ -1010,13 +1010,20 @@ mod tests {
     }
 
     fn assert_large_splits_slice_does_not(batch: RecordBatch, n_slice: usize) {
+        // Arrow 60 `get_slice_memory_size` charges every slice of a view array with the full
+        // capacity of all variadic data buffers, so view columns are measured by the bytes the
+        // slice actually references.
         let measure = |b: &RecordBatch| -> usize {
             b.columns()
                 .iter()
-                .map(|col| {
-                    col.to_data()
+                .map(|col| match col.data_type() {
+                    DataType::Utf8View | DataType::BinaryView => {
+                        payload_estimate(col.as_ref(), ViewBytes::Referenced)
+                    }
+                    _ => col
+                        .to_data()
                         .get_slice_memory_size()
-                        .unwrap_or_else(|_| col.get_buffer_memory_size())
+                        .unwrap_or_else(|_| col.get_buffer_memory_size()),
                 })
                 .sum()
         };

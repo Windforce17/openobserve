@@ -887,6 +887,7 @@ mod tests {
             status: NodeStatus::Online,
             metrics: Default::default(),
             version: String::new(),
+            query_engine_generation: None,
         }
     }
 

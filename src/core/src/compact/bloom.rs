@@ -2587,23 +2587,56 @@ fn vix_error_is_deterministic(error: &anyhow::Error) -> bool {
 }
 
 fn vortex_schema_error_is_deterministic(error: &vortex::error::VortexError) -> bool {
+    use std::error::Error;
+
     use vortex::error::VortexError;
 
-    match error {
-        VortexError::Context(_, inner) => vortex_schema_error_is_deterministic(inner),
-        VortexError::Shared(inner) => vortex_schema_error_is_deterministic(inner),
-        // The ranged-read bridge uses `vortex_err!("fetch ...")`, which is
-        // `Other`; keep those retryable while classifying parser-produced
-        // `Other` errors from immutable footer bytes as poison.
-        VortexError::Other(message, _) => !message.to_string().starts_with("fetch "),
-        VortexError::External(..)
-        | VortexError::Io(..)
-        | VortexError::ObjectStore(..)
-        | VortexError::Join(..) => false,
-        // Dtype/footer parse, bounds, serde, Arrow and FlatBuffer errors are
-        // pure functions of the immutable bytes already fetched.
-        _ => true,
+    let mut first_foreign: Option<&(dyn Error + 'static)> = None;
+    let mut current: Option<&(dyn Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        // Preserve retryability even when an external wrapper hides the IO,
+        // object-store or task error several levels down the source chain.
+        if source.is::<std::io::Error>()
+            || source.is::<object_store::Error>()
+            || source.is::<tokio::task::JoinError>()
+        {
+            return false;
+        }
+        if source.is::<VortexError>() {
+            // with_context flattens messages, while cloned contexts share
+            // sources. The ranged-read bridge reports failures as "fetch ...".
+            if source
+                .to_string()
+                .lines()
+                .any(|line| line.trim_start().starts_with("fetch "))
+            {
+                return false;
+            }
+        } else if first_foreign.is_none() {
+            first_foreign = Some(source);
+        }
+        current = source.source();
     }
+    // Same split as vortex 0.79: message-only errors (its Other, OutOfBounds,
+    // Compute, Serde, ... variants) and its dedicated parser variants are pure
+    // functions of the immutable bytes; opaque `External` sources stay
+    // retryable so a transient failure never permanently disables the Bloom.
+    first_foreign.is_none_or(is_immutable_bytes_parse_error)
+}
+
+/// Error types vortex 0.79 represented with dedicated deterministic variants
+/// (Arrow, FlatBuffers, Fmt, Jiff, TryFromInt, Prost) plus serde decoding;
+/// vortex now wraps all of them as external sources.
+fn is_immutable_bytes_parse_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error.is::<arrow_schema::ArrowError>()
+        || error.is::<flatbuffers::InvalidFlatbuffer>()
+        || error.is::<std::fmt::Error>()
+        || error.is::<jiff::Error>()
+        || error.is::<std::num::TryFromIntError>()
+        || error.is::<prost::EncodeError>()
+        || error.is::<prost::DecodeError>()
+        || error.is::<prost::UnknownEnumValue>()
+        || error.is::<serde_json::Error>()
 }
 
 fn complete_raw_string_term_pairs(
@@ -4305,5 +4338,74 @@ mod tests {
         assert_eq!(blooms.len(), 1);
         assert_eq!(blooms[0].field, vortex_index::bloom::COMPOSITE_BLOOM_FIELD);
         assert!(composite_covers_field(&blooms[0], "trace_id"));
+    }
+}
+
+#[cfg(test)]
+mod vortex_error_classification_tests {
+    use vortex::error::VortexError;
+
+    use super::vortex_schema_error_is_deterministic;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("wrapped dependency error")]
+    struct Wrapped(#[source] std::io::Error);
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("unknown immutable parser failure")]
+    struct Unknown;
+
+    #[test]
+    fn parser_and_message_errors_stop_optional_bloom_rebuild() {
+        let errors = [
+            VortexError::new("invalid footer"),
+            VortexError::from(arrow_schema::ArrowError::ParseError("bad dtype".into())),
+            VortexError::from(flatbuffers::InvalidFlatbuffer::DepthLimitReached),
+            VortexError::from("not-a-date".parse::<jiff::civil::Date>().unwrap_err()),
+            VortexError::external(serde_json::from_str::<serde_json::Value>("{").unwrap_err()),
+            VortexError::from(<() as prost::Message>::decode(&[0x80u8][..]).unwrap_err()),
+            VortexError::from(prost::UnknownEnumValue(123)),
+            VortexError::from(u8::try_from(256).unwrap_err()),
+            VortexError::external(std::fmt::Error),
+        ];
+        for error in errors {
+            assert!(vortex_schema_error_is_deterministic(&error), "{error}");
+            let clone = error.clone();
+            assert!(vortex_schema_error_is_deterministic(
+                &error.with_context("docs schema")
+            ));
+            assert!(vortex_schema_error_is_deterministic(
+                &VortexError::external(clone)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_cancel_fetch_and_unknown_external_errors_remain_retryable() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let errors = [
+            // vortex 0.79 kept opaque `External` sources retryable.
+            VortexError::external(Unknown),
+            VortexError::from(std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout")),
+            VortexError::from(object_store::Error::Generic {
+                store: "test",
+                source: Box::new(std::io::Error::other("unavailable")),
+            }),
+            VortexError::from(task.await.unwrap_err()),
+            VortexError::external(Wrapped(std::io::Error::other("wrapped fetch"))),
+            VortexError::new("fetch object range failed"),
+            VortexError::new("fetch object range failed").with_context("read footer"),
+        ];
+        for error in errors {
+            assert!(!vortex_schema_error_is_deterministic(&error), "{error}");
+            let clone = error.clone();
+            assert!(!vortex_schema_error_is_deterministic(
+                &error.with_context("docs schema")
+            ));
+            assert!(!vortex_schema_error_is_deterministic(
+                &VortexError::external(clone)
+            ));
+        }
     }
 }

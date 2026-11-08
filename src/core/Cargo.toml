@@ -60,10 +60,12 @@ rapidhash.workspace = true
 object_store.workspace = true
 vortex = { workspace = true }
 flate2.workspace = true
+flatbuffers = "25.2.10"
 futures.workspace = true
 hashlink.workspace = true
 hashbrown.workspace = true
 itertools.workspace = true
+jiff = "0.2"
 jsonwebtoken.workspace = true
 log.workspace = true
 maxminddb.workspace = true

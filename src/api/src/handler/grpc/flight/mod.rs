@@ -97,12 +97,24 @@ impl FlightService for FlightServiceImpl {
             .and_then(parse_grpc_timeout);
 
         // decode ticket to RemoteExecNode
-        let ticket = request.into_inner();
+        let (metadata, _, ticket) = request.into_parts();
         let mut buf = Cursor::new(ticket.ticket);
         let req = proto::cluster_rpc::FlightSearchRequest::decode(&mut buf)
             .map_err(|e| DataFusionError::Internal(format!("{e:?}")))
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        // Decode only the envelope for tracing; never decode a foreign physical plan.
+        let request_trace_id = req
+            .query_identifier
+            .as_ref()
+            .map(|q| q.trace_id.as_str())
+            .unwrap_or("unknown");
+        flight::engine::validate_generation(
+            &metadata,
+            "request",
+            &LOCAL_NODE.name,
+            request_trace_id,
+        )?;
         let req: FlightSearchRequest = req.into();
         let trace_id = format!(
             "{}-{}",
@@ -324,7 +336,9 @@ impl FlightService for FlightServiceImpl {
             }
         };
 
-        Ok(Response::new(Box::pin(stream) as Self::DoGetStream))
+        let mut response = Response::new(Box::pin(stream) as Self::DoGetStream);
+        flight::engine::set_generation(response.metadata_mut());
+        Ok(response)
     }
 
     async fn handshake(
@@ -692,6 +706,35 @@ mod tests {
     #[test]
     fn test_flight_service_impl_default() {
         let _impl = FlightServiceImpl;
+    }
+
+    #[tokio::test]
+    async fn engine_generation_handler_rejects_before_plan_decode() {
+        for generation in [None, Some("df54-arrow58")] {
+            let envelope = proto::cluster_rpc::FlightSearchRequest {
+                query_identifier: Some(proto::cluster_rpc::QueryIdentifier {
+                    trace_id: "engine-gate-handler".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            // Missing plan/context would fail later; handshake must win first.
+            let mut request = Request::new(Ticket {
+                ticket: envelope.encode_to_vec().into(),
+            });
+            if let Some(generation) = generation {
+                request.metadata_mut().insert(
+                    flight::engine::GENERATION_HEADER,
+                    generation.parse().unwrap(),
+                );
+            }
+            let Err(status) = FlightServiceImpl.do_get(request).await else {
+                panic!("foreign engine must not execute");
+            };
+            assert!(flight::engine::is_generation_error(&status));
+            assert!(status.message().contains("engine-gate-handler"));
+            assert!(status.message().contains(&LOCAL_NODE.name));
+        }
     }
 
     #[test]

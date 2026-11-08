@@ -853,7 +853,7 @@ async fn metadata_index_scan_and_segment_partials_own_each_file_once() {
     let query = Arc::new(crate::types::QueryParams {
         trace_id: "dispatch-ownership".to_owned(),
         org_id: "org".to_owned(),
-        stream: datafusion::sql::TableReference::from("t"),
+        stream: datafusion::common::TableReference::from("t"),
         stream_type: StreamType::Logs,
         stream_name: "t".to_owned(),
         time_range: query_range,
@@ -1114,7 +1114,7 @@ async fn sparse_gib_sidecar_count_and_topn_keep_exact_optimized_dispatch() {
         let query = Arc::new(crate::types::QueryParams {
             trace_id: "sparse-vix-search".to_owned(),
             org_id: "org".to_owned(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_owned(),
             time_range: (990, 1_020),
@@ -1190,7 +1190,7 @@ async fn unfiltered_straddling_count_never_opens_the_sidecar() {
     let query = Arc::new(crate::types::QueryParams {
         trace_id: "data-only-count-search".to_owned(),
         org_id: "org".to_owned(),
-        stream: datafusion::sql::TableReference::from("t"),
+        stream: datafusion::common::TableReference::from("t"),
         stream_type: StreamType::Logs,
         stream_name: "t".to_owned(),
         time_range: (1_004, 1_020),
@@ -1594,7 +1594,7 @@ async fn multiword_full_text_aggregates_are_refined_to_the_exact_residual_rows()
         Arc::new(crate::types::QueryParams {
             trace_id: "multiword-scope-dispatch".into(),
             org_id: "org".into(),
-            stream: datafusion::sql::TableReference::from("fts-scope"),
+            stream: datafusion::common::TableReference::from("fts-scope"),
             stream_type: StreamType::Logs,
             stream_name: "fts-scope".into(),
             time_range: (90, 110),
@@ -1731,7 +1731,7 @@ async fn superset_select_prunes_files_the_window_has_not_answered() {
     let params = Arc::new(crate::types::QueryParams {
         trace_id: "superset-select-prune".into(),
         org_id: "org".into(),
-        stream: datafusion::sql::TableReference::from("fts-select-prune"),
+        stream: datafusion::common::TableReference::from("fts-select-prune"),
         stream_type: StreamType::Logs,
         stream_name: "fts-select-prune".into(),
         time_range: (0, FILES * 1_000 + 1_000),

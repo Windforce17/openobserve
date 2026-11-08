@@ -42,6 +42,7 @@ use crate::{
 
 pub struct ListingTableAdapter {
     listing_table: ListingTable,
+    scan_options: Option<(usize, bool)>,
     file_schema: SchemaRef,
     expr_adapter: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     trace_id: String,
@@ -78,6 +79,7 @@ impl ListingTableAdapter {
         let listing_table = ListingTable::try_new(config)?;
         Ok(Self {
             listing_table,
+            scan_options: None,
             file_schema,
             expr_adapter,
             trace_id,
@@ -87,7 +89,12 @@ impl ListingTableAdapter {
         })
     }
 
-    pub fn with_cache(mut self, cache: Option<Arc<dyn FileStatisticsCache>>) -> Self {
+    pub fn with_scan_options(mut self, partitions: usize, collect: bool) -> Self {
+        self.scan_options = Some((partitions, collect));
+        self
+    }
+
+    pub fn with_cache(mut self, cache: Option<Arc<FileStatisticsCache>>) -> Self {
         self.listing_table = self.listing_table.with_cache(cache);
         self
     }
@@ -106,10 +113,16 @@ impl TableProvider for ListingTableAdapter {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let configured_session = self.scan_options.map(|(partitions, collect)| {
+            super::scan_session::ScanSession::new(state, partitions, collect)
+        });
+        let state = configured_session
+            .as_ref()
+            .map_or(state, |session| session as &dyn Session);
         // if the index condition can remove filter, we can skip the config
         // feature_query_remove_filter_with_index
         let can_remove_filter = self
@@ -173,7 +186,7 @@ impl TableProvider for ListingTableAdapter {
                 fallback_groups.push(FileGroup::new(fallback));
             }
         }
-        let target = self.listing_table.options().target_partitions.max(1);
+        let target = state.config().target_partitions().max(1);
         let (exact_target, fallback_target) =
             allocate_branch_partitions(exact_files, fallback_files, target);
         // Access/residual/time filters run below the outer SQL limit. Passing
@@ -262,7 +275,7 @@ impl ListingTableAdapter {
     async fn scan_branch(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         limit: Option<usize>,
         index_condition: Option<&IndexCondition>,
         file_groups: Vec<FileGroup>,
@@ -285,7 +298,7 @@ impl ListingTableAdapter {
                 }
 
                 // add requested projection columns
-                if let Some(v) = projection.as_ref() {
+                if let Some(v) = projection {
                     filter_projection.extend(v.iter().copied());
                 } else {
                     filter_projection.extend(0..self.schema().fields().len());
@@ -294,17 +307,17 @@ impl ListingTableAdapter {
                 filter_projection.dedup();
 
                 // regenerate the projection with the filter_projection
-                let projection = projection.as_ref().map(|p| {
+                let projection = projection.map(|p| {
                     p.iter()
                         .filter_map(|i| filter_projection.iter().position(|f| f == i))
                         .collect::<Vec<_>>()
                 });
                 (Some(filter_projection), projection)
             } else {
-                (projection.cloned(), None)
+                (projection.map(<[usize]>::to_vec), None)
             };
-        let parquet_projection = parquet_projection.as_ref();
-        let filter_projection = filter_projection.as_ref();
+        let parquet_projection = parquet_projection.as_deref();
+        let filter_projection = filter_projection.as_deref();
 
         if let Some(projection) = parquet_projection {
             let schema = self.schema();
@@ -319,21 +332,33 @@ impl ListingTableAdapter {
             );
         }
         let options = self.listing_table.options();
-        let mut file_groups = if grouped_by_partition {
-            file_groups
-        } else {
+        let (mut file_groups, partition_split_points) = if grouped_by_partition {
+            // Branch filtering can remove complete groups. Recompute boundaries
+            // before deriving ordering, never regroup an already sorted scan.
             FileGroup::new(
                 file_groups
                     .into_iter()
-                    .flat_map(|g| g.into_inner())
+                    .flat_map(FileGroup::into_inner)
                     .collect(),
             )
-            .split_files(target_partitions)
+            .group_by_partition_values_with_split_points(target_partitions)
+        } else {
+            (
+                FileGroup::new(
+                    file_groups
+                        .into_iter()
+                        .flat_map(|g| g.into_inner())
+                        .collect(),
+                )
+                .split_files(target_partitions),
+                Vec::new(),
+            )
         };
         let output_ordering = self
             .listing_table
             .try_create_output_ordering(state.execution_props(), &file_groups)?;
         let declared_order = !options.file_sort_order.is_empty();
+        let mut regrouped_by_statistics = false;
         if (declared_order
             || state
                 .config_options()
@@ -347,7 +372,10 @@ impl ListingTableAdapter {
                 ordering,
                 target_partitions,
             ) {
-                Ok(groups) => file_groups = groups,
+                Ok(groups) => {
+                    file_groups = groups;
+                    regrouped_by_statistics = true;
+                }
                 Err(error) if declared_order => {
                     log::warn!(
                         "[trace_id {}] failed to split file groups by statistics: {error}; reversing file groups",
@@ -365,8 +393,12 @@ impl ListingTableAdapter {
                 Err(error) => log::debug!("failed to split file groups by statistics: {error}"),
             }
         }
-        let (file_groups, statistics) =
-            compute_all_files_statistics(file_groups, self.schema(), options.collect_stat, false)?;
+        let (file_groups, statistics) = compute_all_files_statistics(
+            file_groups,
+            self.schema(),
+            state.config_options().execution.collect_statistics,
+            false,
+        )?;
         let table_partition_cols = options
             .table_partition_cols
             .iter()
@@ -376,10 +408,11 @@ impl ListingTableAdapter {
                     .map(|f| Arc::new(f.clone()))
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let file_source = options.format.file_source(TableSchema::new(
-            Arc::clone(&self.file_schema),
-            table_partition_cols,
-        ));
+        let file_source = options.format.file_source(
+            TableSchema::builder(Arc::clone(&self.file_schema))
+                .with_table_partition_cols(table_partition_cols)
+                .build(),
+        );
         let object_store_url = self
             .listing_table
             .table_paths()
@@ -388,6 +421,17 @@ impl ListingTableAdapter {
                 DataFusionError::Internal("listed files have no object store".to_string())
             })?
             .object_store();
+        // Statistics-based ordering may redistribute identical partition values.
+        // Match ListingTable: only declare Range while its boundaries still hold.
+        let output_partitioning = if grouped_by_partition && !regrouped_by_statistics {
+            datafusion_datasource::file_scan_config::output_range_partitioning_from_split_points(
+                file_source.table_schema().table_schema(),
+                file_source.table_schema().table_partition_cols(),
+                partition_split_points,
+            )?
+        } else {
+            None
+        };
         let conf = FileScanConfigBuilder::new(object_store_url, file_source)
             .with_file_groups(file_groups)
             .with_statistics(statistics)
@@ -397,11 +441,11 @@ impl ListingTableAdapter {
                     .cloned()
                     .unwrap_or_default(),
             )
-            .with_projection_indices(parquet_projection.cloned())?
+            .with_projection_indices(parquet_projection.map(<[usize]>::to_vec))?
             .with_limit(limit)
             .with_output_ordering(output_ordering)
             .with_expr_adapter(self.expr_adapter.clone())
-            .with_partitioned_by_file_group(grouped_by_partition)
+            .with_output_partitioning(output_partitioning)
             .build();
         let mut parquet_exec = options.format.create_physical_plan(state, conf).await?;
         if !declared_order
@@ -426,10 +470,7 @@ impl ListingTableAdapter {
 
 /// An empty result with the projected table schema (a branchless scan of an
 /// empty file set).
-fn empty_scan(
-    schema: SchemaRef,
-    projection: Option<&Vec<usize>>,
-) -> Result<Arc<dyn ExecutionPlan>> {
+fn empty_scan(schema: SchemaRef, projection: Option<&[usize]>) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = datafusion::common::project_schema(&schema, projection)?;
     Ok(Arc::new(datafusion::physical_plan::empty::EmptyExec::new(
         schema,

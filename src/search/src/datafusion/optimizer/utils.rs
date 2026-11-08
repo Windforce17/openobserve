@@ -24,7 +24,7 @@ use datafusion::{
         },
     },
     datasource::DefaultTableSource,
-    logical_expr::{Limit, LogicalPlan, Projection, Sort, SortExpr, TableScan, TableSource, col},
+    logical_expr::{Limit, LogicalPlan, Projection, Sort, SortExpr, TableSource, col},
     physical_plan::ExecutionPlan,
     prelude::Expr,
     scalar::ScalarValue,
@@ -72,7 +72,7 @@ impl TreeNodeRewriter for AddSortAndLimit {
             // skip projection,subqueryalias, analyze, that we can add limit/sort after them
             LogicalPlan::Projection(_)
             | LogicalPlan::SubqueryAlias(_)
-            | LogicalPlan::DescribeTable(_)
+            | LogicalPlan::Show(_)
             | LogicalPlan::Analyze(_) => {
                 is_stop = false;
                 (Transformed::no(node), None)
@@ -239,13 +239,13 @@ impl TreeNodeRewriter for ChangeTableScanSchema {
                     p.push(timestamp_idx);
                     p
                 });
-                let mut table_scan = TableScan::try_new(
-                    scan.table_name,
-                    scan.source,
-                    projection,
-                    scan.filters,
-                    scan.fetch,
-                )?;
+                let mut table_scan =
+                    datafusion::logical_expr::TableScanBuilder::new(scan.table_name, scan.source)
+                        .with_projection(projection)
+                        .with_filters(scan.filters)
+                        .with_fetch(scan.fetch)
+                        .with_skip(scan.skip)
+                        .build()?;
                 // add sorted by time to the table source
                 let source = generate_table_source_with_sorted_by_time(table_scan.source);
                 table_scan.source = source;

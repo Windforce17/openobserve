@@ -155,6 +155,41 @@ impl ByteDistinctGroups {
 }
 
 impl GroupsAccumulator for ByteDistinctGroups {
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        let [values] = values else {
+            return exec_err!("COUNT DISTINCT requires one input array");
+        };
+        if filter.is_some_and(|f| f.len() != values.len()) {
+            return exec_err!("COUNT DISTINCT filter/value lengths do not match");
+        }
+        let len = i32::try_from(values.len()).map_err(|_| {
+            datafusion::error::DataFusionError::Execution(
+                "COUNT DISTINCT singleton state exceeds i32 offsets".to_string(),
+            )
+        })?;
+        let offsets = OffsetBuffer::new((0..=len).collect::<Vec<_>>().into());
+        // Count's state field is a non-nullable List. A rejected raw row is
+        // represented by a null child (COUNT ignores it), not a null List.
+        let values = if let Some(filter) = filter {
+            let rejected: BooleanArray = (0..filter.len())
+                .map(|i| Some(filter.is_null(i) || !filter.value(i)))
+                .collect();
+            arrow::compute::nullif(values.as_ref(), &rejected)?
+        } else {
+            Arc::clone(values)
+        };
+        Ok(vec![Arc::new(ListArray::try_new(
+            Arc::new(Field::new_list_field(self.data_type.clone(), true)),
+            offsets,
+            values,
+            None,
+        )?)])
+    }
+
     fn update_batch(
         &mut self,
         values: &[ArrayRef],
@@ -171,13 +206,7 @@ impl GroupsAccumulator for ByteDistinctGroups {
         }
         Ok(())
     }
-    fn merge_batch(
-        &mut self,
-        values: &[ArrayRef],
-        groups: &[usize],
-        _filter: Option<&BooleanArray>,
-        total: usize,
-    ) -> Result<()> {
+    fn merge_batch(&mut self, values: &[ArrayRef], groups: &[usize], total: usize) -> Result<()> {
         self.counts.resize(total, 0);
         let lists = values[0].as_list::<i32>();
         let offsets = lists.value_offsets();
@@ -252,7 +281,8 @@ impl GroupsAccumulator for ByteDistinctGroups {
 }
 
 use datafusion::logical_expr::{
-    Documentation, Expr, Operator, ReversedUDAF, SetMonotonicity, Signature, StatisticsArgs,
+    DistinctHandling, Documentation, Expr, Operator, ReversedUDAF, SetMonotonicity, Signature,
+    StatisticsArgs,
     expr::{AggregateFunction, AggregateFunctionParams, WindowFunctionParams},
     function::{AccumulatorArgs, AggregateFunctionSimplification, StateFieldsArgs},
     utils::AggregateOrderSensitivity,
@@ -363,10 +393,6 @@ impl AggregateUDFImpl for SharedCount {
         self.inner.return_field(arg_fields)
     }
 
-    fn is_nullable(&self) -> bool {
-        self.inner.is_nullable()
-    }
-
     fn is_descending(&self) -> Option<bool> {
         self.inner.is_descending()
     }
@@ -393,6 +419,26 @@ impl AggregateUDFImpl for SharedCount {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.inner.documentation()
+    }
+
+    #[expect(deprecated)]
+    fn is_nullable(&self) -> bool {
+        self.inner.is_nullable()
+    }
+
+    /// Answers exactly like the native count: `SingleDistinctToGroupBy` gates its rewrite on
+    /// this, and the byte-distinct groups accumulator must not change that logical decision.
+    fn groups_accumulator_supported_for_types(
+        &self,
+        arg_types: &[DataType],
+        is_distinct: bool,
+    ) -> Option<bool> {
+        self.inner
+            .groups_accumulator_supported_for_types(arg_types, is_distinct)
+    }
+
+    fn distinct_handling(&self) -> DistinctHandling {
+        self.inner.distinct_handling()
     }
 }
 

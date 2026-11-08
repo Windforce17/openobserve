@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 use config::meta::inverted_index::IndexOptimizeMode;
 use datafusion::{
     common::{
-        Result,
+        Result, TableReference,
         tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter, TreeNodeVisitor},
     },
     config::ConfigOptions,
@@ -27,7 +27,6 @@ use datafusion::{
         ExecutionPlan, aggregates::AggregateExec,
         sorts::sort_preserving_merge::SortPreservingMergeExec,
     },
-    sql::TableReference,
 };
 use hashbrown::HashSet;
 use parking_lot::Mutex;
@@ -411,11 +410,11 @@ pub(crate) mod test_harness {
     use arrow_schema::Schema;
     use config::meta::inverted_index::IndexOptimizeMode;
     use datafusion::{
+        common::TableReference,
         execution::{SessionStateBuilder, runtime_env::RuntimeEnvBuilder},
         physical_optimizer::PhysicalOptimizerRule,
         physical_plan::ExecutionPlan,
         prelude::{SessionConfig, SessionContext},
-        sql::TableReference,
     };
     use datafusion_proto::bytes::{
         physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
@@ -521,6 +520,44 @@ mod tests {
         },
         table_provider::empty_table::NewEmptyTable,
     };
+
+    #[tokio::test]
+    async fn test_follower_single_node_topn_and_distinct_df56() {
+        assert!(config::cluster::LOCAL_NODE.is_single_node());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(12));
+        ctx.register_table(
+            "t",
+            Arc::new(NewEmptyTable::new("t", schema).with_partitions(12)),
+        )
+        .unwrap();
+        let cases = [
+            (
+                "SELECT name, count(*) AS cnt FROM t GROUP BY name ORDER BY cnt DESC LIMIT 10",
+                IndexOptimizeMode::SimpleTopN(vec!["name".to_string()], 10, false),
+            ),
+            (
+                "SELECT DISTINCT name FROM t ORDER BY name DESC LIMIT 10",
+                IndexOptimizeMode::SimpleDistinct("name".to_string(), 10, false),
+            ),
+        ];
+        for (sql, expected) in cases {
+            let logical = ctx.state().create_logical_plan(sql).await.unwrap();
+            let plan = ctx.state().create_physical_plan(&logical).await.unwrap();
+            let mode = Arc::new(Mutex::new(None));
+            let rule = FollowerIndexOptimizerRule::new(
+                (0, 0),
+                HashSet::from(["name".to_string()]),
+                HashSet::new(),
+                mode.clone(),
+            );
+            rule.optimize(plan, ctx.state().config_options()).unwrap();
+            assert_eq!(*mode.lock(), Some(expected), "{sql}");
+        }
+    }
 
     #[test]
     fn test_table_name_visitor_extracts_table_name_from_new_empty_exec() {

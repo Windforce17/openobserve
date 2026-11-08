@@ -70,6 +70,42 @@ fn check_equal(a: ArrayRef, b: ArrayRef) {
 }
 
 #[test]
+fn shared_count_convert_to_state_matches_update_and_upstream_merge() -> Result<()> {
+    for dt in types() {
+        let input = values(&dt, 0);
+        let groups: Vec<_> = (0..input.len()).map(|row| row % 17).collect();
+        let filter = BooleanArray::from_iter((0..input.len()).map(|row| {
+            if row % 11 == 0 {
+                None
+            } else {
+                Some(row % 3 != 0)
+            }
+        }));
+        for filter in [None, Some(&filter)] {
+            let source = ByteDistinctGroups::new(dt.clone());
+            let original_size = source.size();
+            let state = source.convert_to_state(&[Arc::clone(&input)], filter)?;
+            assert_eq!(state[0].len(), input.len());
+            assert_eq!(
+                source.size(),
+                original_size,
+                "conversion must not mutate the accumulator"
+            );
+            let mut updated = ByteDistinctGroups::new(dt.clone());
+            updated.update_batch(&[Arc::clone(&input)], &groups, filter, 19)?;
+            let expected = updated.evaluate(EmitTo::All)?;
+            let mut merged = ByteDistinctGroups::new(dt.clone());
+            merged.merge_batch(&state, &groups, 19)?;
+            check_equal(Arc::clone(&expected), merged.evaluate(EmitTo::All)?);
+            let mut upstream = old(&dt);
+            upstream.merge_batch(&state, &groups, 19)?;
+            check_equal(expected, upstream.evaluate(EmitTo::All)?);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn shared_count_random_cross_implementation_and_emit_first() -> Result<()> {
     for dt in types() {
         let mut baseline = old(&dt);
@@ -101,13 +137,13 @@ fn shared_count_random_cross_implementation_and_emit_first() -> Result<()> {
             let mut all_old = old(&dt);
             for _ in 0..3 {
                 // Repeated state merges must remain idempotent.
-                old_from_new.merge_batch(&new_state, &ids, None, n)?;
-                new_from_old.merge_batch(&old_state, &ids, None, n)?;
-                all_old.merge_batch(&old_state, &ids, None, n)?;
+                old_from_new.merge_batch(&new_state, &ids, n)?;
+                new_from_old.merge_batch(&old_state, &ids, n)?;
+                all_old.merge_batch(&old_state, &ids, n)?;
             }
             // Exercise another serialization round, not merely evaluation.
             let roundtrip = new_from_old.state(EmitTo::All)?;
-            new_from_old.merge_batch(&roundtrip, &ids, None, n)?;
+            new_from_old.merge_batch(&roundtrip, &ids, n)?;
             let expected = all_old.evaluate(EmitTo::All)?;
             check_equal(expected.clone(), old_from_new.evaluate(EmitTo::All)?);
             check_equal(expected, new_from_old.evaluate(EmitTo::All)?);
@@ -243,6 +279,81 @@ async fn shared_count_sql_differential_and_plain_count_identity() -> Result<()> 
 }
 
 #[tokio::test]
+async fn shared_count_skip_partial_distinct_and_plain_count() -> Result<()> {
+    use datafusion::{
+        datasource::MemTable,
+        execution::context::{SessionConfig, SessionContext},
+        physical_plan::{collect, display::DisplayableExecutionPlan},
+    };
+
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("g", DataType::Int64, false),
+        Field::new("v", DataType::Utf8, true),
+    ]));
+    let batches = (0..8)
+        .map(|batch| {
+            arrow::record_batch::RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values((0..128).map(|row| row % 31))),
+                    Arc::new(StringArray::from_iter((0..128).map(|row| {
+                        (row % 7 != 0).then(|| format!("value-{}", (row + batch) % 43))
+                    }))),
+                ],
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut outputs = Vec::new();
+    for skip in [false, true] {
+        let mut config = SessionConfig::new()
+            .with_target_partitions(2)
+            .with_batch_size(128);
+        config
+            .options_mut()
+            .execution
+            .skip_partial_aggregation_probe_rows_threshold = if skip { 0 } else { usize::MAX };
+        config
+            .options_mut()
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold = 0.0;
+        let ctx = SessionContext::new_with_config(config);
+        ctx.register_udaf(AggregateUDF::from(SharedCount::default()));
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(
+                Arc::clone(&schema),
+                vec![batches.clone(); 2],
+            )?),
+        )?;
+        let plan = ctx.sql("SELECT g, count(*), count(v), count(DISTINCT v), count(DISTINCT v) FILTER (WHERE g > 10) FROM t GROUP BY g ORDER BY g")
+            .await?.create_physical_plan().await?;
+        let result = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        outputs.push(arrow::util::pretty::pretty_format_batches(&result)?.to_string());
+        if skip {
+            let mut skipped = 0;
+            use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+            plan.apply(|node| {
+                if let Some(metrics) = node.metrics() {
+                    for metric in metrics.iter() {
+                        if metric.value().name() == "skipped_aggregation_rows" {
+                            skipped += metric.value().as_usize();
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            assert!(
+                skipped > 0,
+                "skip-partial path not exercised: {}",
+                DisplayableExecutionPlan::with_metrics(plan.as_ref()).indent(true)
+            );
+        }
+    }
+    assert_eq!(outputs[0], outputs[1]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn shared_count_wire_registry_old_new_and_drop() -> Result<()> {
     use datafusion::{
         common::tree_node::{TreeNode, TreeNodeRecursion},
@@ -277,8 +388,11 @@ async fn shared_count_wire_registry_old_new_and_drop() -> Result<()> {
         )?;
     }
     for sender in [&original, &replacement] {
+        // DF56 rewrites mixed count + byte DISTINCT to a two-level GROUP BY.
+        // A FILTER intentionally keeps DISTINCT so this tests registry decoding,
+        // rather than an optimizer-eliminated accumulator (single_distinct_to_groupby).
         let plan = sender
-            .sql("SELECT g, count(*), count(DISTINCT v) FROM t GROUP BY g")
+            .sql("SELECT g, count(*), count(DISTINCT v) FILTER (WHERE g > 0) FROM t GROUP BY g")
             .await?
             .create_physical_plan()
             .await?;
@@ -353,5 +467,58 @@ async fn shared_count_wire_registry_old_new_and_drop() -> Result<()> {
         }
         assert_eq!(pool.reserved(), 0, "cancel={cancel}");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn shared_count_keeps_native_single_distinct_rewrite() -> Result<()> {
+    use datafusion::{datasource::MemTable, execution::context::SessionContext};
+    let native = Count::new();
+    let shared = SharedCount::default();
+    for dt in [
+        DataType::Utf8,
+        DataType::Utf8View,
+        DataType::LargeBinary,
+        DataType::Int64,
+        DataType::Float64,
+    ] {
+        for is_distinct in [false, true] {
+            assert_eq!(
+                shared
+                    .groups_accumulator_supported_for_types(std::slice::from_ref(&dt), is_distinct),
+                native
+                    .groups_accumulator_supported_for_types(std::slice::from_ref(&dt), is_distinct),
+                "{dt} distinct={is_distinct}"
+            );
+        }
+    }
+    assert_eq!(shared.distinct_handling(), native.distinct_handling());
+    let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Utf8, true),
+    ]));
+    let mut plans = Vec::new();
+    for use_shared in [false, true] {
+        let ctx = SessionContext::new();
+        if use_shared {
+            ctx.register_udaf(AggregateUDF::from(SharedCount::default()));
+        }
+        ctx.register_table(
+            "t",
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![]])?),
+        )?;
+        let plan = ctx
+            .sql("SELECT g, count(DISTINCT v) FROM t GROUP BY g")
+            .await?
+            .into_optimized_plan()?;
+        plans.push(plan.display_indent().to_string());
+    }
+    assert_eq!(
+        plans[0].matches("Aggregate:").count(),
+        2,
+        "native count must take the single-distinct rewrite:\n{}",
+        plans[0]
+    );
+    assert_eq!(plans[0], plans[1]);
     Ok(())
 }

@@ -203,7 +203,7 @@ mod tests {
         },
         ipc::{
             CompressionType, MessageHeader,
-            writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions},
+            writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions},
         },
     };
     use arrow_flight::{FlightData, SchemaAsIpc};
@@ -251,7 +251,7 @@ mod tests {
                 batch,
                 &mut dictionary_tracker,
                 options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .unwrap();
         dictionaries

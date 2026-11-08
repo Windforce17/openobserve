@@ -114,6 +114,7 @@ impl ObjectStore for Remote {
                         .inc_by(time);
                 }
                 Ok(PutResult {
+                    extensions: Default::default(),
                     e_tag: None,
                     version: None,
                 })

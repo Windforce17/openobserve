@@ -1352,7 +1352,7 @@ mod tests {
         Schema::empty().with_metadata(
             [(METADATA_LABEL.to_string(), blob.to_string())]
                 .into_iter()
-                .collect(),
+                .collect::<arrow_schema::Metadata>(),
         )
     }
 

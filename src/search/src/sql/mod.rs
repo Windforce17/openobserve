@@ -299,8 +299,16 @@ impl sqlparser::ast::VisitorMut for PaginationVisitor<'_> {
                 safe &= match &order.kind {
                     OrderByKind::Expressions(expressions) => {
                         expressions.first().is_some_and(|first| {
-                            if let Expr::Identifier(ident) = &first.expr {
-                                let direction = if first.options.asc.unwrap_or(true) {
+                            if let Expr::Identifier(ident) = &first.expr
+                                && !matches!(
+                                    first.options.sort,
+                                    Some(sqlparser::ast::OrderBySort::Using(_))
+                                )
+                            {
+                                let direction = if !matches!(
+                                    first.options.sort,
+                                    Some(sqlparser::ast::OrderBySort::Desc)
+                                ) {
                                     OrderBy::Asc
                                 } else {
                                     OrderBy::Desc

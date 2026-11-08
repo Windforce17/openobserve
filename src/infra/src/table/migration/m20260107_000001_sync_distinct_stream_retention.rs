@@ -62,7 +62,8 @@ impl MigrationTrait for Migration {
                             schema::unwrap_stream_settings(&distinct_schema).unwrap_or_default();
                         distinct_settings.data_retention = original_settings.data_retention;
 
-                        let mut metadata = distinct_schema.metadata.clone();
+                        let mut metadata: std::collections::HashMap<String, String> =
+                            distinct_schema.metadata.clone().into();
                         metadata.insert(
                             "settings".to_string(),
                             json::to_string(&distinct_settings).unwrap(),

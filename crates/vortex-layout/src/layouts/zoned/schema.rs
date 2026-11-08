@@ -11,6 +11,11 @@ use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::StructFields;
+use vortex_array::expr::Expression;
+use vortex_array::expr::cast;
+use vortex_array::expr::get_item;
+use vortex_array::expr::pack;
+use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -43,10 +48,20 @@ impl AggregateSpecProto {
         })
     }
 
-    pub(crate) fn to_aggregate_fn(&self, session: &VortexSession) -> VortexResult<AggregateFnRef> {
+    /// Resolve this spec to its aggregate function, returning `Ok(None)` for an unknown aggregate
+    /// ID when the session allows unknown plugins.
+    ///
+    /// A `None` result means the zone map cannot be reconstructed for this aggregate, so callers
+    /// should disable zoned pruning rather than fail the read.
+    fn to_aggregate_fn_opt(&self, session: &VortexSession) -> VortexResult<Option<AggregateFnRef>> {
         #[expect(clippy::disallowed_methods, reason = "interning a dynamic id")]
         let aggregate_fn_id = AggregateFnId::new(self.id.as_str());
+
         let Some(plugin) = session.aggregate_fns().find_plugin(&aggregate_fn_id) else {
+            if session.allows_unknown() {
+                return Ok(None);
+            }
+
             vortex_bail!("unknown aggregate function id: {}", self.id);
         };
 
@@ -59,7 +74,17 @@ impl AggregateSpecProto {
             );
         }
 
-        Ok(aggregate_fn)
+        Ok(Some(aggregate_fn))
+    }
+
+    /// Construct a spec referencing an aggregate ID that no session resolves, for exercising the
+    /// unknown-aggregate read paths.
+    #[cfg(test)]
+    pub(crate) fn new_unknown(id: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            options: vec![],
+        }
     }
 }
 
@@ -112,6 +137,10 @@ pub(crate) fn legacy_stats_table_dtype(column_dtype: &DType, present_stats: &[St
     )
 }
 
+/// Serializes each live [`AggregateFnRef`] into an [`AggregateSpecProto`] for storage in zoned
+/// metadata. The inverse of [`try_aggregate_fns_from_specs`].
+///
+/// Errors if any aggregate is not serializable.
 pub(crate) fn aggregate_specs_from_fns(
     aggregate_fns: &[AggregateFnRef],
 ) -> VortexResult<Arc<[AggregateSpecProto]>> {
@@ -122,15 +151,27 @@ pub(crate) fn aggregate_specs_from_fns(
         .map(Into::into)
 }
 
-pub(crate) fn aggregate_fns_from_specs(
+/// Resolves each [`AggregateSpecProto`] into a live [`AggregateFnRef`], tolerating aggregates this
+/// session does not recognize. Rebuilding the `zones` child needs every spec resolved, since its
+/// dtype is derived from them.
+///
+/// Returns:
+///
+/// - `Ok(Some(fns))`: all resolved, so the zone map can be rebuilt.
+/// - `Ok(None)`: an aggregate is unknown but unknown plugins are allowed (see
+///   [`VortexSession::allows_unknown`]). The caller should disable pruning and scan only the `data`
+///   child, which still returns correct results.
+/// - `Err(..)`: any other failure (an unknown aggregate while disallowed, or undeserializable
+///   options).
+pub(crate) fn try_aggregate_fns_from_specs(
     aggregate_specs: &[AggregateSpecProto],
     session: &VortexSession,
-) -> VortexResult<Arc<[AggregateFnRef]>> {
+) -> VortexResult<Option<Arc<[AggregateFnRef]>>> {
     aggregate_specs
         .iter()
-        .map(|aggregate_spec| aggregate_spec.to_aggregate_fn(session))
-        .collect::<VortexResult<Vec<_>>>()
-        .map(Into::into)
+        .map(|aggregate_spec| aggregate_spec.to_aggregate_fn_opt(session))
+        .collect::<VortexResult<Option<Vec<_>>>>()
+        .map(|aggregate_fns| aggregate_fns.map(Arc::from))
 }
 
 pub(crate) fn aggregate_state_dtype(
@@ -146,6 +187,51 @@ pub(crate) fn aggregate_state_dtype(
     })
 }
 
+/// Converts a legacy stats table of `table_dtype`, holding `stats` of a `column_dtype` column, to
+/// the aggregate stats-table schema.
+///
+/// Returns the aggregate functions the converted table holds, in field order, and the expression
+/// over the legacy table producing it. A stat with no aggregate function, absent from the table,
+/// or stored with a dtype other than its aggregate's state, is left out: pruning only loses it.
+/// Truncation flags are dropped, as the legacy reader ignores them: a truncated max or min still
+/// bounds its zone.
+pub(crate) fn legacy_stats_to_aggregates(
+    column_dtype: &DType,
+    table_dtype: &DType,
+    stats: &[Stat],
+) -> (Arc<[AggregateFnRef]>, Expression) {
+    let fields = table_dtype.as_struct_fields_opt();
+    let mut aggregate_fns = Vec::with_capacity(stats.len());
+    let mut elements = Vec::with_capacity(stats.len());
+    for stat in stats {
+        let Some(aggregate_fn) = stat.aggregate_fn() else {
+            continue;
+        };
+        let Some(stored) = fields.and_then(|fields| fields.field(stat.name())) else {
+            continue;
+        };
+        let Some(state) = aggregate_state_dtype(column_dtype, &aggregate_fn) else {
+            continue;
+        };
+        let state = state.as_nullable();
+        if !stored.eq_ignore_nullability(&state) {
+            continue;
+        }
+        let value = get_item(stat.name(), root());
+        let value = if stored == state {
+            value
+        } else {
+            cast(value, state)
+        };
+        elements.push((aggregate_fn.to_string(), value));
+        aggregate_fns.push(aggregate_fn);
+    }
+    (
+        aggregate_fns.into(),
+        pack(elements, Nullability::NonNullable),
+    )
+}
+
 pub(crate) fn default_bounded_stat_max_bytes() -> std::num::NonZeroUsize {
     // SAFETY: 64 is non-zero.
     unsafe { std::num::NonZeroUsize::new_unchecked(64) }
@@ -153,6 +239,8 @@ pub(crate) fn default_bounded_stat_max_bytes() -> std::num::NonZeroUsize {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_array::aggregate_fn::AggregateFnVTableExt;
     use vortex_array::aggregate_fn::NumericalAggregateOpts;
     use vortex_array::aggregate_fn::fns::max::Max;
@@ -165,6 +253,23 @@ mod tests {
     use vortex_array::extension::datetime::TimeUnit;
 
     use super::*;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
+    #[test]
+    fn unknown_aggregate_errors_without_allow_unknown() {
+        let specs = [AggregateSpecProto::new_unknown("vortex.test.unknown")];
+        assert!(try_aggregate_fns_from_specs(&specs, &SESSION).is_err());
+    }
+
+    #[test]
+    fn unknown_aggregate_is_none_with_allow_unknown() -> VortexResult<()> {
+        let session = VortexSession::empty();
+        session.allow_unknown();
+        let specs = [AggregateSpecProto::new_unknown("vortex.test.unknown")];
+        assert!(try_aggregate_fns_from_specs(&specs, &session)?.is_none());
+        Ok(())
+    }
 
     #[test]
     fn stats_table_dtype_adds_truncation_flags() {

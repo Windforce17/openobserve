@@ -745,7 +745,12 @@ fn dictionary_visitor_preserves_clipped_rows_nulls_and_changing_codes() {
             .unwrap();
         assert!(
             reader
-                .visit_docs_dict_chunks("group", 6..5, false, &mut |_| Ok(()))
+                .visit_docs_dict_chunks(
+                    "group",
+                    std::ops::Range { start: 6, end: 5 },
+                    false,
+                    &mut |_| Ok(())
+                )
                 .is_err()
         );
         assert!(

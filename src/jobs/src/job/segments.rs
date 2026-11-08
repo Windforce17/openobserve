@@ -2415,7 +2415,7 @@ fn split_by_hour(
 fn sliced_batch_memory_size(batch: &RecordBatch, ctx: &str) -> usize {
     let mut exact = 0usize;
     for column in batch.columns() {
-        match column.to_data().get_slice_memory_size() {
+        match config::utils::arrow::slice_memory_size_without_view_buffers(&column.to_data()) {
             Ok(bytes) => exact += bytes,
             Err(error) => {
                 log::debug!(
@@ -3277,6 +3277,45 @@ mod tests {
             whole >= run_footprint / 2,
             "an unsliced batch keeps the footprint basis (content-bytes bulk): {whole} vs \
              {run_footprint}"
+        );
+    }
+
+    /// Same pin for a `Utf8View` column: arrow-rs #8230 charges every view slice the full
+    /// capacity of the shared variadic buffers, which must not reach `original_size`.
+    #[test]
+    fn test_sliced_batch_memory_size_excludes_view_backing() {
+        let hour11 = T0 + 11 * HOUR_MICROS;
+        let rows = 4096usize;
+        let schema = schema_of(vec![ts_field(), Field::new("v", DataType::Utf8View, false)]);
+        let ts: Vec<i64> = (0..rows)
+            .map(|i| {
+                if i == rows - 1 {
+                    hour11 + 42
+                } else {
+                    hour11 + HOUR_MICROS + (rows - i) as i64
+                }
+            })
+            .collect();
+        let fat: Vec<String> = (0..rows).map(|i| format!("{i:0>512}")).collect();
+        let views = StringViewArray::from_iter_values(fat.iter());
+        let backing: usize = views.data_buffers().iter().map(|b| b.capacity()).sum();
+        assert!(
+            backing > 2 * 1024 * 1024,
+            "MB-scale view backing ({backing})"
+        );
+        let run = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(ts)), Arc::new(views)],
+        )
+        .unwrap();
+        let buckets = split_by_hour(&run, "test").unwrap();
+        assert_eq!(buckets.len(), 2);
+        let lonely = &buckets[1].1;
+        assert_eq!(lonely.num_rows(), 1);
+        let sliced = sliced_batch_memory_size(lonely, "test");
+        assert!(
+            sliced < 16 * 1024,
+            "a 1-row view slice must not report the {backing}-byte shared backing, got {sliced}"
         );
     }
 

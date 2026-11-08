@@ -211,7 +211,7 @@ pub async fn search(
     file_list: &[FileKey],
     sorted_by_time: bool,
     collect_stat: bool,
-    file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
+    file_stat_cache: Option<Arc<FileStatisticsCache>>,
     mut index_condition: Option<IndexCondition>,
     mut fst_fields: Vec<String>,
     idx_optimize_rule: Option<IndexOptimizeMode>,

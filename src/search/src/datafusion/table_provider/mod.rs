@@ -37,3 +37,5 @@ mod helpers;
 pub mod listing_adapter;
 pub mod memtable;
 pub mod uniontable;
+
+mod scan_session;

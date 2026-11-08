@@ -127,7 +127,7 @@ impl DisplayLayoutTree {
     fn make_tree(&self, layout: LayoutRef) -> VortexResult<Tree<String>> {
         // Build the node label with encoding, dtype, and metadata
         let mut node_parts = vec![
-            format!("{}", layout.encoding()),
+            format!("{}", layout.encoding_id()),
             format!("dtype: {}", layout.dtype()),
         ];
 
@@ -232,7 +232,6 @@ mod tests {
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
 
-    use crate::IntoLayout;
     use crate::OwnedLayoutChildren;
     use crate::layouts::chunked::ChunkedLayout;
     use crate::layouts::flat::Flat;
@@ -242,7 +241,7 @@ mod tests {
     use crate::sequence::SequenceId;
     use crate::sequence::SequentialArrayStreamExt;
     use crate::strategy::LayoutStrategy;
-    use crate::test::SESSION;
+    use crate::test::new_session;
 
     /// Test display_tree with inline array_tree metadata (no segment source needed).
     #[test]
@@ -251,7 +250,7 @@ mod tests {
         if std::env::var("NEXTEST_RUN_ID").is_ok() {
             temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", Some("1"), || {
                 block_on(|handle| async move {
-                    let session = SESSION.clone().with_handle(handle);
+                    let session = new_session().with_handle(handle);
                     let ctx = ArrayContext::empty();
                     let segments = Arc::new(TestSegments::default());
 
@@ -268,7 +267,7 @@ mod tests {
                     let array1 = PrimitiveArray::new(buffer![1i64, 2, 3, 4, 5], validity);
                     let layout1 = FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx.clone(),
+                            ctx.clone().into(),
                             Arc::<TestSegments>::clone(&segments),
                             array1.into_array().to_array_stream().sequenced(ptr1),
                             eof1,
@@ -279,7 +278,11 @@ mod tests {
 
                     // Create utf8 array (2 buffers: views + data)
                     let (ptr2, eof2) = SequenceId::root().split();
-                    let mut builder = VarBinViewBuilder::with_capacity(DType::Utf8(NonNullable), 5);
+                    let mut builder = VarBinViewBuilder::with_capacity_in(
+                        DType::Utf8(NonNullable),
+                        5,
+                        vortex_buffer::BufferAllocatorRef::statically_allocated(),
+                    );
                     for s in [
                         "hello world this is long",
                         "another long string",
@@ -291,7 +294,7 @@ mod tests {
                     }
                     let layout2 = FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx.clone(),
+                            ctx.clone().into(),
                             Arc::<TestSegments>::clone(&segments),
                             builder
                                 .finish()
@@ -349,7 +352,7 @@ vortex.struct, dtype: {numbers=i64?, strings=utf8}, children: 2, rows: 5
         if std::env::var("NEXTEST_RUN_ID").is_ok() {
             temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", None::<&str>, || {
                 block_on(|handle| async move {
-                    let session = SESSION.clone().with_handle(handle);
+                    let session = new_session().with_handle(handle);
                     let ctx = ArrayContext::empty();
                     let segments = Arc::new(TestSegments::default());
 
@@ -359,7 +362,7 @@ vortex.struct, dtype: {numbers=i64?, strings=utf8}, children: 2, rows: 5
                         PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::NonNullable);
                     let layout1 = FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx.clone(),
+                            ctx.clone().into(),
                             Arc::<TestSegments>::clone(&segments),
                             array1.into_array().to_array_stream().sequenced(ptr1),
                             eof1,
@@ -374,7 +377,7 @@ vortex.struct, dtype: {numbers=i64?, strings=utf8}, children: 2, rows: 5
                         PrimitiveArray::new(buffer![6i32, 7, 8, 9, 10], Validity::NonNullable);
                     let layout2 = FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx.clone(),
+                            ctx.clone().into(),
                             Arc::<TestSegments>::clone(&segments),
                             array2.into_array().to_array_stream().sequenced(ptr2),
                             eof2,
@@ -419,10 +422,10 @@ vortex.chunked, dtype: i32, children: 2, rows: 10
                 // Create a simple primitive array
                 let array = PrimitiveArray::new(buffer![1i32, 2, 3, 4, 5], Validity::AllValid);
                 let layout = block_on(|handle| async {
-                    let session = SESSION.clone().with_handle(handle);
+                    let session = new_session().with_handle(handle);
                     FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx.clone(),
+                            ctx.clone().into(),
                             Arc::<TestSegments>::clone(&segments),
                             array.into_array().to_array_stream().sequenced(ptr),
                             eof,
@@ -456,7 +459,7 @@ vortex.flat, dtype: i32?, segment 0, buffers=[20B], total=20B
     #[test]
     fn test_display_tree_without_inline_node() {
         if std::env::var("NEXTEST_RUN_ID").is_ok() {
-            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", Some("1"), || {
+            temp_env::with_var("FLAT_LAYOUT_INLINE_ARRAY_NODE", None::<&str>, || {
                 let ctx = ArrayContext::empty();
                 let segments = Arc::new(TestSegments::default());
                 let (ptr, eof) = SequenceId::root().split();
@@ -464,10 +467,10 @@ vortex.flat, dtype: i32?, segment 0, buffers=[20B], total=20B
                 // Create a simple primitive array
                 let array = PrimitiveArray::new(buffer![10i64, 20, 30], Validity::NonNullable);
                 let layout = block_on(|handle| async {
-                    let session = SESSION.clone().with_handle(handle);
+                    let session = new_session().with_handle(handle);
                     FlatLayoutStrategy::default()
                         .write_stream(
-                            ctx,
+                            ctx.into(),
                             Arc::<TestSegments>::clone(&segments),
                             array.into_array().to_array_stream().sequenced(ptr),
                             eof,
@@ -477,11 +480,11 @@ vortex.flat, dtype: i32?, segment 0, buffers=[20B], total=20B
                         .unwrap()
                 });
 
-                // Test display_tree exact output (with inline array_tree enabled by env var from other test)
+                // Without inline metadata or a segment source, only the segment ID is available.
                 assert_eq!(
                     layout.display_tree().to_string(),
                     "\
-vortex.flat, dtype: i64, segment 0, buffers=[24B], total=24B
+vortex.flat, dtype: i64, segment: 0
 "
                 );
             })

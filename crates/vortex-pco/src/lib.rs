@@ -13,13 +13,15 @@
 //!
 //! ```rust
 //! use vortex_array::session::ArraySessionExt;
+//! use vortex_session::VortexSession;
 //!
-//! let session = vortex_array::array_session();
+//! let session = VortexSession::empty();
 //! session.arrays().register(vortex_pco::Pco);
 //! ```
 
 mod array;
 mod compute;
+mod probe;
 mod rules;
 mod slice;
 
@@ -32,7 +34,7 @@ pub struct PcoPageInfo {
     // count of values.
     /// Number of valid primitive values stored in this page.
     #[prost(uint32, tag = "1")]
-    pub n_values: u32,
+    pub(crate) n_values: u32,
 }
 
 // We're calling this Info instead of Metadata because ChunkMeta refers to a specific
@@ -42,7 +44,7 @@ pub struct PcoPageInfo {
 pub struct PcoChunkInfo {
     /// Pages contained in this chunk.
     #[prost(message, repeated, tag = "1")]
-    pub pages: Vec<PcoPageInfo>,
+    pub(crate) pages: Vec<PcoPageInfo>,
 }
 
 #[derive(Clone, prost::Message)]
@@ -52,10 +54,36 @@ pub struct PcoMetadata {
     // no issue duplicating it here per PcoArray
     /// Pco file header bytes.
     #[prost(bytes, tag = "1")]
-    pub header: Vec<u8>,
+    pub(crate) header: Vec<u8>,
     /// Metadata for each compressed chunk.
     #[prost(message, repeated, tag = "2")]
-    pub chunks: Vec<PcoChunkInfo>,
+    pub(crate) chunks: Vec<PcoChunkInfo>,
+}
+
+impl PcoMetadata {
+    /// Returns the Pco file header without copying it.
+    pub fn header(&self) -> &[u8] {
+        &self.header
+    }
+
+    /// Returns chunk metadata in storage order.
+    pub fn chunks(&self) -> &[PcoChunkInfo] {
+        &self.chunks
+    }
+}
+
+impl PcoChunkInfo {
+    /// Returns page metadata in storage order.
+    pub fn pages(&self) -> &[PcoPageInfo] {
+        &self.pages
+    }
+}
+
+impl PcoPageInfo {
+    /// Returns the number of valid primitive values in this page.
+    pub fn n_values(&self) -> u32 {
+        self.n_values
+    }
 }
 
 #[cfg(test)]

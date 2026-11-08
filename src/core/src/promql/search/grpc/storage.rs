@@ -26,8 +26,8 @@ use config::{
 };
 use datafusion::{
     arrow::datatypes::Schema,
+    common::TableReference,
     error::{DataFusionError, Result},
-    sql::TableReference,
 };
 use hashbrown::{HashMap, HashSet};
 use infra::{
@@ -211,7 +211,11 @@ pub(crate) async fn create_context(
         "[trace_id {trace_id}] promql->search->storage: session target_partitions: {target_partitions}"
     );
 
-    let schema = Arc::new(schema.to_owned().with_metadata(Default::default()));
+    let schema = Arc::new(
+        schema
+            .to_owned()
+            .with_metadata(arrow_schema::Metadata::default()),
+    );
 
     let query = Arc::new(QueryParams {
         trace_id: trace_id.to_string(),

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::future;
+use std::iter::once;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -10,6 +11,7 @@ use futures::FutureExt;
 use futures::TryStreamExt;
 use futures::future::BoxFuture;
 use futures::stream::FuturesOrdered;
+use once_cell::sync::OnceCell;
 use tracing::trace;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
@@ -18,7 +20,7 @@ use vortex_array::MaskFuture;
 use vortex_array::arrays::ChunkedArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
-use vortex_array::expr::Expression;
+use vortex_array::expr::BoundExpression;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
@@ -40,6 +42,20 @@ pub struct ChunkedReader {
     layout: ChunkedLayout,
     name: Arc<str>,
     lazy_children: LazyReaderChildren,
+    /// Lazily computed classification of which chunks register no interior splits, letting
+    /// [`ChunkedReader::register_splits`] avoid materializing those chunks' readers.
+    chunk_skips: OnceCell<ChunkSkips>,
+}
+
+/// Which chunks of a chunked layout are known to register no interior splits.
+enum ChunkSkips {
+    /// Every chunk end is a split boundary and no chunk has interior splits (e.g. all-flat
+    /// chunks): splits come straight from the chunk offsets.
+    All,
+    /// No chunk can be skipped.
+    None,
+    /// Per-chunk answers.
+    Mixed(Box<[bool]>),
 }
 
 static UNKNOWN: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("chunked-child"));
@@ -52,38 +68,67 @@ impl ChunkedReader {
         session: &VortexSession,
         ctx: LayoutReaderContext,
     ) -> Self {
-        let nchildren = layout.nchildren();
-        let dtypes = vec![layout.dtype.clone(); nchildren];
-
-        // format!() has non-marginal overhead for short queries like random
-        // access benchmarks
-        let names = if cfg!(debug_assertions) {
-            (0..nchildren)
+        let lazy_children = if cfg!(debug_assertions) {
+            // format!() has non-marginal overhead for short queries like random
+            // access benchmarks
+            let nchildren = layout.nchildren();
+            let dtypes = vec![layout.dtype().clone(); nchildren];
+            let names = (0..nchildren)
                 .map(|idx| Arc::from(format!("{name}.[{idx}]")))
-                .collect()
+                .collect();
+            LazyReaderChildren::new(
+                Arc::clone(layout.children()),
+                dtypes,
+                names,
+                segment_source,
+                session.clone(),
+                ctx,
+            )
         } else {
-            vec![Arc::clone(&*UNKNOWN); nchildren]
+            LazyReaderChildren::new_uniform(
+                Arc::clone(layout.children()),
+                layout.dtype().clone(),
+                Arc::clone(&*UNKNOWN),
+                segment_source,
+                session.clone(),
+                ctx,
+            )
         };
-
-        let lazy_children = LazyReaderChildren::new(
-            Arc::clone(&layout.children),
-            dtypes,
-            names,
-            segment_source,
-            session.clone(),
-            ctx,
-        );
 
         Self {
             layout,
             name,
             lazy_children,
+            chunk_skips: OnceCell::new(),
         }
     }
 
     /// Return the [`LayoutReader`] for the given chunk.
     fn chunk_reader(&self, idx: usize) -> VortexResult<&LayoutReaderRef> {
         self.lazy_children.get(idx)
+    }
+
+    /// Classify which chunks are known to be indivisible, without materializing any chunk
+    /// layouts or readers.
+    fn chunk_skips(&self) -> &ChunkSkips {
+        self.chunk_skips.get_or_init(|| {
+            let children = self.layout.children();
+            let nchildren = self.layout.nchildren();
+            if nchildren == 0 {
+                return ChunkSkips::All;
+            }
+
+            let skips = (0..nchildren)
+                .map(|idx| children.child_is_indivisible(idx))
+                .collect::<Box<[bool]>>();
+            if skips.iter().all(|&skip| skip) {
+                ChunkSkips::All
+            } else if skips.iter().all(|&skip| !skip) {
+                ChunkSkips::None
+            } else {
+                ChunkSkips::Mixed(skips)
+            }
+        })
     }
 
     fn chunk_offset(&self, idx: usize) -> u64 {
@@ -185,24 +230,61 @@ impl LayoutReader for ChunkedReader {
             return Ok(());
         }
 
-        let iter = self.ranges(split_range.row_range());
+        let row_range = split_range.row_range();
+        let row_offset = split_range.row_offset();
+
+        // Fast path: no chunk has interior splits (e.g. all-flat chunks), so the splits are
+        // exactly the chunk-end boundaries — no chunk layouts or readers needed.
+        if matches!(self.chunk_skips(), ChunkSkips::All) {
+            let chunk_range = self.chunk_range(row_range);
+            if chunk_range.is_empty() {
+                return Ok(());
+            }
+            let offsets = &self.layout.chunk_offsets;
+            // The boundaries below are all bounded by the last one, so a single overflow check
+            // covers the whole batch.
+            let last = row_offset
+                .checked_add(offsets[chunk_range.end].min(row_range.end))
+                .vortex_expect("Chunked layout split offset overflow");
+            splits.reserve(chunk_range.len());
+            splits.extend_ascending(
+                offsets[chunk_range.start + 1..chunk_range.end]
+                    .iter()
+                    .map(|&offset| row_offset + offset)
+                    .chain(once(last)),
+            );
+            return Ok(());
+        }
+
+        let iter = self.ranges(row_range);
         splits.reserve(iter.size_hint().0);
 
-        for (chunk_idx, chunk_start, child_range, _) in iter {
-            let child = self.chunk_reader(chunk_idx)?;
-            let child_row_offset = split_range
-                .row_offset()
-                .checked_add(chunk_start)
-                .vortex_expect("Chunked layout split offset overflow");
-            let child_split_range = SplitRange::try_new(child_row_offset, child_range)?;
+        let chunk_skips = self.chunk_skips();
 
-            child.register_splits(field_mask, &child_split_range, splits)?;
+        for (chunk_idx, chunk_start, child_range, _) in iter {
+            let child_end = child_range.end;
+
+            // Children without interior splits (e.g. flat) would only re-register this chunk's
+            // end boundary, so skip materializing a layout and reader for them.
+            let skip_child = match chunk_skips {
+                ChunkSkips::All => true,
+                ChunkSkips::None => false,
+                ChunkSkips::Mixed(skips) => skips[chunk_idx],
+            };
+            if !skip_child {
+                let child = self.chunk_reader(chunk_idx)?;
+                let child_row_offset = row_offset
+                    .checked_add(chunk_start)
+                    .vortex_expect("Chunked layout split offset overflow");
+                let child_split_range = SplitRange::try_new(child_row_offset, child_range)?;
+
+                child.register_splits(field_mask, &child_split_range, splits)?;
+            }
 
             // Register the split indicating the end of this chunk
             splits.push(
-                split_range
-                    .row_offset()
-                    .checked_add(chunk_start + child_split_range.row_range().end)
+                row_offset
+                    .checked_add(chunk_start + child_end)
                     .vortex_expect("Chunked layout split offset overflow"),
             );
         }
@@ -213,7 +295,7 @@ impl LayoutReader for ChunkedReader {
     fn pruning_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         if row_range.is_empty() {
@@ -259,7 +341,7 @@ impl LayoutReader for ChunkedReader {
     fn filter_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
         if row_range.is_empty() {
@@ -298,26 +380,35 @@ impl LayoutReader for ChunkedReader {
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
         if row_range.is_empty() {
-            return Ok(future::ready(Ok(
-                Canonical::empty(&expr.return_dtype(self.dtype())?).into_array()
-            ))
-            .boxed());
+            return Ok(future::ready(Ok(Canonical::empty(expr.dtype()).into_array())).boxed());
         }
 
         let mut chunk_evals = vec![];
 
         for (chunk_idx, _, chunk_range, mask_range) in self.ranges(row_range) {
+            let chunk_mask = mask.slice(mask_range);
+
+            // A chunk known to have no selected rows is not read, decoded or filtered, and adds
+            // no empty chunk to the result. Random row reads select few rows from many chunks.
+            if chunk_mask.peek().is_some_and(Mask::all_false) {
+                continue;
+            }
+
             let chunk_reader = self.chunk_reader(chunk_idx)?;
             let chunk_eval = chunk_reader
-                .projection_evaluation(&chunk_range, expr, mask.slice(mask_range))
+                .projection_evaluation(&chunk_range, expr, chunk_mask)
                 .map_err(|err| {
                     err.with_context(format!("While evaluating projection on chunk {chunk_idx}"))
                 })?;
             chunk_evals.push(chunk_eval);
+        }
+
+        if chunk_evals.is_empty() {
+            return Ok(future::ready(Ok(Canonical::empty(expr.dtype()).into_array())).boxed());
         }
 
         Ok(async move {
@@ -351,9 +442,12 @@ mod test {
     use rstest::fixture;
     use rstest::rstest;
     use vortex_array::ArrayContext;
+    use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::Chunked;
+    use vortex_array::arrays::chunked::ChunkedArrayExt;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::FieldMask;
@@ -363,9 +457,9 @@ mod test {
     use vortex_buffer::buffer;
     use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
+    use vortex_mask::Mask;
     use vortex_session::registry::ReadContext;
 
-    use crate::IntoLayout;
     use crate::LayoutRef;
     use crate::LayoutStrategy;
     use crate::OwnedLayoutChildren;
@@ -381,6 +475,7 @@ mod test {
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt as _;
     use crate::test::SESSION;
+    use crate::test::new_session;
 
     #[fixture]
     /// Create a chunked layout with three chunks of primitive arrays.
@@ -392,10 +487,10 @@ mod test {
         let (mut sequence_id, eof) = SequenceId::root().split();
         let segments2 = Arc::<TestSegments>::clone(&segments);
         let layout = block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
+            let session = new_session().with_handle(handle);
             strategy
                 .write_stream(
-                    ctx,
+                    ctx.into(),
                     segments2,
                     SequentialStreamAdapter::new(
                         DType::Primitive(PType::I32, NonNullable),
@@ -473,12 +568,14 @@ mod test {
     ) {
         block_on(|_h| async {
             let mut ctx = SESSION.create_execution_ctx();
-            let result = layout
+            let reader = layout
                 .new_reader("".into(), segments, &SESSION, &Default::default())
-                .unwrap()
+                .unwrap();
+            let expr = root().bind(reader.dtype()).unwrap();
+            let result = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
-                    &root(),
+                    &expr,
                     MaskFuture::new_true(usize::try_from(layout.row_count()).unwrap()),
                 )
                 .unwrap()
@@ -488,5 +585,58 @@ mod test {
             let expected = buffer![1i32, 2, 3, 4, 5, 6, 7, 8, 9].into_array();
             assert_arrays_eq!(result, expected, &mut ctx);
         })
+    }
+
+    /// Evaluate the whole layout with `mask`, as a projection of every column.
+    fn evaluate(
+        (segments, layout): (Arc<dyn SegmentSource>, LayoutRef),
+        mask: MaskFuture,
+    ) -> ArrayRef {
+        block_on(|_h| async {
+            let reader = layout
+                .new_reader("".into(), segments, &SESSION, &Default::default())
+                .unwrap();
+            let expr = root().bind(reader.dtype()).unwrap();
+            reader
+                .projection_evaluation(&(0..layout.row_count()), &expr, mask)
+                .unwrap()
+                .await
+                .unwrap()
+        })
+    }
+
+    #[rstest]
+    fn test_known_mask_skips_unselected_chunks(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mask = Mask::from_indices(9, vec![0, 7]);
+        let result = evaluate(layout, MaskFuture::ready(mask));
+
+        // The middle chunk has no selected rows, so it adds no chunk.
+        let chunked = result.as_opt::<Chunked>().unwrap();
+        assert_eq!(chunked.nchunks(), 2);
+        assert_arrays_eq!(result, buffer![1i32, 8].into_array(), &mut ctx);
+    }
+
+    #[rstest]
+    fn test_known_all_false_mask_reads_nothing(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        let result = evaluate(layout, MaskFuture::ready(Mask::new_false(9)));
+        assert_eq!(result.len(), 0);
+    }
+
+    #[rstest]
+    fn test_pending_mask_selects_the_same_rows(
+        #[from(chunked_layout)] layout: (Arc<dyn SegmentSource>, LayoutRef),
+    ) {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mask = Mask::from_indices(9, vec![0, 7]);
+        let pending = MaskFuture::new(9, async move { Ok(mask) });
+        assert!(pending.peek().is_none());
+
+        let result = evaluate(layout, pending);
+        assert_arrays_eq!(result, buffer![1i32, 8].into_array(), &mut ctx);
     }
 }

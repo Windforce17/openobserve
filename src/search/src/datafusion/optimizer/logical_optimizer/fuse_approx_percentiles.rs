@@ -53,10 +53,6 @@ impl OptimizerRule for FuseApproxPercentiles {
         Some(ApplyOrder::BottomUp)
     }
 
-    fn supports_rewrite(&self) -> bool {
-        true
-    }
-
     fn rewrite(
         &self,
         plan: LogicalPlan,
@@ -589,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn same_name_custom_udaf_retains_its_behavior() {
         use datafusion::{
-            functions_aggregate::approx_percentile_cont::ApproxPercentileAccumulator,
+            functions_aggregate::min_max::min_udaf,
             logical_expr::{Volatility, create_udaf},
         };
 
@@ -601,19 +597,21 @@ mod tests {
             Arc::new(DataType::Float64),
             Volatility::Immutable,
             Arc::new(|_| {
-                Ok(Box::new(ApproxPercentileAccumulator::new(
-                    0.0,
+                let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "v",
                     DataType::Float64,
-                )))
+                    true,
+                )]));
+                datafusion::physical_expr::aggregate::AggregateExprBuilder::new(
+                    min_udaf(),
+                    vec![datafusion::physical_expr::expressions::col("v", &schema)?],
+                )
+                .schema(schema)
+                .alias("minimum")
+                .build()?
+                .create_accumulator()
             }),
-            Arc::new(vec![
-                DataType::UInt64,
-                DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
-                DataType::Float64,
-                DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true))),
-            ]),
+            Arc::new(vec![DataType::Float64]),
         );
         let baseline = context(false, 1);
         let fused = context(true, 1);

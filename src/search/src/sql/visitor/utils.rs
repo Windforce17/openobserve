@@ -15,7 +15,7 @@
 
 use std::{collections::HashSet, ops::ControlFlow};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use sqlparser::ast::{Expr, Ident, VisitorMut};
 
 pub struct FieldNameVisitor {

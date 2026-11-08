@@ -139,6 +139,11 @@ pub async fn get_enrichment_table_data(
     // do search using search_inner which returns RecordBatches
     match result {
         Ok((batches, _scan_stats, _took_wait, _is_partial, _partial_err)) => {
+            if _partial_err.contains(flight::engine::GENERATION_ERROR) {
+                return Err(anyhow::anyhow!(
+                    "[trace_id {trace_id}] enrichment table {org_id}/{name} is incomplete: {_partial_err}"
+                ));
+            }
             log::info!(
                 "get enrichment table {org_id}/{name} data success with {} rows",
                 batches.iter().map(|b| b.num_rows()).sum::<usize>()

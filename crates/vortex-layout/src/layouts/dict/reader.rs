@@ -15,22 +15,22 @@ use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::DictArray;
-use vortex_array::arrays::SharedArray;
+use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::Nullability;
-use vortex_array::expr::Expression;
-use vortex_array::expr::direct_annotations;
-use vortex_array::expr::is_root;
-use vortex_array::expr::label_tree;
-use vortex_array::expr::pack;
+use vortex_array::expr::BoundExpression;
+use vortex_array::expr::ExactBoundExpr;
+use vortex_array::expr::bound::pack as bound_pack;
 use vortex_array::expr::root;
-use vortex_array::expr::transform::partition_annotations;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::scalar_fn::is_negative_cost;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_expr::direct_bound_annotations;
+use vortex_expr::label_bound_tree;
+use vortex_expr::transform::partition_bound_annotations;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::dash_map::DashMap;
@@ -40,6 +40,7 @@ use crate::LayoutReader;
 use crate::LayoutReaderRef;
 use crate::RowSplits;
 use crate::SplitRange;
+use crate::arrays::shared::Shared;
 use crate::layouts::SharedArrayFuture;
 use crate::segments::SegmentSource;
 
@@ -53,7 +54,7 @@ pub struct DictReader {
     /// Cached dict values array
     values_array: OnceLock<SharedArrayFuture>,
     /// Cache of expression evaluation results on the values array by expression
-    values_evals: DashMap<Expression, SharedArrayFuture>,
+    values_evals: DashMap<ExactBoundExpr, SharedArrayFuture>,
 
     values: LayoutReaderRef,
     codes: LayoutReaderRef,
@@ -67,14 +68,20 @@ impl DictReader {
         session: VortexSession,
         ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
-        let values_len = usize::try_from(layout.values.row_count())?;
-        let values = layout.values.new_reader(
+        let values_layout = layout
+            .slot(0)?
+            .vortex_expect("DictLayout always has a values child");
+        let codes_layout = layout
+            .slot(1)?
+            .vortex_expect("DictLayout always has a codes child");
+        let values_len = usize::try_from(values_layout.row_count())?;
+        let values = values_layout.new_reader(
             format!("{name}.values").into(),
             Arc::clone(&segment_source),
             &session,
             &ctx,
         )?;
-        let codes = layout.codes.new_reader(
+        let codes = codes_layout.new_reader(
             format!("{name}.codes").into(),
             segment_source,
             &session,
@@ -87,7 +94,7 @@ impl DictReader {
             session,
             values_len,
             values_array: Default::default(),
-            values_evals: Default::default(),
+            values_evals: DashMap::with_hasher_and_shard_amount(Default::default(), 8),
             values,
             codes,
         })
@@ -97,17 +104,20 @@ impl DictReader {
         // We capture the name, so it may be wrong if we re-use the same reader within multiple
         // different parent readers. But that's rare...
         let values_len = self.values_len;
+        let root = root()
+            .bind(self.values.dtype())
+            .vortex_expect("root must bind against the dictionary values dtype");
         self.values_array
             .get_or_init(move || {
                 self.values
                     .projection_evaluation(
                         &(0..values_len as u64),
-                        &root(),
+                        &root,
                         MaskFuture::new_true(values_len),
                     )
                     .vortex_expect("must construct dict values array evaluation")
                     .map_err(Arc::new)
-                    .map(move |array| Ok(SharedArray::new(array?).into_array()))
+                    .map(move |array| Ok(Shared::new(array?).into_array()))
                     .boxed()
                     .shared()
             })
@@ -119,11 +129,14 @@ impl DictReader {
         // We capture the name, so it may be wrong if we re-use the same reader within multiple
         // different parent readers. But that's rare...
         let values_len = self.values_len;
+        let root = root()
+            .bind(self.values.dtype())
+            .vortex_expect("root must bind against the dictionary values dtype");
         self.values_array.get().cloned().unwrap_or_else(|| {
             self.values
                 .projection_evaluation(
                     &(0..values_len as u64),
-                    &root(),
+                    &root,
                     MaskFuture::new_true(values_len),
                 )
                 .vortex_expect("must construct dict values array evaluation")
@@ -133,24 +146,26 @@ impl DictReader {
         })
     }
 
-    fn values_eval(&self, expr: Expression) -> SharedArrayFuture {
+    fn values_eval(&self, expr: BoundExpression) -> SharedArrayFuture {
         // This is unsound since we cannot be sure that all the values are referenced in the query
         // after applying the filter, so if the expression is fallible this might fail when it
         // shouldn't.
         // TODO(joe): fixme
 
+        let key = ExactBoundExpr(expr.clone());
+
         // Check cache first with read-only lock
-        if let Some(fut) = self.values_evals.get(&expr) {
+        if let Some(fut) = self.values_evals.get(&key) {
             return fut.clone();
         }
 
         self.values_evals
-            .entry(expr.clone())
+            .entry(key)
             .or_insert_with(|| {
                 self.values_array_uncanonical()
                     .map(move |array| {
-                        let array = array?.apply(&expr)?;
-                        Ok(SharedArray::new(array).into_array())
+                        let array = array?.apply_bound(&expr)?;
+                        Ok(Shared::new(array).into_array())
                     })
                     .boxed()
                     .shared()
@@ -169,26 +184,32 @@ const PUSHDOWN_ANNOTATION: &str = "";
 /// right is the optional inner part that we want to apply to array before
 /// canonicalizing.
 ///
-/// We want to push to array only if expression has a negative cost, is
-/// infallible and null-insensitive.
+/// We want to push to the array only if the expression has a negative cost, is infallible, and is
+/// strict. Strictness ensures dictionary null codes still force a null result after pushdown.
 fn split_expression_for_pushdown(
-    expr: Expression,
-    dtype: &DType,
-) -> VortexResult<(Expression, Option<Expression>)> {
-    let references_root = label_tree(&expr, is_root, |acc, &child| acc | child);
-    let annotations = direct_annotations(&expr, |expr| {
-        let signature = expr.signature();
-        if !signature.is_fallible()
-            && !signature.is_null_sensitive()
-            && is_negative_cost(expr.id())
-            && references_root.get(&expr).copied().unwrap_or(true)
+    expr: &BoundExpression,
+) -> VortexResult<(BoundExpression, Option<BoundExpression>)> {
+    let references_root =
+        label_bound_tree(expr, BoundExpression::is_root, |acc, &child| acc | child);
+    let annotations = direct_bound_annotations(expr, |expr: &BoundExpression| {
+        let Some(scalar_fn) = expr.as_scalar() else {
+            return vec![];
+        };
+        let signature = scalar_fn.signature();
+        if signature.is_infallible()
+            && signature.is_strict()
+            && is_negative_cost(scalar_fn.id())
+            && references_root
+                .get(&ExactBoundExpr(expr.clone()))
+                .copied()
+                .unwrap_or(true)
         {
             vec![PUSHDOWN_ANNOTATION]
         } else {
             vec![]
         }
     });
-    let partition = partition_annotations(expr.clone(), dtype, annotations)?;
+    let partition = partition_bound_annotations(expr.clone(), annotations)?;
     if partition.partitions.is_empty() {
         Ok((partition.root, None))
     } else {
@@ -222,7 +243,7 @@ impl LayoutReader for DictReader {
     fn pruning_evaluation(
         &self,
         _row_range: &Range<u64>,
-        _expr: &Expression,
+        _expr: &BoundExpression,
         mask: Mask,
     ) -> VortexResult<MaskFuture> {
         // NOTE: we can get the values here, convert expression to the codes domain, and push down
@@ -235,20 +256,19 @@ impl LayoutReader for DictReader {
     fn filter_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<MaskFuture> {
-        // TODO(joe): fix up expr partitioning with fallible & null sensitive annotations
+        // TODO(joe): fix up expr partitioning with fallibility and strictness annotations
         let values_eval = self.values_eval(expr.clone());
 
         // We register interest on the entire codes row_range for now, there
         // is no straightforward shift into the codes domain we can do to the expression
         // without reading values.
-        let codes_eval = self.codes.projection_evaluation(
-            row_range,
-            &root(),
-            MaskFuture::new_true(mask.len()),
-        )?;
+        let root = root().bind(self.codes.dtype())?;
+        let codes_eval =
+            self.codes
+                .projection_evaluation(row_range, &root, MaskFuture::new_true(mask.len()))?;
 
         let session = self.session.clone();
 
@@ -258,7 +278,10 @@ impl LayoutReader for DictReader {
             let mask = mask.await?;
 
             let mut ctx = session.create_execution_ctx();
-            let dict_mask = values.take(codes)?.null_as_false().execute(&mut ctx)?;
+            let dict_mask = values
+                .take(codes)?
+                .fill_null(false)?
+                .execute::<Mask>(&mut ctx)?;
 
             Ok(mask.bitand(&dict_mask))
         }))
@@ -267,36 +290,38 @@ impl LayoutReader for DictReader {
     fn projection_evaluation(
         &self,
         row_range: &Range<u64>,
-        expr: &Expression,
+        expr: &BoundExpression,
         mask: MaskFuture,
     ) -> VortexResult<BoxFuture<'static, VortexResult<ArrayRef>>> {
-        // TODO: fix up expr partitioning with fallible & null sensitive annotations
+        // TODO: fix up expr partitioning with fallibility and strictness annotations
+        let codes_root = root().bind(self.codes.dtype())?;
         let codes_eval = self
             .codes
-            .projection_evaluation(row_range, &root(), mask)
+            .projection_evaluation(row_range, &codes_root, mask)
             .map_err(|err| err.with_context("While evaluating projection on codes"))?;
 
-        let (expr_outer, expr_inner) = split_expression_for_pushdown(expr.clone(), self.dtype())?;
+        let (expr_outer, expr_inner) = split_expression_for_pushdown(expr)?;
 
         let values_eval = if let Some(inner) = expr_inner {
             // "outer" takes a struct field with PUSHDOWN_ANNOTATION name, so
             // pack inner with this name as well
-            let inner = pack([(PUSHDOWN_ANNOTATION, inner)], Nullability::NonNullable);
+            let inner = bound_pack([(PUSHDOWN_ANNOTATION, inner)], Nullability::NonNullable);
 
             // We can't use values_eval as it uses values_array_uncanonical
             // which in turn gets populated from self.values. If
             // self.values_array() is called first, it will populate
             // self.values with uncompressed data. Supply uncached data
             let values_len = self.values_len;
+            let values_root = root().bind(self.values.dtype())?;
             self.values
                 .projection_evaluation(
                     &(0..values_len as u64),
-                    &root(),
+                    &values_root,
                     MaskFuture::new_true(values_len),
                 )
                 .vortex_expect("must construct dict values array evaluation")
                 .map_err(Arc::new)
-                .map(move |array| Ok(SharedArray::new(array?.apply(&inner)?).into_array()))
+                .map(move |array| Ok(Shared::new(array?.apply_bound(&inner)?).into_array()))
                 .boxed()
                 .shared()
         } else {
@@ -318,7 +343,7 @@ impl LayoutReader for DictReader {
             .into_array()
             .optimize()?;
 
-            array.apply(&expr_outer)
+            array.apply_bound(&expr_outer)
         }
         .boxed())
     }
@@ -331,15 +356,14 @@ impl LayoutReader for DictReader {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::LazyLock;
 
     use rstest::rstest;
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
-    use vortex_array::Canonical;
     use vortex_array::IntoArray as _;
     use vortex_array::MaskFuture;
     use vortex_array::VortexSessionExecute;
-    use vortex_array::array_session;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::StructArray;
     use vortex_array::arrays::VarBinArray;
@@ -349,7 +373,10 @@ mod tests {
     use vortex_array::dtype::FieldNames;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::StructFields;
+    use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
+    use vortex_array::expr::bound::pack as bound_pack;
     use vortex_array::expr::byte_length;
     use vortex_array::expr::cast;
     use vortex_array::expr::eq;
@@ -360,8 +387,7 @@ mod tests {
     use vortex_array::expr::pack;
     use vortex_array::expr::root;
     use vortex_array::validity::Validity;
-    use vortex_btrblocks::BtrBlocksCompressor;
-    use vortex_error::VortexExpect;
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
     use vortex_error::VortexResult;
     use vortex_io::runtime::Handle;
     use vortex_io::runtime::single::block_on;
@@ -384,10 +410,12 @@ mod tests {
     use crate::sequence::SequentialStreamExt;
     use crate::session::LayoutSession;
 
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
+
     // FIXME(ngates): Deprecate the global `runtime::single::block_on` helper and require tests
     // to call `block_on` on an explicit runtime instance.
     fn session_with_handle(handle: Handle) -> VortexSession {
-        array_session()
+        VortexSession::empty()
             .with::<LayoutSession>()
             .with::<RuntimeSession>()
             .with_handle(handle)
@@ -402,14 +430,18 @@ mod tests {
             FlatLayoutStrategy::default(),
             FlatLayoutStrategy::default(),
             DictLayoutOptions::default(),
-            Arc::new(BtrBlocksCompressor::default()),
+            Arc::new(
+                BtrBlocksCompressorBuilder::from_session(session)
+                    .unrestricted()
+                    .build(),
+            ),
         );
         let segments = Arc::new(TestSegments::default());
         let (ptr, eof) = SequenceId::root().split();
         let dtype = array.dtype().clone();
         let layout = strategy
             .write_stream(
-                ArrayContext::empty(),
+                ArrayContext::empty().into(),
                 Arc::<TestSegments>::clone(&segments),
                 SequentialStreamAdapter::new(dtype, array.to_array_stream().sequenced(ptr))
                     .sendable(),
@@ -432,7 +464,11 @@ mod tests {
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
                 DictLayoutOptions::default(),
-                Arc::new(BtrBlocksCompressor::default()),
+                Arc::new(
+                    BtrBlocksCompressorBuilder::from_session(&session)
+                        .unrestricted()
+                        .build(),
+                ),
             );
 
             let array = VarBinArray::from_iter(
@@ -456,7 +492,7 @@ mod tests {
             let (ptr, eof) = SequenceId::root().split();
             let layout: LayoutRef = strategy
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
@@ -477,9 +513,11 @@ mod tests {
                 Nullability::NonNullable,
             );
             assert!(layout.encoding_id() == LayoutId::new("vortex.dict"));
-            let actual = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
+                .unwrap();
+            let expression = expression.bind(reader.dtype()).unwrap();
+            let actual = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &expression,
@@ -533,7 +571,11 @@ mod tests {
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
                 DictLayoutOptions::default(),
-                Arc::new(BtrBlocksCompressor::default()),
+                Arc::new(
+                    BtrBlocksCompressorBuilder::from_session(&session)
+                        .unrestricted()
+                        .build(),
+                ),
             );
 
             let array =
@@ -543,7 +585,7 @@ mod tests {
             let (ptr, eof) = SequenceId::root().split();
             let layout: LayoutRef = strategy
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
@@ -563,9 +605,11 @@ mod tests {
                     Nullability::Nullable,
                 )),
             );
-            let mask = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
+                .unwrap();
+            let filter = filter.bind(reader.dtype()).unwrap();
+            let mask = reader
                 .filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))
                 .unwrap()
                 .await
@@ -586,7 +630,11 @@ mod tests {
                 FlatLayoutStrategy::default(),
                 FlatLayoutStrategy::default(),
                 DictLayoutOptions::default(),
-                Arc::new(BtrBlocksCompressor::default()),
+                Arc::new(
+                    BtrBlocksCompressorBuilder::from_session(&session)
+                        .unrestricted()
+                        .build(),
+                ),
             );
 
             let array = VarBinArray::from_iter(
@@ -611,7 +659,7 @@ mod tests {
             let (ptr, eof) = SequenceId::root().split();
             let layout: LayoutRef = strategy
                 .write_stream(
-                    array_ctx,
+                    array_ctx.into(),
                     Arc::<TestSegments>::clone(&segments),
                     SequentialStreamAdapter::new(
                         DType::Utf8(Nullability::Nullable),
@@ -626,9 +674,11 @@ mod tests {
 
             let expression = is_not_null(root());
             assert_eq!(layout.encoding_id(), LayoutId::new("vortex.dict"));
-            let actual = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
+                .unwrap();
+            let expression = expression.bind(reader.dtype()).unwrap();
+            let actual = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &expression,
@@ -643,11 +693,7 @@ mod tests {
                 .execute_mask(array.len(), &mut ctx)
                 .unwrap()
                 .into_array();
-            let actual_canonical = actual
-                .execute::<Canonical>(&mut ctx)
-                .vortex_expect("to_canonical failed")
-                .into_array();
-            assert_arrays_eq!(actual_canonical, expected, &mut ctx);
+            assert_arrays_eq!(actual, expected, &mut ctx);
         })
     }
 
@@ -681,12 +727,14 @@ mod tests {
             let mut ctx = session.create_execution_ctx();
             let (layout, segments) = write_dict_layout(array, &session).await;
             assert_eq!(layout.encoding_id(), LayoutId::new("vortex.dict"));
-            let actual = layout
+            let reader = layout
                 .new_reader("".into(), segments, &session, &Default::default())
-                .unwrap()
+                .unwrap();
+            let expression = byte_length(root()).bind(reader.dtype()).unwrap();
+            let actual = reader
                 .projection_evaluation(
                     &(0..layout.row_count()),
-                    &byte_length(root()),
+                    &expression,
                     MaskFuture::new_true(layout.row_count().try_into().unwrap()),
                 )
                 .unwrap()
@@ -711,28 +759,48 @@ mod tests {
         get_item(format!("_{idx}"), get_item("", root()))
     }
 
-    fn test_apply(original: Expression, outer: Expression, inner: Expression) -> VortexResult<()> {
-        let mut ctx = array_session().create_execution_ctx();
+    fn test_apply(
+        original: Expression,
+        outer: BoundExpression,
+        inner: BoundExpression,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let array = VarBinArray::from_iter(
             [Some("abc"), Some("def"), None],
             DType::Utf8(Nullability::Nullable),
         )
         .into_array();
 
-        let pushed = array.clone().apply(&pack(
-            [(PUSHDOWN_ANNOTATION, inner)],
+        let pushed_expr = bound_pack(
+            [(FieldName::from(PUSHDOWN_ANNOTATION), inner)],
             Nullability::NonNullable,
-        ))?;
-        let actual = pushed.apply(&outer)?;
+        );
+        let pushed = array.clone().apply_bound(&pushed_expr)?;
+        let actual = pushed.apply_bound(&outer)?;
         let expected = array.apply(&original)?;
         assert_arrays_eq!(actual, expected, &mut ctx);
         Ok(())
     }
 
+    fn split_bound(
+        expr: Expression,
+        dtype: &DType,
+    ) -> VortexResult<(BoundExpression, Option<BoundExpression>)> {
+        let bound = expr.bind(dtype)?;
+        split_expression_for_pushdown(&bound)
+    }
+
+    fn pushed_scope(inner: &BoundExpression) -> DType {
+        DType::Struct(
+            StructFields::from_iter([(PUSHDOWN_ANNOTATION, inner.dtype().clone())]),
+            Nullability::NonNullable,
+        )
+    }
+
     #[test]
     fn split_expr_root() {
-        let (outer, inner) = split_expression_for_pushdown(root(), &DType::Null).unwrap();
-        assert_eq!(outer, root());
+        let (outer, inner) = split_bound(root(), &DType::Null).unwrap();
+        assert_eq!(outer, root().bind(&DType::Null).unwrap());
         assert_eq!(inner, None);
     }
 
@@ -741,34 +809,37 @@ mod tests {
         // cast is fallible, thus not pushed
         let target = DType::Primitive(PType::I64, Nullability::Nullable);
         let expr = cast(byte_length(root()), target.clone());
-        let (outer, inner) =
-            split_expression_for_pushdown(expr.clone(), &DType::Utf8(false.into()))?;
+        let dtype = DType::Utf8(false.into());
+        let (outer, inner) = split_bound(expr.clone(), &dtype)?;
         let inner = inner.unwrap();
         // [0] = cast([1], dtype)
         // [1] = byte_length(root)
-        assert_eq!(outer, cast(pushed_ref(0), target));
-        assert_eq!(inner, pushed_inner([byte_length(root())]));
+        assert_eq!(
+            outer,
+            cast(pushed_ref(0), target).bind(&pushed_scope(&inner))?
+        );
+        assert_eq!(inner, pushed_inner([byte_length(root())]).bind(&dtype)?);
         test_apply(expr, outer, inner)
     }
 
     #[test]
     fn split_expr_full_pushdown() -> VortexResult<()> {
         let expr = byte_length(root());
-        let (outer, inner) =
-            split_expression_for_pushdown(expr.clone(), &DType::Utf8(false.into()))?;
+        let dtype = DType::Utf8(false.into());
+        let (outer, inner) = split_bound(expr.clone(), &dtype)?;
         let inner = inner.unwrap();
-        assert_eq!(outer, pushed_ref(0));
-        assert_eq!(inner, pushed_inner([byte_length(root())]));
+        assert_eq!(outer, pushed_ref(0).bind(&pushed_scope(&inner))?);
+        assert_eq!(inner, pushed_inner([byte_length(root())]).bind(&dtype)?);
         test_apply(expr, outer, inner)
     }
 
     #[test]
     fn split_expr_no_pushdown() {
         // like is fallible, thus not pushed. lit() does not reference root()
-        let expr = like(root(), lit(1u64));
-        let (outer, inner) =
-            split_expression_for_pushdown(expr.clone(), &DType::Utf8(true.into())).unwrap();
-        assert_eq!(outer, expr);
+        let expr = like(root(), lit("abc"));
+        let dtype = DType::Utf8(true.into());
+        let (outer, inner) = split_bound(expr.clone(), &dtype).unwrap();
+        assert_eq!(outer, expr.bind(&dtype).unwrap());
         assert_eq!(inner, None);
     }
 }

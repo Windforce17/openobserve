@@ -162,9 +162,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Locate the `.proto` files distributed with `datafusion-proto` and
-/// `datafusion-proto-common` and stage them in
-/// `dest` mirroring the upstream source-tree layout.
+/// Locate the `.proto` files distributed with `datafusion-proto-models`
+/// (DataFusion 56 moved `datafusion.proto` there from `datafusion-proto`) and
+/// `datafusion-proto-common`, and stage them in `dest` under the import paths
+/// our `.proto` files use.
 fn stage_datafusion_proto_files(dest: &Path) {
     let metadata = MetadataCommand::new()
         .exec()
@@ -175,7 +176,7 @@ fn stage_datafusion_proto_files(dest: &Path) {
         "datafusion-proto-common",
         "datafusion_common.proto",
     );
-    let df_proto = find_proto_file(&metadata, "datafusion-proto", "datafusion.proto");
+    let df_proto = find_proto_file(&metadata, "datafusion-proto-models", "datafusion.proto");
 
     stage(
         &common_proto,

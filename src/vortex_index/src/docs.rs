@@ -454,13 +454,13 @@ pub fn docs_type_flips(
     input: &arrow::datatypes::Schema,
     output: &arrow::datatypes::Schema,
 ) -> Vec<DocsTypeFlip> {
-    use vortex::{arrow::FromArrowType, dtype::DType};
+    use vortex::arrow::ArrowSession;
     output
         .fields()
         .iter()
         .filter_map(|field| {
             let theirs = input.field_with_name(field.name()).ok()?;
-            (DType::from_arrow(theirs) != DType::from_arrow(field.as_ref())).then(|| DocsTypeFlip {
+            (!matches!((ArrowSession::default().from_arrow_field(theirs), ArrowSession::default().from_arrow_field(field.as_ref())), (Ok(a), Ok(b)) if a == b)).then(|| DocsTypeFlip {
                 name: field.name().clone(),
                 stored: theirs.data_type().clone(),
                 target: field.data_type().clone(),
@@ -483,8 +483,10 @@ pub fn docs_widen_plan(
     input: &arrow::datatypes::Schema,
     output: &arrow::datatypes::Schema,
 ) -> std::result::Result<DocsWidenPlan, String> {
-    use vortex::{VortexSessionDefault, arrow::FromArrowType, dtype::DType};
-    let out_dtype = DType::from_arrow(output);
+    use vortex::{VortexSessionDefault, arrow::ArrowSession, dtype::DType};
+    let out_dtype = ArrowSession::default()
+        .from_arrow_schema(output)
+        .map_err(|e| format!("output docs schema: {e}"))?;
     let Some(struct_fields) = out_dtype.as_struct_fields_opt() else {
         return Err("output docs schema is not a struct dtype".to_string());
     };
@@ -495,7 +497,10 @@ pub fn docs_widen_plan(
         .iter()
         .map(|field| field.name().clone())
         .collect();
-    let identity = DType::from_arrow(input) == out_dtype;
+    let identity = ArrowSession::default()
+        .from_arrow_schema(input)
+        .map_err(|e| format!("input docs schema: {e}"))?
+        == out_dtype;
     if identity {
         return Ok(DocsWidenPlan {
             mapping: (0..output.fields().len()).map(WidenSource::Move).collect(),
@@ -517,7 +522,9 @@ pub fn docs_widen_plan(
         match input.index_of(field.name()) {
             Ok(index) => {
                 let stored = input.field(index);
-                let theirs = DType::from_arrow(stored);
+                let theirs = ArrowSession::default()
+                    .from_arrow_field(stored)
+                    .map_err(|e| format!("stored docs field {:?}: {e}", stored.name()))?;
                 used += 1;
                 if theirs == dtypes[position] {
                     mapping.push(WidenSource::Move(index));
@@ -611,7 +618,7 @@ impl DocsWidenPlan {
         use vortex::{
             array::{
                 IntoArray,
-                arrays::{ConstantArray, Struct, StructArray, struct_::StructArrayExt},
+                arrays::{ConstantArray, Struct, StructArray, struct_::StructArraySlotsExt},
                 validity::Validity,
             },
             scalar::Scalar,
@@ -623,7 +630,7 @@ impl DocsWidenPlan {
         let sa = chunk.array.as_typed::<Struct>().ok_or_else(|| {
             VixError::Malformed("encoded docs chunk is not a struct array".to_string())
         })?;
-        let input_fields = sa.unmasked_fields();
+        let input_fields = sa.fields();
         if input_fields.len() != self.input_fields {
             return Err(VixError::Malformed(format!(
                 "encoded docs chunk carries {} fields but the widen plan mapped {}",
@@ -677,10 +684,7 @@ impl DocsWidenPlan {
         to: &arrow::datatypes::DataType,
         dtype: &vortex::dtype::DType,
     ) -> Result<vortex::array::ArrayRef> {
-        use vortex::{
-            array::VortexSessionExecute,
-            arrow::{ArrowSessionExt, FromArrowArray},
-        };
+        use vortex::{array::VortexSessionExecute, arrow::ArrowSessionExt};
         let session = self.cast_session.as_ref().ok_or_else(|| {
             VixError::Malformed(format!(
                 "widen plan casts column {name:?} without an execution session"
@@ -699,11 +703,14 @@ impl DocsWidenPlan {
                 "cast docs column {name:?} from {from} to {to} for widening: {e}"
             ))
         })?;
-        vortex::array::ArrayRef::from_arrow(cast.as_ref(), dtype.is_nullable()).map_err(|e| {
-            VixError::Malformed(format!(
-                "re-import cast docs column {name:?} as {dtype}: {e}"
-            ))
-        })
+        session
+            .arrow()
+            .from_arrow_array(cast, dtype.is_nullable())
+            .map_err(|e| {
+                VixError::Malformed(format!(
+                    "re-import cast docs column {name:?} as {dtype}: {e}"
+                ))
+            })
     }
 }
 
@@ -1442,7 +1449,10 @@ impl VixDocs {
         let mut seen = 0usize;
         let column = column.to_string();
         let result = self.scan_docs_encoded_chunks(&mut |chunk| {
-            use vortex::array::arrays::{Struct, struct_::StructArrayExt};
+            use vortex::array::arrays::{
+                Struct,
+                struct_::{StructArrayExt, StructArraySlotsExt},
+            };
             let sa = chunk
                 .array
                 .as_typed::<Struct>()
@@ -1453,7 +1463,7 @@ impl VixDocs {
                 .iter()
                 .position(|n| n.as_ref() == column)
                 .ok_or_else(|| anyhow::anyhow!("column {column:?} missing"))?;
-            let field = &sa.unmasked_fields()[index];
+            let field = &sa.fields()[index];
             let ids: Vec<String> = field
                 .depth_first_traversal()
                 .map(|node| format!("{}({}B)", node.encoding_id(), node.nbytes()))
@@ -1601,11 +1611,15 @@ impl VixDocs {
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let _scope = self.enter_read()?;
-        let selection = rows.map(|mut rows| {
-            rows.sort_unstable();
-            rows.dedup();
-            Selection::IncludeByIndex(Buffer::from(rows))
-        });
+        let selection = rows
+            .map(|mut rows| {
+                rows.sort_unstable();
+                rows.dedup();
+                vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(Buffer::from(rows))
+                    .map(Selection::IncludeByIndex)
+                    .map_err(|e| VixError::Malformed(format!("sorted docs row indices: {e}")))
+            })
+            .transpose()?;
         self.scan_docs_selection_opts(
             projection,
             selection,
@@ -2119,11 +2133,15 @@ impl VixDocs {
         on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
         let _scope = self.enter_read()?;
-        let selection = rows.map(|mut rows| {
-            rows.sort_unstable();
-            rows.dedup();
-            Selection::IncludeByIndex(Buffer::from(rows))
-        });
+        let selection = rows
+            .map(|mut rows| {
+                rows.sort_unstable();
+                rows.dedup();
+                vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(Buffer::from(rows))
+                    .map(Selection::IncludeByIndex)
+                    .map_err(|e| VixError::Malformed(format!("sorted docs row indices: {e}")))
+            })
+            .transpose()?;
         self.scan_docs_ts_desc_merged_selection(
             projection,
             selection,
@@ -2273,7 +2291,14 @@ impl VixDocs {
                         continue;
                     }
                     RegionWork::Selection(
-                        Selection::IncludeByIndex(indices.slice(start..end)),
+                        Selection::IncludeByIndex(
+                            vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(
+                                indices.slice(start..end),
+                            )
+                            .map_err(|e| {
+                                VixError::Malformed(format!("slice sorted region indices: {e}"))
+                            })?,
+                        ),
                         None,
                     )
                 }

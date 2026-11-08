@@ -830,7 +830,7 @@ pub async fn search(
     let union_exec = union_table
         .scan(
             &ctx.state(),
-            empty_exec.projection(),
+            empty_exec.projection().map(Vec::as_slice),
             empty_exec.filters(),
             empty_exec.limit(),
         )

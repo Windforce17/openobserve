@@ -507,7 +507,7 @@ pub async fn save_stream_settings(
     if !metadata.contains_key("created_at") {
         metadata.insert("created_at".to_string(), now_micros().to_string());
     }
-    db::schema::update_setting(org_id, stream_name, stream_type, metadata)
+    db::schema::update_setting(org_id, stream_name, stream_type, metadata.into())
         .await
         .unwrap();
 
@@ -540,7 +540,7 @@ pub async fn save_stream_settings(
                         org_id,
                         &distinct_stream,
                         StreamType::Metadata,
-                        metadata,
+                        metadata.into(),
                     )
                     .await
                     {
@@ -1648,7 +1648,7 @@ mod tests {
                         .to_string(),
                 )]
                 .into_iter()
-                .collect(),
+                .collect::<arrow_schema::Metadata>(),
             );
 
         let stream = stream_res("org1", "http_requests", StreamType::Metrics, schema, None);

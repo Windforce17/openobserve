@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use vortex_array::ArrayRef;
-use vortex_array::ArrayView;
-use vortex_array::IntoArray;
-use vortex_array::dtype::DType;
-use vortex_array::scalar_fn::fns::cast::CastReduce;
-use vortex_array::vtable::child_to_validity;
+use vortex_array::{
+    ArrayRef, ArrayView, IntoArray, dtype::DType, scalar_fn::fns::cast::CastReduce,
+};
 use vortex_error::VortexResult;
 
-use crate::Pco;
-use crate::PcoData;
+use crate::{Pco, PcoArrayExt, PcoData};
 
 impl CastReduce for Pco {
     fn cast(array: ArrayView<'_, Self>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
@@ -28,21 +24,24 @@ impl CastReduce for Pco {
             return Ok(None);
         }
 
-        let unsliced_validity =
-            child_to_validity(array.slots()[0].as_ref(), array.dtype().nullability());
+        let unsliced_validity = array.unsliced_validity();
         let Some(new_validity) =
             unsliced_validity.trivially_cast_nullability(dtype.nullability(), array.len())?
         else {
             return Ok(None);
         };
 
-        let data = PcoData::new(
-            array.chunk_metas.clone(),
-            array.pages.clone(),
-            dtype.as_ptype(),
-            array.metadata.clone(),
-            array.unsliced_n_rows(),
-        )
+        // SAFETY: The buffers and metadata come from a validated Pco array, the primitive type is
+        // unchanged, and `Pco::try_new` validates the adjusted nullability and slice below.
+        let data = unsafe {
+            PcoData::new_unchecked(
+                array.chunk_metas.clone(),
+                array.pages.clone(),
+                dtype.as_ptype(),
+                array.metadata.clone(),
+                array.unsliced_n_rows(),
+            )
+        }
         ._slice(array.slice_start(), array.slice_stop());
 
         Ok(Some(
@@ -56,22 +55,21 @@ mod tests {
     use std::sync::LazyLock;
 
     use rstest::rstest;
-    use vortex_array::IntoArray;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::PrimitiveArray;
-    use vortex_array::assert_arrays_eq;
-    use vortex_array::builtins::ArrayBuiltins;
-    use vortex_array::compute::conformance::cast::test_cast_conformance;
-    use vortex_array::dtype::DType;
-    use vortex_array::dtype::Nullability;
-    use vortex_array::dtype::PType;
-    use vortex_array::validity::Validity;
+    use vortex_array::{
+        IntoArray, VortexSessionExecute,
+        arrays::PrimitiveArray,
+        assert_arrays_eq,
+        builtins::ArrayBuiltins,
+        compute::conformance::cast::test_cast_conformance,
+        dtype::{DType, Nullability, PType},
+        validity::Validity,
+    };
     use vortex_buffer::buffer;
     use vortex_session::VortexSession;
 
     use crate::Pco;
 
-    static SESSION: LazyLock<VortexSession> = LazyLock::new(vortex_array::array_session);
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(VortexSession::empty);
 
     #[test]
     fn test_cast_pco_f32_to_f64() {

@@ -7,7 +7,7 @@
 //! file; after the fix the curve is flat.
 //!
 //! usage: m28_dict_leak <files> <rows_per_file> <cardinality> [mode]
-//!   mode: default   — WriteStrategyBuilder::default() (dict probing ON)
+//!   mode: default   — WriteStrategyBuilder::from_session(&session) (dict probing ON)
 //!         nodict    — same but probe compressor can never pick Dict is not
 //!                     trivially reachable; instead we use a flat-only
 //!                     strategy (bisection control)
@@ -21,6 +21,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
 use arrow::{
     array::{ArrayRef as ArrowArrayRef, Int64Array, StringArray},
     datatypes::{DataType, Field, Schema},
@@ -28,9 +29,9 @@ use arrow::{
 };
 use vortex::{
     VortexSessionDefault,
-    array::{ArrayRef, VortexSessionExecute},
-    arrow::{ArrowSessionExt, FromArrowArray, FromArrowType},
-    dtype::DType,
+    array::VortexSessionExecute,
+    arrow::{ArrowSession, ArrowSessionExt},
+    editions::{CORE_2025_10_0, EditionSessionExt, EnabledEditions},
     file::{VortexWriteOptions, WriteStrategyBuilder},
     io::{
         runtime::{BlockingRuntime, single::SingleThreadRuntime, tokio::TokioRuntime},
@@ -86,19 +87,6 @@ static GLOBAL: CountingSys = CountingSys;
 
 fn live_mb() -> f64 {
     LIVE_BYTES.load(Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x.wrapping_mul(0x2545F4914F6CDD1D)
-    }
 }
 
 /// One file's batch: `rows` rows, utf8 terms with consecutive repetition so
@@ -165,10 +153,12 @@ fn write_one_file_async_static(
     rows: usize,
     card: usize,
     chunk_rows: usize,
-) -> usize {
+) -> anyhow::Result<usize> {
     let batch = make_batch(schema, file_idx, rows, card);
-    let dtype = DType::from_arrow(schema.as_ref());
-    let (tx, mut rx) = std::sync::mpsc::sync_channel::<arrow::record_batch::RecordBatch>(2);
+    let dtype = ArrowSession::default()
+        .from_arrow_schema(schema)
+        .context("import diagnostic schema")?;
+    let (tx, rx) = std::sync::mpsc::sync_channel::<arrow::record_batch::RecordBatch>(2);
     let feeder = std::thread::spawn(move || {
         let rows = batch.num_rows();
         let mut offset = 0usize;
@@ -181,17 +171,24 @@ fn write_one_file_async_static(
     let task = static_rt.spawn_blocking(move || {
         static_rt.handle().block_on(async move {
             let session = VortexSession::default().with_tokio();
-            let strategy = WriteStrategyBuilder::default().build();
+            session.register(EnabledEditions::default());
+            session
+                .enable_edition(CORE_2025_10_0)
+                .context("pin diagnostic write edition")?;
+            let strategy = WriteStrategyBuilder::from_session(&session).build();
             let mut buf: Vec<u8> = Vec::new();
-            let mut writer = VortexWriteOptions::new(session)
+            let mut writer = VortexWriteOptions::new(session.clone())
                 .with_strategy(strategy)
                 .writer(&mut buf, dtype);
             while let Ok(part) = rx.recv() {
-                let chunk = ArrayRef::from_arrow(&part, false).expect("from_arrow");
+                let chunk = session
+                    .arrow()
+                    .from_arrow_record_batch(part.clone(), part.schema().as_ref())
+                    .context("import diagnostic batch")?;
                 writer.push(chunk).await.expect("push");
             }
             writer.finish().await.expect("finish");
-            buf.len()
+            Ok::<_, anyhow::Error>(buf.len())
         })
     });
     let len = static_rt.handle().block_on(task).expect("join");
@@ -207,9 +204,11 @@ fn write_one_file(
     chunk_rows: usize,
     mode: &str,
     shared_pool: Option<&tokio::runtime::Runtime>,
-) -> usize {
+) -> anyhow::Result<usize> {
     let batch = make_batch(schema, file_idx, rows, card);
-    let dtype = DType::from_arrow(schema.as_ref());
+    let dtype = ArrowSession::default()
+        .from_arrow_schema(schema)
+        .context("import diagnostic schema")?;
 
     // mirrors vortex_index::container::write_vortex_blob: a SingleThreadRuntime
     // drives the blocking writer; the SESSION handle is either that runtime
@@ -245,11 +244,15 @@ fn write_one_file(
         }
     };
     let _keep_wrapper_alive = &pool_wrapper;
-    let mut options = VortexWriteOptions::new(session);
+    session.register(EnabledEditions::default());
+    session
+        .enable_edition(CORE_2025_10_0)
+        .context("pin diagnostic write edition")?;
+    let mut options = VortexWriteOptions::new(session.clone());
     if mode == "nodict" {
         options = options.with_strategy(flat_only_strategy());
     } else {
-        options = options.with_strategy(WriteStrategyBuilder::default().build());
+        options = options.with_strategy(WriteStrategyBuilder::from_session(&session).build());
     }
 
     let mut sink: Vec<u8> = Vec::new();
@@ -259,7 +262,10 @@ fn write_one_file(
         while offset < rows {
             let len = chunk_rows.min(rows - offset);
             let part = batch.slice(offset, len);
-            let chunk = ArrayRef::from_arrow(&part, false).expect("from_arrow");
+            let chunk = session
+                .arrow()
+                .from_arrow_record_batch(part.clone(), part.schema().as_ref())
+                .context("import diagnostic batch")?;
             writer.push(chunk).expect("push");
             offset += len;
         }
@@ -315,10 +321,10 @@ fn write_one_file(
         }
         eprintln!("[m28] verify file={file_idx}: rows={scanned_rows} max_value_len={max_len} OK");
     }
-    sink.len()
+    Ok(sink.len())
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let files: usize = args.get(1).map(|s| s.parse().unwrap()).unwrap_or(30);
     let rows: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(131_072);
@@ -356,7 +362,7 @@ fn main() {
                 .expect("static rt")
         });
 
-    let write = |f: usize| -> usize {
+    let write = |f: usize| -> anyhow::Result<usize> {
         if mode == "asyncstatic" {
             write_one_file_async_static(&schema, &STATIC_RT, f, rows, card, chunk_rows)
         } else if mode == "concstatic" {
@@ -393,7 +399,7 @@ fn main() {
 
     // warmup file 0: pay one-time statics (registries, interner, lazylocks)
     let t0 = Instant::now();
-    let bytes = write(0);
+    let bytes = write(0)?;
     let live0 = live_mb();
     eprintln!(
         "[m28] warmup: {bytes}B file, live={live0:.1}MB, {:.2}s",
@@ -402,7 +408,7 @@ fn main() {
 
     let mut prev = live0;
     for f in 1..=files {
-        let bytes = write(f);
+        let bytes = write(f)?;
         let now = live_mb();
         eprintln!(
             "[m28] file={f:03} out={:.1}KB live={now:.1}MB d={:+.2}MB",
@@ -418,4 +424,5 @@ fn main() {
         "[m28] SUMMARY files={files} live0={live0:.1}MB live1={live1:.1}MB d={:.1}MB per_file={per_file:.3}MB mode={mode}",
         live1 - live0
     );
+    Ok(())
 }

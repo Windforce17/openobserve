@@ -13,7 +13,10 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use arrow::array::RecordBatch;
+use arrow::{
+    array::{ArrayData, RecordBatch, layout},
+    error::ArrowError,
+};
 
 use super::json::{Map as JsonMap, Value};
 
@@ -56,15 +59,100 @@ pub fn record_batches_to_json_rows(
     Ok(ret)
 }
 
+/// [`ArrayData::get_slice_memory_size`] without the variadic data buffers of view arrays.
+///
+/// arrow-rs #8230 makes the slice size of a `Utf8View`/`BinaryView` array include the full
+/// capacity of every variadic data buffer it retains, so every slice over a shared backing is
+/// charged the whole backing. Callers that charge the bytes a slice's views reference on their
+/// own use this to keep the slice's own footprint (views, offsets, validity, children).
+pub fn slice_memory_size_without_view_buffers(data: &ArrayData) -> Result<usize, ArrowError> {
+    fn retained_view_buffer_capacity(data: &ArrayData) -> usize {
+        let data_type_layout = layout(data.data_type());
+        let own = if data_type_layout.variadic {
+            data.buffers()
+                .iter()
+                .skip(data_type_layout.buffers.len())
+                .map(|buffer| buffer.capacity())
+                .sum()
+        } else {
+            0
+        };
+        data.child_data()
+            .iter()
+            .fold(own, |sum, child| sum + retained_view_buffer_capacity(child))
+    }
+    let slice = data.get_slice_memory_size()?;
+    let retained = retained_view_buffer_capacity(data);
+    slice.checked_sub(retained).ok_or_else(|| {
+        ArrowError::ComputeError(format!(
+            "slice memory size {slice} of {} array is smaller than its retained view buffer \
+             capacity {retained}",
+            data.data_type()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow::{
-        array::{Int32Array, StringArray, record_batch},
+        array::{Array, Int32Array, ListArray, StringArray, StringViewArray, record_batch},
+        buffer::OffsetBuffer,
         datatypes::{DataType, Field, Schema},
         record_batch::RecordBatch,
     };
 
     use super::*;
+
+    fn long_view_array(rows: usize) -> StringViewArray {
+        let values: Vec<String> = (0..rows)
+            .map(|i| format!("{i:04}{}", "x".repeat(60)))
+            .collect();
+        StringViewArray::from(values.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn view_slice_size_excludes_shared_backing() {
+        let array = long_view_array(1000);
+        let backing: usize = array.data_buffers().iter().map(|b| b.capacity()).sum();
+        assert!(backing >= 1000 * 64);
+        let slice = array.slice(10, 2).to_data();
+        // Two 16-byte views and no validity: the shared backing is not charged to the slice.
+        assert_eq!(
+            slice_memory_size_without_view_buffers(&slice).unwrap(),
+            2 * 16
+        );
+        assert!(slice.get_slice_memory_size().unwrap() >= backing);
+    }
+
+    #[test]
+    fn nested_view_backing_is_excluded() {
+        let child = long_view_array(100);
+        let backing: usize = child.data_buffers().iter().map(|b| b.capacity()).sum();
+        let list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8View, true)),
+            OffsetBuffer::from_lengths([40, 60]),
+            Arc::new(child),
+            None,
+        );
+        let data = list.to_data();
+        let full = data.get_slice_memory_size().unwrap();
+        assert_eq!(
+            slice_memory_size_without_view_buffers(&data).unwrap(),
+            full - backing
+        );
+    }
+
+    #[test]
+    fn non_view_slice_size_is_unchanged() {
+        let array = StringArray::from(vec![Some("alpha"), None, Some("gamma")]);
+        let data = array.slice(1, 2).to_data();
+        assert_eq!(
+            slice_memory_size_without_view_buffers(&data).unwrap(),
+            data.get_slice_memory_size().unwrap()
+        );
+    }
 
     fn create_test_batch() -> RecordBatch {
         record_batch!(

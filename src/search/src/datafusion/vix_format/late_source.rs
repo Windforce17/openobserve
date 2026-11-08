@@ -28,6 +28,10 @@ pub(super) struct LateSourcePredicate {
 }
 
 impl LateSourcePredicate {
+    pub(super) fn expression(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.expr
+    }
+
     pub(super) fn try_new(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Result<Option<Self>> {
         if !supported(expr, &mut 128) {
             return Ok(None);
@@ -174,4 +178,62 @@ fn supported(expr: &Arc<dyn PhysicalExpr>, remaining: &mut usize) -> bool {
             .children()
             .iter()
             .all(|child| supported(child, remaining))
+}
+
+#[cfg(test)]
+mod expression_visit_tests {
+    use datafusion::{
+        common::tree_node::{TreeNode, TreeNodeRecursion},
+        execution::object_store::ObjectStoreUrl,
+        physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit},
+        physical_plan::execution_plan::plan_contains_expression_id,
+    };
+
+    use super::*;
+
+    #[test]
+    fn apply_expressions_reports_projection_and_late_dynamic_predicate() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("projected", DataType::Int64, false),
+            Field::new("predicate_only", DataType::Int64, false),
+        ]));
+        let column = col("predicate_only", &schema)?;
+        let dynamic: Arc<dyn PhysicalExpr> =
+            Arc::new(DynamicFilterPhysicalExpr::new(vec![column], lit(true)));
+        let id = dynamic.expression_id().expect("dynamic filter has an id");
+        let mut source = VixCoreSource::new(TableSchema::from(Arc::clone(&schema)), None);
+        // Any retained expression must be visible, including dynamic filters.
+        // try_new currently declines dynamic inputs; inject one to pin the
+        // traversal contract independently of the predicate admission policy.
+        source.late_source_predicate = Some(LateSourcePredicate {
+            expr: dynamic,
+            schema: Arc::clone(&schema),
+        });
+        let mut columns = Vec::new();
+        source.apply_expressions(&mut |root| {
+            root.apply(|expr| {
+                if let Some(column) = expr.downcast_ref::<Column>() {
+                    columns.push(column.name().to_string());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        assert!(columns.iter().any(|name| name == "projected"));
+        assert!(
+            columns
+                .iter()
+                .filter(|name| *name == "predicate_only")
+                .count()
+                >= 2
+        );
+        assert_eq!(
+            source.apply_expressions(&mut |_| Ok(TreeNodeRecursion::Stop))?,
+            TreeNodeRecursion::Stop
+        );
+        let conf = FileScanConfigBuilder::new(ObjectStoreUrl::local_filesystem(), Arc::new(source))
+            .build();
+        let plan: Arc<dyn ExecutionPlan> = DataSourceExec::from_data_source(conf);
+        assert!(plan_contains_expression_id(&plan, id)?);
+        Ok(())
+    }
 }

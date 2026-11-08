@@ -34,8 +34,7 @@ use futures::TryStreamExt;
 use vortex::{
     VortexSessionDefault,
     array::ArrayRef,
-    arrow::{FromArrowArray, FromArrowType},
-    dtype::DType,
+    arrow::ArrowSessionExt,
     file::{VortexWriteOptions, WriteStrategyBuilder},
     io::session::RuntimeSessionExt,
     session::VortexSession,
@@ -45,7 +44,7 @@ use crate::datafusion::{
     exec::DataFusionContextBuilder,
     merge::{MergeParquetResult, append_metadata},
     table_provider::uniontable::NewUnionTable,
-    vortex_support::{Utf8Compressor, VORTEX_RUNTIME},
+    vortex_support::{Utf8Compressor, VORTEX_RUNTIME, legacy_write_session},
 };
 
 const TIMESTAMP_ALIAS: &str = "_timestamp_alias";
@@ -217,13 +216,18 @@ async fn write_downsampled_vortex(
             let mut file_meta = FileMeta::default();
             let mut last_min_ts = 0;
 
-            let session = VortexSession::default()
-                .with_handle(vortex_index::shared_vortex_execution_handle()?);
-            let dtype = DType::from_arrow(schema.as_ref());
+            let session = legacy_write_session(
+                VortexSession::default()
+                    .with_handle(vortex_index::shared_vortex_execution_handle()?),
+            )?;
+            let dtype = session
+                .arrow()
+                .from_arrow_schema(schema.as_ref())
+                .map_err(|e| DataFusionError::Execution(format!("Vortex schema import: {e}")))?;
 
             // Helper to create write options - need to recreate for each writer
-            let strategy = WriteStrategyBuilder::default()
-                .with_compressor(Utf8Compressor::default())
+            let strategy = WriteStrategyBuilder::from_session(&session)
+                .with_compressor(Utf8Compressor::from_session(&session))
                 .build();
 
             let write_options =
@@ -262,11 +266,14 @@ async fn write_downsampled_vortex(
                 last_min_ts = get_min_timestamp(&batch_result);
 
                 // Write batch to current file (convert to Vortex array)
-                let array: ArrayRef = ArrayRef::from_arrow(batch_result, false).map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "Failed to convert arrow array to vortex array: {e}"
-                    ))
-                })?;
+                let array: ArrayRef = session
+                    .arrow()
+                    .from_arrow_record_batch(batch_result, schema.as_ref())
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "Failed to convert arrow array to vortex array: {e}"
+                        ))
+                    })?;
                 writer.push(array).await?;
             }
 

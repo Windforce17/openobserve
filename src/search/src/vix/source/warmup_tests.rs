@@ -21,8 +21,40 @@ use object_store::{
 use super::*;
 use crate::vix::{WarmFileOutcome, warm_file_outcome};
 
+// These assertions intentionally observe the real process-wide admission gates.
+// Other vix tests also acquire them, so a module mutex cannot isolate the deltas.
+// Re-execute just this test in a child process rather than weakening the checks
+// or substituting mock permits for the production read/evaluation path.
+fn run_isolated(name: &str) -> bool {
+    const MARKER: &str = "OO_WARMUP_ISOLATED_TEST";
+    let full_name = format!("vix::source::warmup_tests::{name}");
+    if std::env::var(MARKER).as_deref() == Ok(full_name.as_str()) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            full_name.as_str(),
+            "--exact",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(MARKER, &full_name)
+        .output()
+        .expect("run isolated warmup test process");
+    assert!(
+        output.status.success(),
+        "isolated {full_name} failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warm_file_cancel_releases_real_read_and_evaluation_permits() {
+    if run_isolated("warm_file_cancel_releases_real_read_and_evaluation_permits") {
+        return;
+    }
     assert!(config::is_local_disk_storage());
     let org = "warmup-cancel-fixture";
     let account = format!("{org}:default");
@@ -79,6 +111,9 @@ async fn warm_file_cancel_releases_real_read_and_evaluation_permits() {
 
 #[tokio::test]
 async fn warm_file_busy_does_not_queue_for_evaluation_slots() {
+    if run_isolated("warm_file_busy_does_not_queue_for_evaluation_slots") {
+        return;
+    }
     let available = EVAL_COUNT.available_permits();
     let held = Arc::clone(&EVAL_COUNT)
         .acquire_many_owned(available as u32)

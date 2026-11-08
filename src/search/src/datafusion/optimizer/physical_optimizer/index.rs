@@ -720,7 +720,7 @@ mod tests {
         let child: Arc<dyn ExecutionPlan> = Arc::new(NewEmptyExec::new(
             "default",
             schema,
-            Some(&vec![0usize, 1, 2]),
+            Some(&[0usize, 1, 2]),
             &filters,
             None,
             false,
@@ -1336,26 +1336,17 @@ mod tests {
                     )],
                 }),
             ),
-            // DataFusion rewrites small IN lists to OR chains at plan time;
-            // each equality leaf expands independently (larger lists stay
-            // InListExpr and take the multi-value NumericCmp arm)
+            // DF56 retains short numeric literal IN lists (ShortenInListSimplifier).
+            // The multi-value NumericCmp arm must still extract every value.
             (
                 "SELECT count(*) from t where code in (38, 40)",
                 Some(IndexCondition {
-                    conditions: vec![Condition::Or(vec![
-                        Condition::NumericCmp(
-                            "code".to_string(),
-                            vec!["38".to_string()],
-                            false,
-                            NumericKind::Int,
-                        ),
-                        Condition::NumericCmp(
-                            "code".to_string(),
-                            vec!["40".to_string()],
-                            false,
-                            NumericKind::Int,
-                        ),
-                    ])],
+                    conditions: vec![Condition::NumericCmp(
+                        "code".to_string(),
+                        vec!["38".to_string(), "40".to_string()],
+                        false,
+                        NumericKind::Int,
+                    )],
                 }),
             ),
             // DataFusion simplifies `ok = true` to the BARE column and

@@ -161,7 +161,7 @@ mod tests {
     use config::meta::stream::FileMeta;
     use config::meta::stream::{FileKey, StreamType};
     use datafusion::{
-        common::Result,
+        common::{Result, TableReference},
         functions_aggregate::count::count_udaf,
         physical_expr::aggregate::AggregateExprBuilder,
         physical_plan::{
@@ -171,7 +171,6 @@ mod tests {
             expressions::lit,
             union::UnionExec,
         },
-        sql::TableReference,
     };
 
     use super::*;

@@ -2211,8 +2211,10 @@ impl VixWriter {
         folder.append_spliced(zone_entries, spliced_stats, run_regions);
         self.track_ts_bounds(ts_min, ts_max);
         let dtype = {
-            use vortex::arrow::FromArrowType;
-            vortex::dtype::DType::from_arrow(self.docs_schema.as_ref())
+            use vortex::arrow::ArrowSession;
+            ArrowSession::default()
+                .from_arrow_schema(self.docs_schema.as_ref())
+                .map_err(|e| VixError::Writer(format!("encoded run docs schema: {e}")))?
         };
         self.encoded_run = Some(EncodedRunState {
             dtype,
@@ -4735,8 +4737,16 @@ impl ZoneMapFolder {
 /// are equal hold interchangeable encoded chunks, which is exactly the
 /// passthrough requirement.
 pub fn docs_schema_mismatch_reason(input: &Schema, output: &Schema) -> Option<String> {
-    use vortex::{arrow::FromArrowType, dtype::DType};
-    if DType::from_arrow(input) == DType::from_arrow(output) {
+    use vortex::arrow::ArrowSession;
+    let arrow = ArrowSession::default();
+    let (input_dtype, output_dtype) = match (
+        arrow.from_arrow_schema(input),
+        arrow.from_arrow_schema(output),
+    ) {
+        (Ok(a), Ok(b)) => (a, b),
+        (Err(e), _) | (_, Err(e)) => return Some(format!("docs schema conversion: {e}")),
+    };
+    if input_dtype == output_dtype {
         return None;
     }
     if input.fields().len() != output.fields().len() {
@@ -4749,7 +4759,7 @@ pub fn docs_schema_mismatch_reason(input: &Schema, output: &Schema) -> Option<St
     }
     for (theirs, ours) in input.fields().iter().zip(output.fields()) {
         if theirs.name() != ours.name()
-            || DType::from_arrow(theirs.as_ref()) != DType::from_arrow(ours.as_ref())
+            || !matches!((arrow.from_arrow_field(theirs), arrow.from_arrow_field(ours)), (Ok(a), Ok(b)) if a == b)
         {
             return Some(format!(
                 "docs column {:?} ({}, nullable {}) does not match the output column {:?} \

@@ -25,6 +25,7 @@ use arrow::{
 };
 use bytes::Bytes;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use vortex::layout::arrays::shared::Shared;
 
 use crate::{VixQuery, VixReader, VixWriter, VixWriterOptions};
 
@@ -4185,14 +4186,19 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
         vec![3, 3, 1]
     );
     assert_eq!(docs.eq_string_count("svc", "hit", None).unwrap(), Some(7));
-    assert_eq!(docs.eq_string_count("svc", "absent", None).unwrap(), Some(0));
+    assert_eq!(
+        docs.eq_string_count("svc", "absent", None).unwrap(),
+        Some(0)
+    );
     // Same half-open clamp as the top-n/histogram paths: 103 in, 109 out.
     assert_eq!(
-        docs.eq_string_count("svc", "hit", Some((103, 109))).unwrap(),
+        docs.eq_string_count("svc", "hit", Some((103, 109)))
+            .unwrap(),
         Some(4)
     );
     assert_eq!(
-        docs.eq_string_count("svc", "hit", Some((109, 109))).unwrap(),
+        docs.eq_string_count("svc", "hit", Some((109, 109)))
+            .unwrap(),
         Some(0),
         "an empty clamp counts nothing"
     );
@@ -4220,7 +4226,11 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
-    assert!(docs.eq_string_count("missing", "hit", None).unwrap().is_none());
+    assert!(
+        docs.eq_string_count("missing", "hit", None)
+            .unwrap()
+            .is_none()
+    );
     assert!(
         docs.eq_string_top_n("_timestamp", "107", None, 3, false)
             .unwrap()
@@ -4231,7 +4241,11 @@ fn vix_docs_broad_string_equality_aggregates_are_exact() {
             .unwrap()
             .is_none()
     );
-    assert!(docs.eq_string_count("_timestamp", "107", None).unwrap().is_none());
+    assert!(
+        docs.eq_string_count("_timestamp", "107", None)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -4338,7 +4352,7 @@ fn docs_blob_zstd_beats_round1_by_4x() {
     let round1 = crate::container::write_vortex_blob(
         &docs_schema,
         &[docs_batch],
-        crate::container::compressed_strategy(128 * 1024),
+        crate::container::compressed_strategy(128 * 1024).unwrap(),
         1,
     )
     .unwrap();
@@ -4464,14 +4478,6 @@ mod ranged {
                 .lock()
                 .iter()
                 .any(|read| read.start < range.end && range.start < read.end)
-        }
-
-        /// Whether a single recorded fetch covers `range` entirely.
-        fn read_ranges_cover(&self, range: Range<u64>) -> bool {
-            self.ranges
-                .lock()
-                .iter()
-                .any(|read| read.start <= range.start && range.end <= read.end)
         }
 
         /// Whether exactly one recorded fetch covers `range` entirely.
@@ -5811,7 +5817,8 @@ mod ranged {
             VixDocs::open_ranged_data_only(Arc::clone(&count_source) as Arc<dyn VixRangeSource>)
                 .unwrap();
         let count_open_bytes = count_source.bytes();
-        let count = count_docs.eq_string_count("level", "info", None)
+        let count = count_docs
+            .eq_string_count("level", "info", None)
             .unwrap()
             .unwrap();
         let count_scan_bytes = count_source.bytes() - count_open_bytes;
@@ -7074,10 +7081,11 @@ fn bench_real_vix_file() {
         let runtime = SingleThreadRuntime::default();
         let session = VortexSession::default().with_handle(runtime.handle());
         let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
-        let scan = vxf
-            .scan()
-            .unwrap()
-            .with_projection(select(vec!["kubernetes_namespace_name"], root()));
+        let scan = vxf.scan().unwrap().with_projection(
+            select(vec!["kubernetes_namespace_name"], root())
+                .bind(vxf.dtype())
+                .unwrap(),
+        );
         fn dump(prefix: &str, name: &str, array: &vortex::array::ArrayRef, depth: usize) {
             if depth > 6 {
                 return;
@@ -13847,7 +13855,7 @@ fn m12_unwrap_shared_strips_dict_reader_wrappers() {
         array::{
             IntoArray,
             arrays::{
-                Dict, DictArray, PrimitiveArray, SharedArray, StructArray,
+                Dict, DictArray, PrimitiveArray, StructArray,
                 dict::{DictArrayExt, DictArraySlotsExt},
             },
             validity::Validity,
@@ -13867,7 +13875,7 @@ fn m12_unwrap_shared_strips_dict_reader_wrappers() {
 
     // a bare Shared wrapper unwraps to its SOURCE (stored form, not the
     // canonical cache)
-    let bare = SharedArray::new(values.clone()).into_array();
+    let bare = Shared::new(values.clone()).into_array();
     assert!(contains_shared(&bare));
     let clean = unwrap_shared(&bare).expect("bare Shared must unwrap");
     assert!(!contains_shared(&clean));
@@ -13878,7 +13886,7 @@ fn m12_unwrap_shared_strips_dict_reader_wrappers() {
     // reader's projection output. SAFETY of the fixture: codes 0/1/2 all
     // reference the 3 values, so the asserted flag is true in fact.
     let wrapped = unsafe {
-        DictArray::new_unchecked(codes.clone(), SharedArray::new(values.clone()).into_array())
+        DictArray::new_unchecked(codes.clone(), Shared::new(values.clone()).into_array())
             .set_all_values_referenced(true)
     }
     .into_array();
@@ -13903,7 +13911,7 @@ fn m12_unwrap_shared_strips_dict_reader_wrappers() {
     let names: vortex::dtype::FieldNames = vec![vortex::dtype::FieldName::from("inner")].into();
     let nested = StructArray::try_new(
         names,
-        vec![SharedArray::new(values.clone()).into_array()],
+        vec![Shared::new(values.clone()).into_array()],
         3,
         Validity::NonNullable,
     )
@@ -14179,9 +14187,9 @@ fn m25_sparse_column_copy_does_not_bloat() {
     let mut mixed = 0usize;
     input
         .scan_docs_encoded_chunks(&mut |chunk| {
-            use vortex::array::arrays::{Struct, struct_::StructArrayExt};
+            use vortex::array::arrays::{Struct, struct_::StructArraySlotsExt};
             let sa = chunk.array.as_typed::<Struct>().unwrap().clone();
-            for field in sa.unmasked_fields().iter() {
+            for field in sa.fields().iter() {
                 if crate::container::is_decoded_root(field)
                     && !crate::container::is_decoded_family(field)
                 {
@@ -14335,8 +14343,15 @@ fn m12_probe_prod_shared_wrapper() {
     let session = VortexSession::default().with_handle(runtime.handle());
     let vxf = session.open_options().open_buffer(docs_bytes).unwrap();
     let scan = vxf.scan().unwrap();
-    let write_ctx =
-        ArrayContext::new(Vec::new()).with_registry(session.arrays().registry().clone());
+    let write_ctx = ArrayContext::new(Vec::new()).with_allowed_ids(
+        session
+            .arrays()
+            .registry()
+            .snapshot()
+            .keys()
+            .copied()
+            .collect(),
+    );
     let (mut raw_chunks, mut raw_shared, mut raw_dict, mut serialize_errors) = (0, 0, 0, 0);
     let mut first_error = String::new();
     for array in scan.into_array_iter(&runtime).unwrap() {
@@ -14999,7 +15014,10 @@ fn m17_bloom_encoded_scan_byte_equality() {
         VortexSessionDefault,
         array::{
             IntoArray, VortexSessionExecute,
-            arrays::{Struct, StructArray as VStructArray, struct_::StructArrayExt},
+            arrays::{
+                Struct, StructArray as VStructArray,
+                struct_::{StructArrayExt, StructArraySlotsExt},
+            },
             validity::Validity,
         },
         encodings::fsst::{fsst_compress, fsst_train_compressor},
@@ -15119,7 +15137,7 @@ fn m17_bloom_encoded_scan_byte_equality() {
             let names = sa.names().clone();
             let rows = chunk.rows();
             let fields: Vec<vortex::array::ArrayRef> = sa
-                .unmasked_fields()
+                .fields()
                 .iter()
                 .enumerate()
                 .map(|(index, field)| {
@@ -15381,7 +15399,7 @@ fn m18_runend_slice_keeps_wrapper_the_write_ctx_rejects() {
         session
             .arrays()
             .registry()
-            .find(&sliced.encoding_id())
+            .get(&sliced.encoding_id())
             .is_none(),
         "vortex.slice is not in the session array registry — interning it fails with \
          'not permitted by ctx'"
@@ -15603,9 +15621,8 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
             arrays::{PrimitiveArray, SliceArray, StructArray},
             validity::Validity,
         },
-        arrow::{FromArrowArray, FromArrowType},
+        arrow::ArrowSessionExt,
         buffer::Buffer,
-        dtype::DType,
         encodings::runend::RunEnd,
         session::VortexSession,
     };
@@ -15633,11 +15650,10 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
     let mut ctx = session.create_execution_ctx();
     let ends: Vec<u32> = (1..=nruns as u32).map(|i| i * 8).collect();
     let ends = PrimitiveArray::new(Buffer::copy_from(ends), Validity::NonNullable).into_array();
-    let values = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
-        &Int64Array::from(run_values.clone()),
-        true,
-    )
-    .unwrap();
+    let values = session
+        .arrow()
+        .from_arrow_array(Arc::new(Int64Array::from(run_values.clone())), true)
+        .unwrap();
     let runend = RunEnd::new(ends, values, &mut ctx).into_array();
     assert!(
         runend.nbytes() > crate::clustered::COALESCE_MAX_ENCODED_BYTES,
@@ -15657,16 +15673,14 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
     ]
     .into();
     let build_chunk = |status_field: vortex::array::ArrayRef| -> vortex::array::ArrayRef {
-        let ts_field = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
-            &Int64Array::from(ts.clone()),
-            false,
-        )
-        .unwrap();
-        let src_field = <vortex::array::ArrayRef as FromArrowArray<_>>::from_arrow(
-            &StringArray::from(source.clone()),
-            false,
-        )
-        .unwrap();
+        let ts_field = session
+            .arrow()
+            .from_arrow_array(Arc::new(Int64Array::from(ts.clone())), false)
+            .unwrap();
+        let src_field = session
+            .arrow()
+            .from_arrow_array(Arc::new(StringArray::from(source.clone())), false)
+            .unwrap();
         StructArray::try_new(
             names.clone(),
             vec![ts_field, status_field, src_field],
@@ -15679,7 +15693,10 @@ fn m18_writer_failopen_reencodes_slice_wrapped_chunk() {
 
     let copy = |status_field: vortex::array::ArrayRef| -> (u64, Vec<u8>) {
         let chunk = build_chunk(status_field);
-        assert_eq!(chunk.dtype(), &DType::from_arrow(&docs_schema));
+        assert_eq!(
+            chunk.dtype(),
+            &session.arrow().from_arrow_schema(&docs_schema).unwrap()
+        );
         let mut writer = VixWriter::new(
             &schema,
             VixWriterOptions {

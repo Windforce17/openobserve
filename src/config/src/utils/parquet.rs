@@ -37,7 +37,7 @@ use parquet::{
 use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, VortexSessionExecute},
-    arrow::{ArrowSessionExt, ToArrowType},
+    arrow::ArrowSessionExt,
     buffer::Buffer,
     file::OpenOptionsSessionExt,
     io::session::RuntimeSessionExt,
@@ -99,7 +99,7 @@ pub fn new_parquet_writer<'a>(
             writer_props = writer_props
                 .set_column_bloom_filter_enabled(field.as_str().into(), true)
                 .set_column_bloom_filter_fpp(field.as_str().into(), DEFAULT_BLOOM_FILTER_FPP)
-                .set_column_bloom_filter_ndv(field.into(), bf_ndv); // take the field ownership
+                .set_column_bloom_filter_max_ndv(field.into(), bf_ndv); // take the field ownership
         }
     }
     let writer_props = writer_props.build();
@@ -180,7 +180,7 @@ pub async fn get_recordbatch_reader_from_bytes(
             let session = VortexSession::default().with_tokio();
             let buf = Buffer::from(data.to_vec());
             let vxf = session.open_options().open_buffer(buf)?;
-            let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+            let schema = Arc::new(session.arrow().to_arrow_schema(vxf.dtype())?);
             let arrow_data_type = DataType::Struct(schema.fields().clone());
             let vortex_stream = vxf.scan()?.into_array_stream()?;
 
@@ -208,7 +208,7 @@ pub async fn get_recordbatch_reader_from_bytes(
             let docs = super::vix::docs_blob_from_vix_bytes(&data)?;
             let session = VortexSession::default().with_tokio();
             let vxf = session.open_options().open_buffer(docs)?;
-            let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+            let schema = Arc::new(session.arrow().to_arrow_schema(vxf.dtype())?);
             let arrow_data_type = DataType::Struct(schema.fields().clone());
             let vortex_stream = vxf.scan()?.into_array_stream()?;
 
@@ -251,7 +251,7 @@ pub async fn read_schema_from_file(path: &PathBuf) -> Result<Arc<Schema>, anyhow
             // Read vortex file
             let session = VortexSession::default().with_tokio();
             let vxf = session.open_options().open_path(path.clone()).await?;
-            let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+            let schema = Arc::new(session.arrow().to_arrow_schema(vxf.dtype())?);
             Ok(schema)
         }
         // a core .vix file must never fall into the parquet default below:
@@ -284,7 +284,7 @@ pub async fn read_schema_from_bytes(
             let session = VortexSession::default().with_tokio();
             let buf = Buffer::from(data.to_vec());
             let vxf = session.open_options().open_buffer(buf)?;
-            let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+            let schema = Arc::new(session.arrow().to_arrow_schema(vxf.dtype())?);
             Ok(schema)
         }
         FileFormat::Vix => {
@@ -292,7 +292,7 @@ pub async fn read_schema_from_bytes(
             let docs = super::vix::docs_blob_from_vix_bytes(data)?;
             let session = VortexSession::default().with_tokio();
             let vxf = session.open_options().open_buffer(docs)?;
-            let schema = Arc::new(vxf.dtype().to_arrow_schema()?);
+            let schema = Arc::new(session.arrow().to_arrow_schema(vxf.dtype())?);
             Ok(schema)
         }
     }
@@ -505,7 +505,7 @@ mod tests {
         let read_schema = read_schema
             .as_ref()
             .clone()
-            .with_metadata(Default::default());
+            .with_metadata(arrow_schema::Metadata::default());
         assert_eq!(Arc::new(read_schema), schema);
         assert_eq!(read_batches.len(), 1);
         assert_eq!(read_batches[0], batch);

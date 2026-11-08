@@ -1395,6 +1395,7 @@ mod tests {
     fn synthetic_get_result(chunks: Vec<Bytes>, header_size: u64) -> GetResult {
         let stream = futures::stream::iter(chunks.into_iter().map(Ok));
         GetResult {
+            extensions: Default::default(),
             payload: object_store::GetResultPayload::Stream(Box::pin(stream)),
             meta: object_store::ObjectMeta {
                 location: object_store::path::Path::from("synthetic"),

@@ -308,15 +308,18 @@ async fn context_order(
         .build()
         .unwrap();
     let state = SessionStateBuilder::new()
-        .with_config(SessionConfig::new().with_target_partitions(1))
+        .with_config(
+            SessionConfig::new()
+                .with_target_partitions(1)
+                .with_collect_statistics(false),
+        )
         .with_runtime_env(Arc::new(runtime))
         .with_default_features()
         .build();
     let ctx = SessionContext::new_with_state(state);
     let mut options = ListingOptions::new(Arc::new(
         VixCoreFormat::new(None).with_ordered_output(ordered),
-    ))
-    .with_collect_stat(false);
+    ));
     if ordered {
         options = options.with_file_sort_order(vec![vec![
             datafusion::prelude::col(TIMESTAMP_COL_NAME).sort(false, false),

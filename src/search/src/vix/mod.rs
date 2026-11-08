@@ -5926,7 +5926,7 @@ mod tests {
             Arc::new(crate::types::QueryParams {
                 trace_id: trace.to_string(),
                 org_id: "org".to_string(),
-                stream: datafusion::sql::TableReference::from("t"),
+                stream: datafusion::common::TableReference::from("t"),
                 stream_type: StreamType::Logs,
                 stream_name: "t".to_string(),
                 time_range: (0, 10_000),
@@ -6003,7 +6003,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: trace_prefix.to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (0, 2000),
@@ -6060,7 +6060,7 @@ mod tests {
             let params = Arc::new(crate::types::QueryParams {
                 trace_id: trace_id.to_string(),
                 org_id: "org".to_string(),
-                stream: datafusion::sql::TableReference::from("t"),
+                stream: datafusion::common::TableReference::from("t"),
                 stream_type: StreamType::Logs,
                 stream_name: "t".to_string(),
                 time_range: (0, 2_000),
@@ -6106,7 +6106,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "native-histogram".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6158,7 +6158,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "native-histogram-one-bucket".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (800, 1_500),
@@ -6212,7 +6212,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "native-count-clamp".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (800, 1_951),
@@ -6269,7 +6269,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "all-histogram-metadata".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6341,7 +6341,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "all-histogram-current-hour-scale".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (ORIGIN, ORIGIN + WIDTH as i64 * BUCKETS as i64),
@@ -6401,7 +6401,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "all-histogram-zone".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6454,7 +6454,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "all-indexed-histogram-zone".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6576,7 +6576,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "cold-indexed-native-histogram".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6737,7 +6737,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: trace_id.to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -6901,7 +6901,7 @@ mod tests {
         let params = Arc::new(crate::types::QueryParams {
             trace_id: "all-multi-zero-offset-outer".to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (990, 1_010),
@@ -7020,7 +7020,7 @@ mod tests {
             let params = Arc::new(crate::types::QueryParams {
                 trace_id: format!("native-equality-{field}-{needle}"),
                 org_id: "org".to_string(),
-                stream: datafusion::sql::TableReference::from("t"),
+                stream: datafusion::common::TableReference::from("t"),
                 stream_type: StreamType::Logs,
                 stream_name: "t".to_string(),
                 time_range: (990, 1_010),
@@ -7065,8 +7065,11 @@ mod tests {
                     .await
                     .unwrap();
             }
-            let ctx =
-                SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new()
+                    .with_collect_statistics(true)
+                    .with_target_partitions(1),
+            );
             ctx.register_object_store(&url::Url::parse("test:///").unwrap(), store);
             let schema = Arc::new(Schema::new(vec![
                 Field::new("_timestamp", DataType::Int64, false),
@@ -7074,9 +7077,7 @@ mod tests {
                 Field::new("ghost", DataType::Utf8, true),
             ]));
             let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/").unwrap())
-                .with_listing_options(
-                    ListingOptions::new(Arc::new(VixCoreFormat::new(None))).with_collect_stat(true),
-                )
+                .with_listing_options(ListingOptions::new(Arc::new(VixCoreFormat::new(None))))
                 .with_schema(schema);
             ctx.register_table("t", Arc::new(ListingTable::try_new(config).unwrap()))
                 .unwrap();
@@ -9350,7 +9351,7 @@ mod review_tests {
         Arc::new(crate::types::QueryParams {
             trace_id: trace_id.to_string(),
             org_id: "org".to_string(),
-            stream: datafusion::sql::TableReference::from("t"),
+            stream: datafusion::common::TableReference::from("t"),
             stream_type: config::meta::stream::StreamType::Logs,
             stream_name: "t".to_string(),
             time_range: (0, 2000),

@@ -122,6 +122,30 @@ impl DisplayAs for IndexOptimizeExec {
 }
 
 impl ExecutionPlan for IndexOptimizeExec {
+    // Still required by DF56; callers use replace_children.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "IndexOptimizeExec"
     }
@@ -134,9 +158,10 @@ impl ExecutionPlan for IndexOptimizeExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::execution_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }
@@ -715,7 +740,7 @@ mod tests {
     use arrow::array::{BooleanArray, Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use config::meta::stream::{FileMeta, StreamType};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::*;
 
@@ -820,7 +845,12 @@ mod tests {
             IndexOptimizeMode::SimpleCount,
         ));
 
-        let result = exec.with_new_children(vec![]);
+        let result = exec.replace_children(
+            vec![],
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        );
         assert!(result.is_ok());
         let new_exec = result.unwrap();
         assert_eq!(new_exec.name(), "IndexOptimizeExec");
@@ -836,7 +866,8 @@ mod tests {
             IndexOptimizeMode::SimpleCount,
         );
 
-        let stats = exec.partition_statistics(None);
+        let stats = datafusion::physical_plan::StatisticsContext::new()
+            .compute(&exec, &datafusion::physical_plan::StatisticsArgs::new());
         assert!(stats.is_ok());
         let stats = stats.unwrap();
         assert!(matches!(

@@ -147,6 +147,7 @@ pub fn proto_node_to_config(node: NodeDetails) -> ConfigNode {
         broadcasted: node.broadcasted,
         version: node.version,
         metrics,
+        query_engine_generation: None,
     }
 }
 
@@ -252,6 +253,7 @@ mod tests {
             broadcasted: true,
             version: "1.0.0".to_string(),
             metrics: NodeMetrics::default(),
+            query_engine_generation: None,
         };
 
         let proto_node = config_node_to_proto(config_node);
@@ -313,6 +315,7 @@ mod tests {
             broadcasted: false,
             version: "".to_string(),
             metrics: NodeMetrics::default(),
+            query_engine_generation: None,
         };
         let proto = config_node_to_proto(node);
         assert_eq!(proto.roles.len(), 5);
@@ -336,6 +339,7 @@ mod tests {
             broadcasted: false,
             version: "".to_string(),
             metrics: NodeMetrics::default(),
+            query_engine_generation: None,
         };
         let proto = config_node_to_proto(node);
         assert_eq!(proto.role_group, ProtoRoleGroup::Background as i32);

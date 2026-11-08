@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use vortex_array::ArrayRef;
+use vortex_array::Columnar;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::aggregate_fn::AggregateFnRef;
@@ -16,35 +18,33 @@ use vortex_array::aggregate_fn::fns::all_non_null::AllNonNull;
 use vortex_array::aggregate_fn::fns::all_null::AllNull;
 use vortex_array::aggregate_fn::fns::bounded_max::BOUNDED_MAX_BOUND;
 use vortex_array::aggregate_fn::fns::bounded_max::BoundedMax;
-use vortex_array::aggregate_fn::fns::nan_count::NanCount;
+use vortex_array::arrays::BoolArray;
 use vortex_array::arrays::ConstantArray;
 use vortex_array::arrays::PrimitiveArray;
+use vortex_array::arrays::RunEnd;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
+use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
 use vortex_array::expr::eq;
 use vortex_array::expr::get_item;
-use vortex_array::expr::is_root;
 use vortex_array::expr::lit;
 use vortex_array::expr::root;
 use vortex_array::expr::stats::Stat;
-use vortex_array::expr::traversal::NodeExt;
-use vortex_array::expr::traversal::Transformed;
 use vortex_array::scalar_fn::EmptyOptions;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
-use vortex_array::scalar_fn::fns::stat::StatFn;
 use vortex_array::scalar_fn::internal::row_count::RowCount;
 use vortex_array::scalar_fn::internal::row_count::contains_row_count;
 use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
-use vortex_array::stats::bind::StatBinder;
-use vortex_array::stats::bind::bind_stats;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure_eq;
+use vortex_expr::stats::bind::StatBinder;
+use vortex_expr::stats::bind::bind_stats;
 use vortex_mask::Mask;
-use vortex_runend::RunEnd;
 use vortex_session::VortexSession;
 
 use crate::layouts::zoned::schema::aggregate_stats_table_dtype;
@@ -131,69 +131,84 @@ impl ZoneMap {
     /// Apply a pruning predicate to this zone map.
     ///
     /// `predicate` should be a stats rewrite expression such as the result of
-    /// [`Expression::falsify`]. The returned mask has one value per zone, where
+    /// [`BoundExpressionPruneExt::falsify`]. The returned mask has one value per zone, where
     /// `true` means the zone cannot contain matching rows and can be skipped.
     ///
     /// If the predicate contains [`row_count`][vortex_array::scalar_fn::internal::row_count]
-    /// placeholders, they are replaced after [`ArrayRef::apply`] with per-zone
+    /// placeholders, they are replaced after [`ArrayRef::apply_bound`] with per-zone
     /// counts derived from `zone_len` and `row_count`. Uniform zones use a
     /// [`ConstantArray`]; a short final zone uses a run-end encoded array.
     /// `row_count` is a layout property rather than a stored stats field, and the
     /// final zone may be shorter than the nominal zone length, so it is materialized
     /// only after the predicate has been lowered to the zone-map table.
-    pub fn prune(&self, predicate: &Expression, session: &VortexSession) -> VortexResult<Mask> {
+    ///
+    /// [`BoundExpressionPruneExt::falsify`]: vortex_expr::stats::rewrite::BoundExpressionPruneExt::falsify
+    pub fn prune(
+        &self,
+        predicate: &BoundExpression,
+        session: &VortexSession,
+    ) -> VortexResult<Mask> {
+        let predicate = self.lower_stats(predicate.clone())?;
+        self.prune_lowered(&predicate, session)
+    }
+
+    /// Apply a predicate that [`Self::lower_stats`] already lowered to this zone map's
+    /// stats table.
+    ///
+    /// Lowering depends only on the column and stats-table dtypes, so callers that evaluate
+    /// the same predicate many times lower it once and call this function for each evaluation.
+    pub(super) fn prune_lowered(
+        &self,
+        predicate: &BoundExpression,
+        session: &VortexSession,
+    ) -> VortexResult<Mask> {
         let mut ctx = session.create_execution_ctx();
         let num_zones = self.array.len();
-        let predicate = self.lower_stats(predicate.clone())?;
 
-        let applied = self.array.clone().into_array().apply(&predicate)?;
+        let array = self.array.clone().into_array();
+        let applied = array.apply_bound(predicate)?;
 
         if !contains_row_count(&applied) {
-            return applied.null_as_false().execute(&mut ctx);
+            return null_as_false_mask(applied, &mut ctx);
         }
 
         let row_count_array = row_count_array(self.zone_len, self.row_count, num_zones)?;
         let substituted = substitute_row_count(applied, &row_count_array)?;
-        substituted.null_as_false().execute(&mut ctx)
+        null_as_false_mask(substituted, &mut ctx)
     }
 
-    fn lower_stats(&self, predicate: Expression) -> VortexResult<Expression> {
-        let predicate = self.lower_non_float_nan_stats(predicate)?;
+    /// Rewrite the stats references in `predicate` into expressions over the stats table.
+    pub(super) fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
         let binder = ZoneMapStatsBinder { zone_map: self };
-        bind_stats(predicate, &binder)?.optimize_recursive(self.array.dtype())
+        bind_stats(predicate, &binder)
     }
+}
 
-    fn lower_non_float_nan_stats(&self, predicate: Expression) -> VortexResult<Expression> {
-        predicate
-            .transform_down(|expr| {
-                if !expr.is::<StatFn>() {
-                    return Ok(Transformed::no(expr));
-                }
-
-                let options = expr.as_::<StatFn>();
-                let aggregate_fn = options.aggregate_fn();
-                let input_dtype = expr.child(0).return_dtype(&self.column_dtype)?;
-
-                if has_nans(&input_dtype) {
-                    return Ok(Transformed::no(expr));
-                }
-
-                if aggregate_fn.is::<NanCount>() {
-                    return Ok(Transformed::yes(lit(0u64)));
-                }
-
-                if aggregate_fn.is::<AllNan>() {
-                    return Ok(Transformed::yes(lit(false)));
-                }
-
-                if aggregate_fn.is::<AllNonNan>() {
-                    return Ok(Transformed::yes(lit(true)));
-                }
-
-                Ok(Transformed::no(expr))
-            })
-            .map(Transformed::into_inner)
+/// This is equivalent to `fill_null(false)?.execute::<Mask>(ctx)`.
+/// However, in the case of very frequend and very short operations the cost of
+/// filling nulls and then canonicalizing is greater than canonicalizing and
+/// then intersecting the bitbuffer.
+fn null_as_false_mask(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Mask> {
+    if !array.dtype().is_nullable() {
+        return array.execute::<Mask>(ctx);
     }
+    let len = array.len();
+    Ok(match array.execute::<Columnar>(ctx)? {
+        Columnar::Constant(c) => Mask::new(len, c.scalar().as_bool().value().unwrap_or(false)),
+        Columnar::Canonical(c) => {
+            let bool = c.into_array().execute::<BoolArray>(ctx)?;
+            match bool.as_ref().validity()? {
+                Validity::NonNullable | Validity::AllValid => {
+                    Mask::from_buffer(bool.into_bit_buffer())
+                }
+                Validity::AllInvalid => Mask::new_false(len),
+                Validity::Array(v) => {
+                    let validity_bits = v.execute::<BoolArray>(ctx)?.into_bit_buffer();
+                    Mask::from_buffer(bool.into_bit_buffer() & &validity_bits)
+                }
+            }
+        }
+    })
 }
 
 struct ZoneMapStatsBinder<'a> {
@@ -201,57 +216,72 @@ struct ZoneMapStatsBinder<'a> {
 }
 
 impl StatBinder for ZoneMapStatsBinder<'_> {
-    fn scope(&self) -> &DType {
-        &self.zone_map.column_dtype
-    }
-
     fn bind_aggregate(
         &self,
-        input: &Expression,
+        input: &BoundExpression,
         aggregate_fn: &AggregateFnRef,
         _stat_dtype: &DType,
-    ) -> VortexResult<Option<Expression>> {
-        if !is_root(input) {
+    ) -> VortexResult<Option<BoundExpression>> {
+        if !input.is_root() {
             return Ok(None);
         }
+        vortex_ensure_eq!(
+            input.dtype(),
+            &self.zone_map.column_dtype,
+            "Stats predicate root dtype does not match zone-map column dtype"
+        );
 
         if let Some(stat_expr) = self.zone_map.aggregate_field_expr(aggregate_fn) {
-            return Ok(Some(stat_expr));
+            return Ok(Some(self.bind_target(stat_expr)?));
         }
 
         if aggregate_fn.is::<AllNull>() {
-            return Ok(self
+            return self
                 .zone_map
                 .stat_field_expr(Stat::NullCount)
-                .map(|null_count| eq(null_count, row_count_expr())));
+                .map(|null_count| self.bind_target(eq(null_count, row_count_expr())))
+                .transpose();
         }
 
         if aggregate_fn.is::<AllNonNull>() {
-            return Ok(self
+            return self
                 .zone_map
                 .stat_field_expr(Stat::NullCount)
-                .map(|null_count| eq(null_count, lit(0u64))));
+                .map(|null_count| self.bind_target(eq(null_count, lit(0u64))))
+                .transpose();
         }
 
         if aggregate_fn.is::<AllNan>() {
-            return Ok(self
+            return self
                 .zone_map
                 .stat_field_expr(Stat::NaNCount)
-                .map(|nan_count| eq(nan_count, row_count_expr())));
+                .map(|nan_count| self.bind_target(eq(nan_count, row_count_expr())))
+                .transpose();
         }
 
         if aggregate_fn.is::<AllNonNan>() {
-            return Ok(self
+            return self
                 .zone_map
                 .stat_field_expr(Stat::NaNCount)
-                .map(|nan_count| eq(nan_count, lit(0u64))));
+                .map(|nan_count| self.bind_target(eq(nan_count, lit(0u64))))
+                .transpose();
         }
 
         if let Some(stat) = Stat::from_aggregate_fn(aggregate_fn) {
-            return Ok(self.zone_map.stat_field_expr(stat));
+            return self
+                .zone_map
+                .stat_field_expr(stat)
+                .map(|expr| self.bind_target(expr))
+                .transpose();
         }
 
         Ok(None)
+    }
+}
+
+impl ZoneMapStatsBinder<'_> {
+    fn bind_target(&self, expr: Expression) -> VortexResult<BoundExpression> {
+        expr.bind(self.zone_map.array.dtype())
     }
 }
 
@@ -317,21 +347,27 @@ fn row_count_expr() -> Expression {
     RowCount.new_expr(EmptyOptions, [])
 }
 
-fn has_nans(dtype: &DType) -> bool {
-    matches!(dtype, DType::Primitive(ptype, _) if ptype.is_float())
-}
-
 /// Build per-zone row counts for a zone map.
 ///
 /// `zone_len` is the nominal zone size; only the final zone may be shorter. The
 /// result is a [`ConstantArray`] for uniform zone sizes, otherwise a two-run
 /// run-end encoded array whose trailing run carries the final zone length.
+///
+/// All three arguments come from the file — `zone_len` from the zoned layout's metadata,
+/// `row_count` from the layout node, `num_zones` from the zone map's own length — and nothing ties
+/// them together, so a file may declare more zone coverage than the layout has rows.
 fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexResult<ArrayRef> {
     if num_zones == 0 {
         return Ok(ConstantArray::new(0u64, 0).into_array());
     }
 
-    let last_zone_len = row_count - zone_len.saturating_mul((num_zones as u64) - 1);
+    let leading_rows = zone_len.saturating_mul((num_zones as u64) - 1);
+    let Some(last_zone_len) = row_count.checked_sub(leading_rows) else {
+        vortex_bail!(
+            "Zone map declares {num_zones} zones of {zone_len} rows, which is more than the \
+             {row_count} rows of the layout"
+        );
+    };
     if num_zones == 1 || last_zone_len == zone_len {
         return Ok(ConstantArray::new(last_zone_len, num_zones).into_array());
     }
@@ -357,7 +393,10 @@ fn row_count_array(zone_len: u64, row_count: u64, num_zones: usize) -> VortexRes
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicI32;
+    use std::sync::atomic::Ordering;
 
+    use rstest::rstest;
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::AggregateFnVTableExt;
@@ -384,8 +423,10 @@ mod tests {
     use vortex_array::dtype::FieldNames;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::cast;
+    use vortex_array::expr::dynamic;
     use vortex_array::expr::gt;
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
@@ -395,18 +436,32 @@ mod tests {
     use vortex_array::expr::not_eq;
     use vortex_array::expr::root;
     use vortex_array::expr::stats::Stat;
-    use vortex_array::stats::all_nan;
-    use vortex_array::stats::all_non_nan;
-    use vortex_array::stats::all_non_null;
-    use vortex_array::stats::all_null;
+    use vortex_array::scalar::ScalarValue;
+    use vortex_array::scalar_fn::fns::operators::CompareOperator;
     use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_expr::stats::all_nan;
+    use vortex_expr::stats::all_non_nan;
+    use vortex_expr::stats::all_non_null;
+    use vortex_expr::stats::all_null;
+    use vortex_expr::stats::rewrite::BoundExpressionPruneExt;
+    use vortex_mask::Mask;
 
     use crate::layouts::zoned::zone_map::ZoneMap;
     use crate::test::SESSION;
 
-    fn falsify(expr: &Expression, dtype: DType) -> Expression {
-        expr.falsify(&dtype, &SESSION).unwrap().unwrap()
+    fn falsify(expr: &Expression, dtype: DType) -> BoundExpression {
+        expr.bind(&dtype)
+            .unwrap()
+            .falsify(&SESSION)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn prune(zone_map: &ZoneMap, predicate: &Expression) -> VortexResult<Mask> {
+        zone_map.prune(&predicate.bind(&zone_map.column_dtype)?, &SESSION)
     }
 
     fn default_bounded_stat_max_bytes() -> NonZeroUsize {
@@ -567,6 +622,49 @@ mod tests {
         );
     }
 
+    /// `zone_len`, `row_count` and the zone-map length all come from the file and nothing ties them
+    /// together, so a file can claim more zone coverage than the layout has rows. Pruning must
+    /// report that rather than underflowing the per-zone row-count arithmetic.
+    #[rstest]
+    // 4 zones of 4 rows claims 12 rows of leading coverage for a 10-row layout. (3 zones of 4 is
+    // legal — 4 + 4 + 2 — and is what `row_count_prunes_short_trailing_zone` covers.)
+    #[case::zones_overrun_row_count(4, 4, 10)]
+    // The leading zones alone already exceed the row count.
+    #[case::leading_zones_overrun(8, 3, 10)]
+    // A zero row count with a non-empty zone map.
+    #[case::no_rows_but_zones_present(4, 2, 0)]
+    fn row_count_rejects_zones_overrunning_the_layout(
+        #[case] zone_len: u64,
+        #[case] num_zones: usize,
+        #[case] row_count: u64,
+    ) {
+        let null_counts = PrimitiveArray::new(
+            Buffer::<u64>::from_iter(std::iter::repeat_n(0u64, num_zones)),
+            Validity::AllValid,
+        )
+        .into_array();
+        let zone_map = ZoneMap::try_new_legacy(
+            PType::U64.into(),
+            StructArray::from_fields(&[("null_count", null_counts)]).unwrap(),
+            Arc::new([Stat::NullCount]),
+            zone_len,
+            row_count,
+        )
+        .unwrap();
+
+        let pruning_expr = falsify(&is_not_null(root()), PType::U64.into());
+        let message = zone_map
+            .prune(&pruning_expr, &SESSION)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("more than the"),
+            "zone_len {zone_len} x {num_zones} zones over {row_count} rows should have been \
+             rejected, got: {message}"
+        );
+    }
+
     #[test]
     fn row_count_substitution_handles_empty_zone_map() {
         let zone_map = ZoneMap::try_new_legacy(
@@ -630,7 +728,7 @@ mod tests {
         )
         .unwrap();
 
-        let mask = zone_map.prune(&all_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, true, true]),
@@ -653,7 +751,7 @@ mod tests {
         )
         .unwrap();
 
-        let mask = zone_map.prune(&all_non_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_non_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([true, false, false]),
@@ -678,14 +776,14 @@ mod tests {
         .unwrap();
         let ctx = &mut SESSION.create_execution_ctx();
 
-        let mask = zone_map.prune(&all_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([true, false, true]),
             ctx
         );
 
-        let mask = zone_map.prune(&all_non_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_non_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, true, false]),
@@ -710,14 +808,14 @@ mod tests {
         .unwrap();
         let ctx = &mut SESSION.create_execution_ctx();
 
-        let mask = zone_map.prune(&all_nan(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_nan(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([true, false, true]),
             ctx
         );
 
-        let mask = zone_map.prune(&all_non_nan(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_non_nan(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, true, false]),
@@ -726,22 +824,17 @@ mod tests {
     }
 
     #[test]
-    fn non_float_nan_stat_fns_lower_to_constants() {
-        let zone_map = ZoneMap::try_new(
-            PType::I32.into(),
-            StructArray::try_new(FieldNames::empty(), vec![], 2, Validity::NonNullable).unwrap(),
-            Arc::new([]),
-            4,
-            8,
-        )
-        .unwrap();
-        let ctx = &mut SESSION.create_execution_ctx();
-
-        let mask = zone_map.prune(&all_nan(root()), &SESSION).unwrap();
-        assert_arrays_eq!(mask.into_array(), BoolArray::from_iter([false, false]), ctx);
-
-        let mask = zone_map.prune(&all_non_nan(root()), &SESSION).unwrap();
-        assert_arrays_eq!(mask.into_array(), BoolArray::from_iter([true, true]), ctx);
+    fn non_float_nan_stat_fns_fail_to_bind() {
+        let dtype = DType::from(PType::I32);
+        for expr in [all_nan(root()), all_non_nan(root())] {
+            let error = expr.bind(&dtype).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support input dtype i32"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -756,7 +849,7 @@ mod tests {
         .unwrap();
         let ctx = &mut SESSION.create_execution_ctx();
 
-        let mask = zone_map.prune(&all_non_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_non_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, false, false]),
@@ -895,10 +988,10 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
+        let predicate = is_null(vortex_expr::stats::stat(root(), max_fn));
 
         // Missing StatFn lowers to a nullable null literal, so `is_null(...)` is true for every zone.
-        let mask = zone_map.prune(&predicate, &SESSION).unwrap();
+        let mask = prune(&zone_map, &predicate).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([true, true, true]),
@@ -920,8 +1013,8 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
-        let error = zone_map.prune(&predicate, &SESSION).unwrap_err();
+        let predicate = is_null(vortex_expr::stats::stat(root(), max_fn));
+        let error = prune(&zone_map, &predicate).unwrap_err();
 
         assert!(
             error
@@ -974,7 +1067,7 @@ mod tests {
         )
         .unwrap();
 
-        let mask = zone_map.prune(&all_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, true, true]),
@@ -998,11 +1091,67 @@ mod tests {
         )
         .unwrap();
 
-        let mask = zone_map.prune(&all_non_null(root()), &SESSION).unwrap();
+        let mask = prune(&zone_map, &all_non_null(root())).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([true, false, false]),
             &mut SESSION.create_execution_ctx()
         );
+    }
+
+    #[test]
+    fn lowered_dynamic_predicate_tracks_rhs_updates() -> VortexResult<()> {
+        let max = Max.bind(NumericalAggregateOpts::skip_nans());
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let zone_map = ZoneMap::try_new(
+            PType::I32.into(),
+            StructArray::from_fields(&[
+                (
+                    max.to_string(),
+                    PrimitiveArray::new(buffer![5i32, 6i32, 7i32], Validity::AllValid).into_array(),
+                ),
+                (
+                    min.to_string(),
+                    PrimitiveArray::new(buffer![1i32, 2i32, 3i32], Validity::AllValid).into_array(),
+                ),
+            ])?,
+            Arc::new([max, min]),
+            3,
+            10,
+        )?;
+        let ctx = &mut SESSION.create_execution_ctx();
+
+        let threshold = Arc::new(AtomicI32::new(5));
+        let rhs = Arc::clone(&threshold);
+        let expr = dynamic(
+            CompareOperator::Gt,
+            move || Some(ScalarValue::from(rhs.load(Ordering::Relaxed))),
+            PType::I32.into(),
+            true,
+            root(),
+        );
+
+        // Lower once, as the zoned reader does, and evaluate the lowered predicate after each
+        // update of the dynamic value.
+        let lowered = zone_map.lower_stats(falsify(&expr, PType::I32.into()))?;
+
+        // A > 5 => A.max <= 5
+        let mask = zone_map.prune_lowered(&lowered, &SESSION)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, false, false]),
+            ctx
+        );
+
+        // A > 6 => A.max <= 6
+        threshold.store(6, Ordering::Relaxed);
+        let mask = zone_map.prune_lowered(&lowered, &SESSION)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([true, true, false]),
+            ctx
+        );
+
+        Ok(())
     }
 }

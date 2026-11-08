@@ -384,9 +384,10 @@ mod tests {
             let index_fields = HashSet::from(["name".to_string(), "id".to_string()]);
             assert_eq!(
                 expected,
-                is_simple_topn(physical_plan, index_fields, HashSet::new()),
-                "Failed for SQL: {}",
-                sql
+                is_simple_topn(Arc::clone(&physical_plan), index_fields, HashSet::new()),
+                "Failed for SQL: {}\n{}",
+                sql,
+                datafusion::physical_plan::displayable(physical_plan.as_ref()).indent(true)
             );
         }
     }

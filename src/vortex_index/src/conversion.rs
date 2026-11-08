@@ -39,11 +39,17 @@ use vortex::{
         ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute,
         arrays::{
             Bool, BoolArray, Constant, Dict, DictArray, Filter, FilterArray, Null, NullArray,
-            Primitive, PrimitiveArray, ScalarFn, Shared, Slice, Struct, StructArray, VarBin,
-            VarBinArray, VarBinView, VarBinViewArray, bool::BoolArrayExt, dict::DictArraySlotsExt,
-            filter::FilterArrayExt, primitive::PrimitiveArrayExt, scalar_fn::ScalarFnArrayExt,
-            shared::SharedArrayExt, slice::SliceArrayExt, struct_::StructArrayExt,
-            varbin::VarBinArrayExt, varbinview::VarBinViewArrayExt,
+            Primitive, PrimitiveArray, ScalarFn, Slice, Struct, StructArray, VarBin, VarBinArray,
+            VarBinView, VarBinViewArray,
+            bool::BoolArrayExt,
+            dict::DictArraySlotsExt,
+            filter::FilterArraySlotsExt,
+            primitive::PrimitiveArrayExt,
+            scalar_fn::ScalarFnArrayExt,
+            slice::SliceArraySlotsExt,
+            struct_::StructArrayExt,
+            varbin::{VarBinArrayExt, VarBinArraySlotsExt},
+            varbinview::VarBinViewArrayExt,
         },
         scalar_fn::fns::pack::Pack,
         validity::Validity,
@@ -54,14 +60,15 @@ use vortex::{
     encodings::{
         alp::{ALP, ALPRD},
         fastlanes::{BitPacked, Delta, FoR},
-        fsst::{FSST, FSSTArrayExt},
+        fsst::{FSST, FSSTArrayExt, FSSTArraySlotsExt},
         pco::Pco,
-        runend::{RunEnd, RunEndArrayExt},
+        runend::{RunEnd, RunEndArrayExt, RunEndArraySlotsExt},
         sequence::{Sequence, SequenceData},
         sparse::{Sparse, SparseArraySlotsExt},
         zstd::{Zstd, ZstdDataParts, ZstdFrameMetadata},
     },
     error::VortexResult,
+    layout::arrays::shared::{Shared, SharedArraySlotsExt},
     mask::Mask,
     session::VortexSession,
 };
@@ -504,7 +511,7 @@ fn admitted_arrow(
 // Vortex BufferMut reserves requested bytes PLUS the preferred alignment,
 // including hidden leading padding; this pinned default is 256, not Arrow's 64.
 fn allocation(bytes: usize) -> Option<usize> {
-    let capacity = bytes.checked_add(*vortex::buffer::Alignment::DEFAULT_ALIGNMENT)?;
+    let capacity = bytes.checked_add(vortex::buffer::Alignment::DEFAULT_ALIGNMENT.as_usize())?;
     (capacity <= isize::MAX as usize).then_some(capacity)
 }
 fn add(total: &mut usize, bytes: usize) -> Option<()> {
@@ -636,18 +643,22 @@ fn codec_probe_size(array: &ArrayRef, depth: usize, nodes: &mut usize) -> Option
 }
 
 fn zstd_uncompressed(parts: &ZstdDataParts) -> Option<usize> {
-    parts.metadata.frames.iter().try_fold(0usize, |sum, frame| {
-        sum.checked_add(usize::try_from(frame.uncompressed_size).ok()?)
-    })
+    parts
+        .metadata
+        .frames()
+        .iter()
+        .try_fold(0usize, |sum, frame| {
+            sum.checked_add(frame.get_uncompressed_size().ok()?)
+        })
 }
 
 fn zstd_bound(parts: &ZstdDataParts) -> Option<usize> {
     let raw = zstd_uncompressed(parts)?;
     // Keep the public reconstruction on its single-segment branch.
-    if raw > i32::MAX as usize || parts.frames.len() != parts.metadata.frames.len() {
+    if raw > i32::MAX as usize || parts.frames.len() != parts.metadata.frames().len() {
         return None;
     }
-    for (frame, metadata) in parts.frames.iter().zip(&parts.metadata.frames) {
+    for (frame, metadata) in parts.frames.iter().zip(parts.metadata.frames()) {
         // Legacy and concatenated streams have different context allocations.
         if frame.get(..4)? != [0x28, 0xb5, 0x2f, 0xfd] {
             return None;
@@ -656,7 +667,7 @@ fn zstd_bound(parts: &ZstdDataParts) -> Option<usize> {
             return None;
         }
         if zstd::zstd_safe::get_frame_content_size(frame.as_slice()).ok()??
-            != metadata.uncompressed_size
+            != u64::try_from(metadata.get_uncompressed_size().ok()?).ok()?
         {
             return None;
         }
@@ -859,7 +870,7 @@ fn pco_chunk_latents(header: &[u8], chunk: &[u8], ptype: vortex::dtype::PType) -
 fn pco_bound(array: &ArrayRef) -> Option<usize> {
     let view = array.as_opt::<Pco>()?;
     let metadata = view.metadata();
-    if metadata.header.as_slice() != [4, 1] {
+    if metadata.header() != [4, 1] {
         return None;
     }
     let width = match array.dtype().as_ptype() {
@@ -870,13 +881,13 @@ fn pco_bound(array: &ArrayRef) -> Option<usize> {
     };
     let mut pages = 0usize;
     let mut values = 0usize;
-    for chunk in &metadata.chunks {
-        pages = pages.checked_add(chunk.pages.len())?;
-        for page in &chunk.pages {
-            values = values.checked_add(usize::try_from(page.n_values).ok()?)?;
+    for chunk in metadata.chunks() {
+        pages = pages.checked_add(chunk.pages().len())?;
+        for page in chunk.pages() {
+            values = values.checked_add(usize::try_from(page.n_values()).ok()?)?;
         }
     }
-    if metadata.chunks.len().checked_add(pages)? != array.nbuffers()
+    if metadata.chunks().len().checked_add(pages)? != array.nbuffers()
         || array.len() > view.unsliced_n_rows()
         || values > view.unsliced_n_rows()
     {
@@ -888,13 +899,13 @@ fn pco_bound(array: &ArrayRef) -> Option<usize> {
         return None;
     }
     let mut latent_count = 1usize;
-    for index in 0..metadata.chunks.len() {
+    for index in 0..metadata.chunks().len() {
         let buffer = <Pco as vortex::array::VTable>::buffer(array.as_::<Pco>(), index);
         if !buffer.is_on_host() {
             return None;
         }
         latent_count = latent_count.max(pco_chunk_latents(
-            &metadata.header,
+            metadata.header(),
             buffer.as_host().as_slice(),
             array.dtype().as_ptype(),
         )?);
@@ -911,11 +922,11 @@ fn pco_bound(array: &ArrayRef) -> Option<usize> {
     }
     add(&mut bytes, array.len().checked_mul(width)?)?; // nullable expansion
     add(&mut bytes, array.len().checked_mul(width)?)?; // detached output
-    add(&mut bytes, metadata.header.len())?;
+    add(&mut bytes, metadata.header().len())?;
     add(
         &mut bytes,
         metadata
-            .chunks
+            .chunks()
             .len()
             .checked_mul(size_of::<vortex::encodings::pco::PcoChunkInfo>())?,
     )?;
@@ -1208,8 +1219,14 @@ fn prepare_wrapper(
             previous = Some(index);
         }
         let indices = PrimitiveArray::new(normalized.freeze(), Validity::NonNullable).into_array();
-        let prepared = Sparse::try_new(indices, values, array.len(), sparse.fill_scalar().clone())?
-            .into_array();
+        let prepared = Sparse::try_new(
+            indices,
+            values,
+            array.len(),
+            sparse.fill_scalar().clone(),
+            ctx,
+        )?
+        .into_array();
         return Ok(Some(prepared.execute::<PrimitiveArray>(ctx)?.into_array()));
     }
     Ok(None)
@@ -1671,8 +1688,8 @@ fn detach_planned(
         }
         return Ok(FSST::try_new(
             array.dtype().clone(),
-            Buffer::copy_from(fsst.symbols().as_slice()),
-            Buffer::copy_from(fsst.symbol_lengths().as_slice()),
+            Buffer::copy_from(fsst.symbols()),
+            Buffer::copy_from(fsst.symbol_lengths()),
             codes,
             lengths,
             ctx,
@@ -1693,6 +1710,7 @@ fn detach_planned(
             copy(varbin.bytes()),
             array.dtype().clone(),
             detach_validity(varbin.varbin_validity(), ctx, plans)?,
+            ctx,
         )?
         .into_array());
     }
@@ -1707,6 +1725,7 @@ fn detach_planned(
             buffers.into(),
             array.dtype().clone(),
             detach_validity(view.varbinview_validity(), ctx, plans)?,
+            ctx,
         )?
         .into_array());
     }
@@ -2009,15 +2028,15 @@ mod tests {
         .into_array();
         let values = FSST::try_new(
             fsst.dtype().clone(),
-            fsst.symbols().clone(),
-            fsst.symbol_lengths().clone(),
+            Buffer::copy_from(fsst.symbols()),
+            Buffer::copy_from(fsst.symbol_lengths()),
             fsst.codes(),
             lengths,
             &mut ctx,
         )
         .unwrap()
         .into_array();
-        let values = vortex::array::arrays::SharedArray::new(values).into_array();
+        let values = vortex::layout::arrays::shared::Shared::new(values).into_array();
         let dict = DictArray::new(buffer![1u32, 0, 1, 0].into_array(), values).into_array();
         let array = StructArray::new(
             ["x", "x"].into(),
@@ -2056,6 +2075,7 @@ mod tests {
 
     #[test]
     fn alp_and_alprd_numeric_preparation_preserves_float_bits() {
+        use vortex::encodings::alp::RDEncoderExt;
         let session = VortexSession::default();
         let values = [1.25f64, 2.5, 1.2345678901234567, -100_000_000.0];
         let primitive = PrimitiveArray::new(Buffer::copy_from(values), Validity::NonNullable);
@@ -2299,6 +2319,7 @@ mod tests {
             buffer![9i64].into_array(),
             3,
             0i64.into(),
+            &mut ctx,
         )
         .unwrap()
         .into_array();

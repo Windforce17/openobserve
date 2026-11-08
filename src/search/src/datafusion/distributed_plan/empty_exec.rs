@@ -50,7 +50,7 @@ impl NewEmptyExec {
     pub fn new(
         name: &str,
         schema: SchemaRef,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
         sorted_by_time: bool,
@@ -62,7 +62,7 @@ impl NewEmptyExec {
             schema,
             partitions: 1,
             cache,
-            projection: projection.cloned(),
+            projection: projection.map(<[usize]>::to_vec),
             filters: filters.to_owned(),
             limit,
             sorted_by_time,
@@ -192,6 +192,30 @@ impl DisplayAs for NewEmptyExec {
 }
 
 impl ExecutionPlan for NewEmptyExec {
+    // Still required by DF56; callers use replace_children.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "NewEmptyExec"
     }
@@ -204,9 +228,10 @@ impl ExecutionPlan for NewEmptyExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::execution_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
     }

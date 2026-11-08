@@ -20,12 +20,11 @@ use config::TIMESTAMP_COL_NAME;
 use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
-    common::{Result, project_schema},
+    common::{Result, TableReference, project_schema},
     datasource::{TableProvider, TableType},
     logical_expr::TableProviderFilterPushDown,
     physical_plan::ExecutionPlan,
     prelude::Expr,
-    sql::TableReference,
 };
 
 use crate::datafusion::{
@@ -78,7 +77,7 @@ impl TableProvider for EnrichTable {
     async fn scan(
         &self,
         _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -93,25 +92,25 @@ impl TableProvider for EnrichTable {
             }
 
             // add requested projection columns
-            if let Some(v) = projection.as_ref() {
+            if let Some(v) = projection {
                 filter_projection.extend(v.iter().copied());
             }
             filter_projection.sort();
             filter_projection.dedup();
 
             // regenerate the projection with the filter_projection
-            let projection = projection.as_ref().map(|p| {
+            let projection = projection.map(|p| {
                 p.iter()
                     .filter_map(|i| filter_projection.iter().position(|f| f == i))
                     .collect::<Vec<_>>()
             });
             (Some(filter_projection), projection)
         } else {
-            (projection.cloned(), None)
+            (projection.map(<[usize]>::to_vec), None)
         };
 
-        let enrich_projection = enrich_projection.as_ref();
-        let filter_projection = filter_projection.as_ref();
+        let enrich_projection = enrich_projection.as_deref();
+        let filter_projection = filter_projection.as_deref();
 
         // Create the base execution plan
         let schema = project_schema(&self.schema, enrich_projection)?;
@@ -144,11 +143,11 @@ mod tests {
 
     use datafusion::{
         arrow::datatypes::{DataType, Field, Schema},
+        common::TableReference,
         datasource::{TableProvider, TableType},
         logical_expr::TableProviderFilterPushDown,
         prelude::Expr,
         scalar::ScalarValue,
-        sql::TableReference,
     };
 
     use super::*;

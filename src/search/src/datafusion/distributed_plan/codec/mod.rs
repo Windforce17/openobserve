@@ -21,7 +21,7 @@ use datafusion::{
     logical_expr::{AggregateUDF, ScalarUDF},
     physical_plan::ExecutionPlan,
 };
-use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_proto::physical_plan::{PhysicalExtensionCodec, PhysicalProtoConverterExtension};
 
 use crate::datafusion::udaf::shared_percentile::{NAME, SharedPercentiles};
 
@@ -58,26 +58,40 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut last_err = None;
         for codec in &self.codecs {
-            match codec.try_decode(buf, inputs, ctx) {
+            match codec.try_decode(buf, inputs, ctx, proto_converter) {
                 Ok(plan) => return Ok(plan),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "no physical extension codec configured".to_string(),
+            )
+        }))
     }
 
-    fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+    fn try_encode(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<()> {
         let mut last_err = None;
         for codec in &self.codecs {
-            match codec.try_encode(node.clone(), buf) {
+            match codec.try_encode(node.clone(), buf, proto_converter) {
                 Ok(_) => return Ok(()),
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "no physical extension codec configured".to_string(),
+            )
+        }))
     }
 
     fn try_decode_udf(&self, name: &str, buf: &[u8]) -> Result<Arc<ScalarUDF>> {
@@ -88,7 +102,11 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "no physical extension codec configured".to_string(),
+            )
+        }))
     }
 
     fn try_encode_udf(&self, _node: &ScalarUDF, buf: &mut Vec<u8>) -> Result<()> {
@@ -99,7 +117,11 @@ impl PhysicalExtensionCodec for ComposedPhysicalExtensionCodec {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or_else(|| {
+            datafusion::error::DataFusionError::Internal(
+                "no physical extension codec configured".to_string(),
+            )
+        }))
     }
 
     fn try_encode_udaf(&self, node: &AggregateUDF, buf: &mut Vec<u8>) -> Result<()> {

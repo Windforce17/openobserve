@@ -157,10 +157,22 @@ impl<'n> TreeNodeVisitor<'n> for SimpleDistinctVisitor {
             if exprs.len() == 2 && is_only_timestamp_filter(&exprs) {
                 return Ok(TreeNodeRecursion::Continue);
             }
+            // DF55+ evaluates cheap timestamp comparisons before scalar UDFs.
+            // Conjunct order is not semantic: still require exactly one eligible
+            // str_match and the same two timestamp bounds, in any order.
             if exprs.len() == 3
-                && is_only_timestamp_filter(&exprs[1..])
-                && let Some(column_name) = is_simple_str_match(exprs[0])
+                && let Some((position, column_name)) = exprs
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, expr)| is_simple_str_match(expr).map(|name| (i, name)))
                 && self.index_fields.contains(&column_name)
+                && is_only_timestamp_filter(
+                    &exprs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, expr)| (i != position).then_some(*expr))
+                        .collect::<Vec<_>>(),
+                )
             {
                 // a real condition: dictionary-only group fields serve via
                 // the filtered postings∩bitmap path at execution

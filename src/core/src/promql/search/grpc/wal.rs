@@ -199,6 +199,13 @@ async fn get_wal_batches(
     let ret = datafusion::physical_plan::collect(physical_plan.clone(), ctx.task_ctx()).await;
     let mut visit = ScanStatsVisitor::new();
     let _ = visit_execution_plan(physical_plan.as_ref(), &mut visit);
+    // This API has no partial-result channel; never silently omit incompatible WAL.
+    if visit.partial_err.contains(flight::engine::GENERATION_ERROR) {
+        return Err(DataFusionError::Execution(format!(
+            "[trace_id {trace_id}] PromQL WAL query is incomplete: {}",
+            visit.partial_err
+        )));
+    }
     let (batches, stats, ..) = if let Err(e) = ret {
         log::error!("[trace_id {trace_id}] promql->wal->search: datafusion collect error: {e}");
         Err(e)

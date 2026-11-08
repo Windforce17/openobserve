@@ -21,7 +21,7 @@ use datafusion::{
     execution::TaskContext,
     physical_plan::{ExecutionPlan, aggregates::AggregateExec},
 };
-use datafusion_proto::{physical_plan::AsExecutionPlan, protobuf::PhysicalPlanNode};
+use datafusion_proto::physical_plan::{AsExecutionPlan, PhysicalProtoConverterExtension};
 use o2_enterprise::enterprise::search::datafusion::distributed_plan::streaming_aggs_exec::exec::StreamingAggsExec;
 use prost::Message;
 use proto::cluster_rpc;
@@ -30,12 +30,17 @@ pub fn try_decode(
     node: cluster_rpc::StreamingAggsExecNode,
     inputs: &[Arc<dyn ExecutionPlan>],
     ctx: &TaskContext,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     let Some(aggregate_plan) = node.aggregate_plan else {
         return internal_err!("aggregate_plan is required");
     };
     let extension_codec = super::get_physical_extension_codec();
-    let aggregate_plan = aggregate_plan.try_into_physical_plan(ctx, &extension_codec)?;
+    let aggregate_plan = aggregate_plan.try_into_physical_plan_with_converter(
+        ctx,
+        &extension_codec,
+        proto_converter,
+    )?;
     let Some(aggregate_plan) = aggregate_plan.downcast_ref::<AggregateExec>() else {
         return internal_err!("aggregate_plan is not an AggregateExec");
     };
@@ -60,15 +65,21 @@ pub fn try_decode(
     )))
 }
 
-pub fn try_encode(node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> Result<()> {
+pub fn try_encode(
+    node: Arc<dyn ExecutionPlan>,
+    buf: &mut Vec<u8>,
+    proto_converter: &dyn PhysicalProtoConverterExtension,
+) -> Result<()> {
     let Some(node) = node.downcast_ref::<StreamingAggsExec>() else {
         return internal_err!("Not supported");
     };
 
     // serialize execution plan to proto
     let extension_codec = super::get_physical_extension_codec();
-    let aggregate_plan =
-        PhysicalPlanNode::try_from_physical_plan(node.aggregate_plan().clone(), &extension_codec)?;
+    let aggregate_plan = proto_converter.execution_plan_to_proto(
+        &(node.aggregate_plan().clone() as Arc<dyn ExecutionPlan>),
+        &extension_codec,
+    )?;
     let plan_node = cluster_rpc::StreamingAggsExecNode {
         id: node.id().to_string(),
         start_time: node.start_time(),

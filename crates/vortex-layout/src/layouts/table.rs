@@ -12,12 +12,9 @@
 //! The dispatcher also owns field-path overrides, letting callers force a specific leaf field —
 //! at any depth — onto a custom strategy.
 
-use std::env;
 use std::sync::Arc;
-use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use vortex_array::ArrayContext;
 use vortex_array::dtype::Field;
 use vortex_array::dtype::FieldName;
 use vortex_array::dtype::FieldPath;
@@ -28,22 +25,12 @@ use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::LayoutWriterContext;
 use crate::layouts::list::writer::ListLayoutStrategy;
 use crate::layouts::struct_::StructStrategy;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
 use crate::sequence::SequencePointer;
-
-/// Whether [`TableStrategy`] writes list fields using a [`ListLayoutStrategy`] by
-/// default. Disabled unless the environment variable `VORTEX_EXPERIMENTAL_LIST_LAYOUT`
-/// is set to `1`.
-///
-/// [`ListLayoutStrategy`]: crate::layouts::list::writer::ListLayoutStrategy
-pub fn use_experimental_list_layout() -> bool {
-    static USE_EXPERIMENTAL_LIST_LAYOUT: LazyLock<bool> =
-        LazyLock::new(|| env::var("VORTEX_EXPERIMENTAL_LIST_LAYOUT").is_ok_and(|v| v == "1"));
-    *USE_EXPERIMENTAL_LIST_LAYOUT
-}
 
 type ListLayoutFactory = Arc<dyn Fn(ListLayoutStrategy) -> Arc<dyn LayoutStrategy> + Send + Sync>;
 
@@ -72,7 +59,7 @@ pub struct TableStrategy {
     /// Optional factory applied to each dynamically constructed [`ListLayoutStrategy`].
     /// Its presence also enables list decomposition.
     ///
-    /// [`ListLayoutStrategy`]: crate::layouts::list::writer::ListLayoutStrategy
+    /// [`ListLayoutStrategy`]: ListLayoutStrategy
     list_layout_factory: Option<ListLayoutFactory>,
 }
 
@@ -118,7 +105,7 @@ impl TableStrategy {
     ///
     /// // A strategy for compressing data using the balanced BtrBlocks compressor.
     /// let compress =
-    ///     CompressingStrategy::new(FlatLayoutStrategy::default(), BtrBlocksCompressor::default());
+    ///     CompressingStrategy::new(FlatLayoutStrategy::default(), BtrBlocksCompressor::from_session(&session));
     ///
     /// // Our combined strategy uses no compression for validity buffers, BtrBlocks compression
     /// // for most columns, and stores a nested binary column uncompressed (flat) because it
@@ -295,7 +282,7 @@ impl TableStrategy {
 impl LayoutStrategy for TableStrategy {
     async fn write_stream(
         &self,
-        ctx: ArrayContext,
+        ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         eof: SequencePointer,
@@ -334,6 +321,7 @@ mod tests {
     use vortex_array::ArrayContext;
     use vortex_array::ArrayRef;
     use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::ChunkedArray;
     use vortex_array::arrays::ListArray;
@@ -349,12 +337,13 @@ mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
     use vortex_error::VortexResult;
-    use vortex_io::runtime::single::block_on;
     use vortex_io::session::RuntimeSessionExt;
 
     use crate::LayoutRef;
     use crate::LayoutStrategy;
+    use crate::layouts::chunked::Chunked;
     use crate::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use crate::layouts::flat::Flat;
     use crate::layouts::flat::writer::FlatLayoutStrategy;
     use crate::layouts::list::List;
     use crate::layouts::repartition::RepartitionStrategy;
@@ -369,14 +358,45 @@ mod tests {
     use crate::sequence::SequentialStreamAdapter;
     use crate::sequence::SequentialStreamExt;
     use crate::test::SESSION;
+    use crate::test::new_session;
 
     async fn write<S: LayoutStrategy>(strategy: &S, array: ArrayRef) -> VortexResult<LayoutRef> {
         let segments = Arc::new(TestSegments::default());
         let (ptr, eof) = SequenceId::root().split();
         let stream = array.to_array_stream().sequenced(ptr);
+        let session = new_session().with_tokio();
         strategy
-            .write_stream(ArrayContext::empty(), segments, stream, eof, &SESSION)
+            .write_stream(
+                ArrayContext::empty().into(),
+                segments,
+                stream,
+                eof,
+                &session,
+            )
             .await
+    }
+
+    // Segment allocation follows task scheduling; normalize IDs while preserving aliases.
+    fn display_tree_with_canonical_segments(layout: &LayoutRef) -> String {
+        let tree = layout.display_tree().to_string();
+        let mut segments = Vec::new();
+        tree.lines()
+            .map(|line| {
+                let Some((prefix, segment)) = line.rsplit_once("segment: ") else {
+                    return line.to_owned();
+                };
+                let index = segments
+                    .iter()
+                    .position(|id| *id == segment)
+                    .unwrap_or_else(|| {
+                        let index = segments.len();
+                        segments.push(segment);
+                        index
+                    });
+                format!("{prefix}segment: {index}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// A plain table dispatcher with no overrides. `flat` here is both the validity and leaf
@@ -411,16 +431,19 @@ mod tests {
     /// `elements` are decomposed as a nested `ListLayout`.
     #[tokio::test]
     async fn dispatches_nested_list() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let inner = ListArray::try_new(
             buffer![1i32, 2, 3, 4, 5, 6].into_array(),
             buffer![0u32, 2, 5, 5, 6].into_array(),
             Validity::NonNullable,
+            &mut ctx,
         )?
         .into_array();
         let outer = ListArray::try_new(
             inner,
             buffer![0u32, 2, 4].into_array(),
             Validity::NonNullable,
+            &mut ctx,
         )?
         .into_array();
 
@@ -439,6 +462,7 @@ mod tests {
     /// decomposition for the elements, and a nullable list writes a validity child.
     #[tokio::test]
     async fn dispatches_struct_list_struct() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let inner_struct = StructArray::from_fields(
             [
                 ("a", buffer![1i32, 2, 3, 4, 5].into_array()),
@@ -451,6 +475,7 @@ mod tests {
             inner_struct,
             buffer![0u32, 2, 5, 5].into_array(),
             Validity::Array(BoolArray::from_iter([true, false, true]).into_array()),
+            &mut ctx,
         )?
         .into_array();
         let st = StructArray::from_fields([("items", items)].as_slice())?.into_array();
@@ -473,16 +498,19 @@ mod tests {
     /// This is the "list-of-chunkeds" topology top-level decomposition unlocks.
     #[tokio::test]
     async fn dispatches_chunked_list() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let chunk0 = ListArray::try_new(
             buffer![1i32, 2, 3].into_array(),
             buffer![0u32, 2, 3].into_array(),
             Validity::NonNullable,
+            &mut ctx,
         )?
         .into_array();
         let chunk1 = ListArray::try_new(
             buffer![4i32, 5, 6, 7].into_array(),
             buffer![0u32, 1, 4].into_array(),
             Validity::NonNullable,
+            &mut ctx,
         )?
         .into_array();
         let dtype = chunk0.dtype().clone();
@@ -495,7 +523,7 @@ mod tests {
         )
         .with_list_layout();
         let layout = write(&dispatcher, chunked).await?;
-        insta::assert_snapshot!(layout.display_tree(), @r"
+        insta::assert_snapshot!(display_tree_with_canonical_segments(&layout), @r"
         vortex.list, dtype: list(i32), children: 2
         ├── elements: vortex.chunked, dtype: i32, children: 2
         │   ├── [0]: vortex.flat, dtype: i32, segment: 0
@@ -510,10 +538,12 @@ mod tests {
     /// A wrapper can repartition and zone lists in outer-row space before decomposition.
     #[tokio::test]
     async fn wraps_list_strategy_before_decomposition() -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
         let list = ListArray::try_new(
             PrimitiveArray::from_iter(0..9_i32).into_array(),
             PrimitiveArray::from_iter(0..=9_u32).into_array(),
             Validity::NonNullable,
+            &mut ctx,
         )?
         .into_array();
 
@@ -549,7 +579,9 @@ mod tests {
         assert_eq!(zoned.zone_len(), 4);
         assert_eq!(zoned.nzones(), 3);
 
-        let data = layout.child(0)?;
+        let data = layout
+            .slot(0)?
+            .vortex_expect("ZonedLayout always has a data child");
         assert!(data.is::<List>());
         assert_eq!(data.row_count(), 9);
         Ok(())
@@ -592,7 +624,7 @@ mod tests {
         let chunked = ChunkedArray::try_new(vec![c0, c1], dtype)?.into_array();
 
         let layout = write(&dispatcher, chunked).await?;
-        insta::assert_snapshot!(layout.display_tree(), @r"
+        insta::assert_snapshot!(display_tree_with_canonical_segments(&layout), @r"
         vortex.struct, dtype: {a=i32, b=i32}, children: 2
         ├── a: vortex.chunked, dtype: i32, children: 2
         │   ├── [0]: vortex.flat, dtype: i32, segment: 0
@@ -616,14 +648,35 @@ mod tests {
         )?
         .into_array();
 
-        let strategy =
-            flat_table().with_field_writer(field_path!(a), Arc::new(FlatLayoutStrategy::default()));
+        let strategy = flat_table().with_field_writer(
+            field_path!(a),
+            Arc::new(RepartitionStrategy::new(
+                ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+                RepartitionWriterOptions {
+                    block_size_minimum: 0,
+                    block_len_multiple: 2,
+                    block_size_target: None,
+                    canonicalize: false,
+                },
+            )),
+        );
         let layout = write(&strategy, struct_array).await?;
-        insta::assert_snapshot!(layout.display_tree(), @r"
-        vortex.struct, dtype: {a=i32, b=i32}, children: 2
-        ├── a: vortex.flat, dtype: i32, segment: 0
-        └── b: vortex.flat, dtype: i32, segment: 1
-        ");
+        assert_eq!(layout.nchildren(), 2);
+        let overridden = layout.slot(1)?.vortex_expect("field a");
+        assert!(overridden.is::<Chunked>());
+        assert_eq!(overridden.nchildren(), 2);
+        assert_eq!(
+            overridden.slot(0)?.vortex_expect("first chunk").row_count(),
+            2
+        );
+        assert_eq!(
+            overridden
+                .slot(1)?
+                .vortex_expect("second chunk")
+                .row_count(),
+            1
+        );
+        assert!(layout.slot(2)?.vortex_expect("field b").is::<Flat>());
         Ok(())
     }
 
@@ -658,9 +711,9 @@ mod tests {
         .with_field_writer(FieldPath::root(), flat);
     }
 
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "panic while transposing table stream")]
-    fn table_fanout_panic_propagates() {
+    async fn table_fanout_panic_propagates() {
         let ctx = ArrayContext::empty();
         let segments = Arc::new(TestSegments::default());
         let (_, eof) = SequenceId::root().split();
@@ -680,18 +733,15 @@ mod tests {
             Arc::new(FlatLayoutStrategy::default()),
         );
 
-        block_on(|handle| async move {
-            let session = SESSION.clone().with_handle(handle);
-            strategy
-                .write_stream(
-                    ctx,
-                    segments,
-                    SequentialStreamAdapter::new(dtype, stream).sendable(),
-                    eof,
-                    &session,
-                )
-                .await
-                .unwrap();
-        });
+        strategy
+            .write_stream(
+                ctx.into(),
+                segments,
+                SequentialStreamAdapter::new(dtype, stream).sendable(),
+                eof,
+                &SESSION,
+            )
+            .await
+            .unwrap();
     }
 }

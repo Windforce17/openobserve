@@ -338,6 +338,7 @@ pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<G
     let stream = futures::stream::once(futures::future::ready(Ok(data)));
 
     Ok(GetResult {
+        extensions: Default::default(),
         payload: GetResultPayload::Stream(stream.boxed()),
         attributes: Default::default(),
         meta,

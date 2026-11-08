@@ -115,6 +115,214 @@ fn schema_footer_does_not_cross_operation_boundary() {
 }
 
 #[test]
+fn leaf_planning_reuses_footer_once_with_operation_admission() {
+    let (blob, reads) = fixture(64);
+    with_read_operation(Operation::new(), || {
+        let before = native_open_counts();
+        let leaves = blob_column_leaves(&blob, "col0").unwrap().unwrap();
+        assert!(!leaves.is_empty());
+        let planned = native_open_counts();
+        assert_eq!(planned.1, before.1 + 1);
+        let cached_reads = reads.load(Ordering::Acquire);
+        let first = reopen(&blob);
+        assert_eq!(native_open_counts().1, planned.1);
+        assert_eq!(reads.load(Ordering::Acquire), cached_reads);
+        let second = reopen(&blob);
+        assert_eq!(native_open_counts().1, planned.1 + 1);
+        assert!(!Arc::ptr_eq(
+            first.footer().layout(),
+            second.footer().layout()
+        ));
+    });
+    // Neither the operation-local slot nor its metadata runtime can escape.
+    assert!(NATIVE_SCHEMA_FOOTER.with(|slot| slot.borrow().is_none()));
+}
+
+#[test]
+fn read_registry_keeps_relocated_stats_session() {
+    use vortex::session::SessionExt;
+
+    let setup = NativeReadSetup::new().unwrap();
+    let first = setup.registries.session();
+    let second = setup.registries.session();
+    assert!(
+        first
+            .get_opt::<vortex::expr::stats::session::StatsSession>()
+            .is_some()
+    );
+    assert!(
+        second
+            .get_opt::<vortex::expr::stats::session::StatsSession>()
+            .is_some()
+    );
+    assert!(
+        first
+            .get_opt::<vortex::io::session::RuntimeSession>()
+            .is_none()
+    );
+    assert!(
+        second
+            .get_opt::<vortex::io::session::RuntimeSession>()
+            .is_none()
+    );
+}
+
+#[test]
+fn read_template_is_built_once_and_concurrent_reads_do_not_mutate_registries() {
+    let (blob, _) = fixture(3);
+    let blob = Arc::new(blob);
+    let setup = NativeReadSetup::new().unwrap();
+    let template = setup.registries.template;
+    let arrays = template.arrays.registry().snapshot();
+    let dtypes = template.dtypes.registry().snapshot();
+    let layouts = template.layouts.registry().snapshot();
+    let scalars = template.scalars.registry().snapshot();
+    drop(setup);
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let blob = blob.clone();
+            std::thread::spawn(move || {
+                with_read_operation(Operation::new(), || {
+                    let setup = NativeReadSetup::new().unwrap();
+                    let (schema, file) = blob_arrow_schema_owned(&blob).unwrap();
+                    assert_eq!(schema.fields().len(), 3);
+                    assert_eq!(file.row_count(), 3);
+                    let batches = scan_blob(&blob, Some(&["col0"]), RowSelection::All).unwrap();
+                    assert_eq!(batches.len(), 1);
+                    assert_eq!(
+                        batches[0].column(0).to_data(),
+                        Int64Array::from(vec![Some(0), None, Some(7)]).to_data()
+                    );
+                    std::ptr::from_ref(setup.registries.template) as usize
+                })
+            })
+        })
+        .collect();
+    for thread in threads {
+        assert_eq!(
+            thread.join().unwrap(),
+            std::ptr::from_ref(template) as usize
+        );
+    }
+    assert_eq!(NATIVE_TEMPLATE_BUILDS.load(Ordering::Relaxed), 1);
+    // Pointer equality, not just equal entries: no COW publication occurred.
+    assert!(Arc::ptr_eq(&arrays, &template.arrays.registry().snapshot()));
+    assert!(Arc::ptr_eq(&dtypes, &template.dtypes.registry().snapshot()));
+    assert!(Arc::ptr_eq(
+        &layouts,
+        &template.layouts.registry().snapshot()
+    ));
+    assert!(Arc::ptr_eq(
+        &scalars,
+        &template.scalars.registry().snapshot()
+    ));
+}
+
+#[test]
+fn read_template_sessions_keep_runtime_memory_and_late_defaults_private() {
+    use vortex::session::SessionExt;
+
+    let setup = NativeReadSetup::new().unwrap();
+    let first_runtime = SingleThreadRuntime::default();
+    let second_runtime = SingleThreadRuntime::default();
+    let first = setup.session(first_runtime.handle());
+    let second = setup.session(second_runtime.handle());
+    first.allow_unknown();
+    assert!(first.allows_unknown());
+    assert!(!second.allows_unknown());
+    assert!(!std::ptr::eq(
+        &*first.get::<vortex::io::session::RuntimeSession>(),
+        &*second.get::<vortex::io::session::RuntimeSession>()
+    ));
+    assert!(!std::ptr::eq(
+        &*first.get::<vortex::array::memory::MemorySession>(),
+        &*second.get::<vortex::array::memory::MemorySession>()
+    ));
+    drop(second);
+    drop(second_runtime);
+    assert_eq!(first_runtime.block_on(async { 7 }), 7);
+    let metadata = setup.registries.session();
+    assert!(!metadata.allows_unknown());
+    assert!(
+        metadata
+            .get_opt::<vortex::io::session::RuntimeSession>()
+            .is_none()
+    );
+    assert!(
+        metadata
+            .get_opt::<vortex::array::memory::MemorySession>()
+            .is_none()
+    );
+}
+
+#[test]
+fn read_template_preserves_operation_admission_and_releases_each_owner() {
+    let first = Operation::new();
+    let second = Operation::new();
+    let memory = Arc::new(crate::reader::ReaderMemory::new());
+    let other_memory = Arc::new(crate::reader::ReaderMemory::new());
+    let baseline = with_read_operation(first.clone(), || {
+        memory.reserve(0).unwrap();
+        first.last.load(Ordering::Acquire)
+    });
+    let expected = baseline + native_registry_workspace().unwrap() + NATIVE_SESSION_WORKSPACE;
+    with_read_operation(first.clone(), || {
+        let _scope = crate::source::enter_reader_memory(Arc::clone(&memory));
+        let setup = NativeReadSetup::new().unwrap();
+        memory.reserve(0).unwrap();
+        assert_eq!(first.last.load(Ordering::Acquire), expected);
+        with_read_operation(second.clone(), || {
+            let _scope = crate::source::enter_reader_memory(Arc::clone(&other_memory));
+            let inner = NativeReadSetup::new().unwrap();
+            assert!(!Arc::ptr_eq(
+                &setup.registries.memory,
+                &inner.registries.memory
+            ));
+            assert_eq!(second.last.load(Ordering::Acquire), expected);
+            second.cancelled.store(true, Ordering::Release);
+            assert!(matches!(NativeReadSetup::new(), Err(VixError::Cancelled)));
+        });
+        memory.reserve(0).unwrap();
+        assert_eq!(first.last.load(Ordering::Acquire), expected);
+        crate::check_read_cancelled().unwrap();
+        drop(setup);
+    });
+    second.cancelled.store(false, Ordering::Release);
+    for (operation, memory) in [(first, memory), (second, other_memory)] {
+        with_read_operation(operation.clone(), || {
+            memory.reserve(0).unwrap();
+            assert_eq!(operation.last.load(Ordering::Acquire), baseline);
+        });
+    }
+}
+
+#[test]
+fn read_template_cached_plugins_do_not_bypass_budget_or_cancellation() {
+    drop(NativeReadSetup::new().unwrap());
+    for cancelled in [false, true] {
+        let operation = Operation::new();
+        operation.cancelled.store(cancelled, Ordering::Release);
+        if !cancelled {
+            operation.limit.store(0, Ordering::Release);
+        }
+        with_read_operation(operation, || {
+            let result = NativeReadSetup::new();
+            if cancelled {
+                assert!(matches!(result, Err(VixError::Cancelled)));
+            } else {
+                assert!(
+                    matches!(result, Err(VixError::Malformed(message)) if message == "footer test budget denied")
+                );
+            }
+            assert!(NATIVE_READ_REGISTRIES.with(|slot| slot.borrow().is_none()));
+        });
+    }
+    with_read_operation(Operation::new(), || {
+        assert!(NativeReadSetup::new().is_ok());
+    });
+}
+
+#[test]
 fn schema_footer_keeps_original_admission_until_consumed() {
     let (blob, _) = fixture(64);
     let BlobHandle::Ranged(ranged) = &blob else {
@@ -180,9 +388,8 @@ fn schema_footer_identity_rejects_new_generation_and_other_files() {
         ));
         let (_, schema) = blob_arrow_schema_owned(&blob).unwrap();
         assert_eq!(
-            reopen(&other)
-                .dtype()
-                .to_arrow_schema()
+            vortex::arrow::ArrowSession::default()
+                .to_arrow_schema(reopen(&other).dtype())
                 .unwrap()
                 .fields()
                 .len(),
@@ -428,4 +635,114 @@ fn schema_footer_rebinds_io_and_preserves_small_initial_read_floor() {
             vec![Some(511), None, Some(7)]
         );
     });
+}
+
+#[test]
+fn write_policy_is_pinned_to_079_compatible_components() {
+    use vortex::editions::{CORE_2025_10_0, ComponentKind, EditionSessionExt};
+    let session = legacy_write_session(VortexSession::default()).unwrap();
+    assert_eq!(session.enabled_editions().editions(), vec![CORE_2025_10_0]);
+    let arrays: std::collections::HashSet<_> = session
+        .enabled_component_ids(ComponentKind::Array)
+        .into_iter()
+        .collect();
+    assert_eq!(arrays, *LEGACY_ARRAY_ENCODINGS);
+    for id in ["vortex.pco", "vortex.zstd", "vortex.fsst", "vortex.runend"] {
+        assert!(arrays.contains(&vortex::session::registry::Id::from(id)));
+    }
+    for id in ["vortex.slice", "vortex.shared", "vortex.filter"] {
+        assert!(!arrays.contains(&vortex::session::registry::Id::from(id)));
+    }
+    let layouts = session.enabled_component_ids(ComponentKind::Layout);
+    assert!(layouts.contains(&vortex::session::registry::Id::from("vortex.stats")));
+    assert!(!layouts.contains(&vortex::session::registry::Id::from("vortex.zoned")));
+}
+
+#[test]
+fn file_statistics_resolve_paths_after_nested_fields_and_literal_dots() {
+    use vortex::{buffer::ByteBuffer, dtype::FieldPath};
+
+    use crate::NumScalar;
+
+    let nested_fields = vec![Arc::new(Field::new("number", DataType::Int64, false))];
+    let nested = StructArray::new(
+        nested_fields.clone().into(),
+        vec![Arc::new(Int64Array::from(vec![100, 200, 300]))],
+        Some(arrow::buffer::NullBuffer::from(vec![true, false, true])),
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("nested", DataType::Struct(nested_fields.into()), true),
+        Field::new("number", DataType::Int64, true),
+        Field::new("nested.number", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(nested),
+            Arc::new(Int64Array::from(vec![Some(-10), None, Some(30)])),
+            Arc::new(Int64Array::from(vec![7, 8, 9])),
+        ],
+    )
+    .unwrap();
+
+    for legacy in [true, false] {
+        let runtime = SingleThreadRuntime::default();
+        let session = VortexSession::default().with_handle(runtime.handle());
+        let session = if legacy {
+            legacy_write_session(session).unwrap()
+        } else {
+            // Deliberately write a modern fixture to exercise post-order stats,
+            // not the production write policy (which must stay legacy-only).
+            session
+        };
+        let dtype = session.arrow().from_arrow_schema(&schema).unwrap();
+        let mut bytes = Vec::new();
+        let options =
+            VortexWriteOptions::new(session.clone()).with_strategy(addressable_strategy());
+        // The modern session alone does not enable nested statistics: the writer
+        // defaults to the legacy layout even when modern editions are enabled.
+        let options = if legacy {
+            options
+        } else {
+            options.include_nested_statistics()
+        };
+        let mut writer = options.blocking(&runtime).writer(&mut bytes, dtype);
+        writer
+            .push(
+                session
+                    .arrow()
+                    .from_arrow_record_batch(batch.clone(), &schema)
+                    .unwrap(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        let file = session
+            .open_options()
+            .open_buffer(ByteBuffer::copy_from(&bytes))
+            .unwrap();
+        let paths = file.footer().statistics().unwrap().paths();
+        let number_index = paths
+            .iter()
+            .position(|path| path == &FieldPath::from_name("number"))
+            .unwrap();
+        if legacy {
+            assert_eq!(number_index, 1);
+        } else {
+            assert!(
+                number_index > 1,
+                "nested stats must not use schema ordinals"
+            );
+        }
+        let blob = BlobHandle::Mem(Bytes::from(bytes));
+        assert_eq!(
+            blob_column_stats(&blob, "number").unwrap(),
+            Some((NumScalar::I64(-10), NumScalar::I64(30)))
+        );
+        assert_eq!(
+            blob_column_stats(&blob, "nested.number").unwrap(),
+            Some((NumScalar::I64(7), NumScalar::I64(9)))
+        );
+        assert_eq!(blob_column_stats(&blob, "missing").unwrap(), None);
+        assert_eq!(blob_column_stats(&blob, "nested").unwrap(), None);
+    }
 }

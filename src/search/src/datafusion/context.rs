@@ -109,7 +109,7 @@ pub async fn register_table(ctx: &SessionContext, sql: &Sql) -> Result<()> {
             .schema()
             .as_ref()
             .clone()
-            .with_metadata(Default::default());
+            .with_metadata(arrow_schema::Metadata::default());
         let stream_name = stream.to_quoted_string();
         let table = Arc::new(
             NewEmptyTable::new(&stream_name, Arc::new(schema))

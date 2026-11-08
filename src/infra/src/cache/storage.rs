@@ -505,6 +505,7 @@ async fn block_get_opts(
         .await?;
     let end = range.start + read.bytes.len() as u64;
     Ok(Some(GetResult {
+        extensions: Default::default(),
         payload: GetResultPayload::Stream(
             futures::stream::once(futures::future::ready(Ok(read.bytes))).boxed(),
         ),
@@ -710,6 +711,7 @@ mod tests {
         }))
         .boxed();
         let result = GetResult {
+            extensions: Default::default(),
             payload: object_store::GetResultPayload::Stream(body),
             range: 0..4,
             meta: ObjectMeta {
@@ -731,6 +733,7 @@ mod tests {
         })
         .boxed();
         let result = GetResult {
+            extensions: Default::default(),
             payload: object_store::GetResultPayload::Stream(body),
             range: 0..5,
             meta: ObjectMeta {
@@ -764,6 +767,7 @@ mod tests {
         file.write_all(b"test").unwrap();
         file.rewind().unwrap();
         let result = GetResult {
+            extensions: Default::default(),
             payload: object_store::GetResultPayload::File(
                 file.as_file().try_clone().unwrap(),
                 file.path().to_owned(),

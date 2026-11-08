@@ -106,6 +106,33 @@ impl DisplayAs for DeduplicationExec {
 }
 
 impl ExecutionPlan for DeduplicationExec {
+    // Still required by DF56; callers use replace_children.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.deduplication_columns.iter().map(|column| {
+                Arc::new(column.clone()) as Arc<dyn datafusion::physical_expr::PhysicalExpr>
+            }),
+            f,
+        )
+    }
+
     fn name(&self) -> &'static str {
         "DeduplicationExec"
     }
@@ -118,9 +145,10 @@ impl ExecutionPlan for DeduplicationExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::execution_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         assert!(children.len() == 1);
         Ok(Arc::new(DeduplicationExec::new(
@@ -130,8 +158,10 @@ impl ExecutionPlan for DeduplicationExec {
         )))
     }
 
-    fn supports_limit_pushdown(&self) -> bool {
-        true
+    fn limit_behavior(&self) -> datafusion::physical_plan::execution_plan::LimitBehavior {
+        // n distinct output rows can require more than n input rows. A bound
+        // above dedup must not truncate the sorted input before duplicates go.
+        datafusion::physical_plan::execution_plan::LimitBehavior::Stops
     }
 
     fn execute(
@@ -156,8 +186,19 @@ impl ExecutionPlan for DeduplicationExec {
         )))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(
+        &self,
+        partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        vec![datafusion::physical_plan::ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        Ok(Arc::clone(&input_stats[0]))
     }
 
     // if don't have this, the optimizer will not merge the SortExec
@@ -416,6 +457,65 @@ mod tests {
     }
 
     #[test]
+    fn apply_expressions_reports_deduplication_columns() -> Result<()> {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+        let exec = make_exec();
+        let mut columns = Vec::new();
+        exec.apply_expressions(&mut |root| {
+            root.apply(|expr| {
+                if let Some(column) = expr.downcast_ref::<Column>() {
+                    columns.push((column.name().to_string(), column.index()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        assert_eq!(columns, vec![("a".to_string(), 0)]);
+        assert_eq!(
+            exec.apply_expressions(&mut |_| Ok(TreeNodeRecursion::Stop))?,
+            TreeNodeRecursion::Stop
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn limit_above_dedup_preserves_distinct_rows() -> Result<()> {
+        use datafusion::{
+            datasource::memory::MemorySourceConfig,
+            physical_optimizer::{PhysicalOptimizerRule, limit_pushdown::LimitPushdown},
+            physical_plan::{collect, limit::GlobalLimitExec},
+            prelude::SessionContext,
+        };
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        // Already ordered as required by DeduplicationExec. LIMIT 2 must
+        // consume the third input row, not just the first two equal rows.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["b", "b", "a"]))],
+        )?;
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)?;
+        let dedup = Arc::new(DeduplicationExec::new(input, vec![Column::new("a", 0)], 2));
+        let plan = Arc::new(GlobalLimitExec::new(dedup, 0, Some(2)));
+        let ctx = SessionContext::new();
+        let optimized = LimitPushdown::new().optimize(plan, ctx.state().config_options())?;
+        let batches = collect(optimized, ctx.task_ctx()).await?;
+        let values = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec![Some("b"), Some("a")]);
+        Ok(())
+    }
+
+    #[test]
     fn test_deduplication_exec_name() {
         let exec = make_exec();
         assert_eq!(ExecutionPlan::name(&exec), "DeduplicationExec");
@@ -438,7 +538,10 @@ mod tests {
     #[test]
     fn test_deduplication_exec_supports_limit_pushdown() {
         let exec = make_exec();
-        assert!(exec.supports_limit_pushdown());
+        assert_eq!(
+            exec.limit_behavior(),
+            datafusion::physical_plan::execution_plan::LimitBehavior::Stops
+        );
     }
 
     #[test]

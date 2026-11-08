@@ -244,7 +244,7 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                     remote_scan_or_partial_reduce,
                     output_partitioning,
                 )?);
-                let new_node = node.with_new_children(vec![repartition])?;
+                let new_node = node.replace_children(vec![repartition], datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute))?;
                 self.is_changed = true;
                 return Ok(Transformed::yes(new_node));
             }
@@ -255,13 +255,13 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                 let table_name = visitor.table_name.clone().unwrap();
                 let follow_merge_node = node.clone();
                 let new_input =
-                    follow_merge_node.with_new_children(vec![node.children()[0].clone()])?;
+                    follow_merge_node.replace_children(vec![node.children()[0].clone()], datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute))?;
 
                 let remote_scan = Arc::new(RemoteScanExec::new(
                     new_input,
                     self.remote_scan_nodes.get_remote_node(&table_name),
                 )?);
-                let new_node = node.with_new_children(vec![remote_scan])?;
+                let new_node = node.replace_children(vec![remote_scan], datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute))?;
                 self.is_changed = true;
                 return Ok(Transformed::yes(new_node));
             }
@@ -299,7 +299,7 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                         new_children.push(remote_scan);
                     }
                 }
-                let new_node = node.with_new_children(new_children)?;
+                let new_node = node.replace_children(new_children, datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute))?;
                 self.is_changed = true;
                 return Ok(Transformed::yes(new_node));
             }
@@ -325,7 +325,12 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                     new_children.push(child.clone());
                 }
             }
-            let new_node = node.with_new_children(new_children)?;
+            let new_node = node.replace_children(
+                new_children,
+                datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?;
             self.is_changed = true;
             return Ok(Transformed::yes(new_node));
         }
@@ -589,11 +594,18 @@ mod tests {
     -> datafusion::common::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let group_by = PhysicalGroupBy::new(vec![], vec![], vec![vec![]], false);
+        let count = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(
+            datafusion::functions_aggregate::count::count_udaf(),
+            vec![col("a", &schema)?],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("count_a")
+        .build()?;
         let agg = AggregateExec::try_new(
             AggregateMode::Partial,
             group_by,
-            vec![],
-            vec![],
+            vec![Arc::new(count)],
+            vec![None],
             Arc::new(EmptyExec::new(Arc::clone(&schema))),
             Arc::clone(&schema),
         )?;
@@ -684,12 +696,19 @@ mod tests {
     -> datafusion::common::Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let group_by = PhysicalGroupBy::new(vec![], vec![], vec![vec![]], false);
+        let count = datafusion::physical_expr::aggregate::AggregateExprBuilder::new(
+            datafusion::functions_aggregate::count::count_udaf(),
+            vec![col("a", &schema)?],
+        )
+        .schema(Arc::clone(&schema))
+        .alias("count_a")
+        .build()?;
         // Partial agg over a 4-partition input but with no GROUP BY.
         let agg = AggregateExec::try_new(
             AggregateMode::Partial,
             group_by,
-            vec![],
-            vec![],
+            vec![Arc::new(count)],
+            vec![None],
             Arc::new(EmptyExec::new(Arc::clone(&schema)).with_partitions(4)),
             Arc::clone(&schema),
         )?;

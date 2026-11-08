@@ -70,14 +70,14 @@ use futures::StreamExt;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use vortex::{
     array::{
-        ArrayContext, ArrayRef, Canonical, IntoArray, VortexSessionExecute,
-        arrays::{ChunkedArray, StructArray, struct_::StructArrayExt},
+        ArrayRef, Canonical, IntoArray, VortexSessionExecute,
+        arrays::{ChunkedArray, StructArray, struct_::StructArraySlotsExt},
     },
     dtype::DType,
     error::{VortexExpect, VortexResult, vortex_bail, vortex_err},
     io::{runtime::Handle, session::RuntimeSessionExt},
     layout::{
-        IntoLayout, LayoutChildren, LayoutRef, LayoutStrategy,
+        LayoutChildren, LayoutRef, LayoutStrategy, LayoutWriterContext,
         layouts::{
             chunked::ChunkedLayout, compressed::CompressorPlugin, flat::writer::FlatLayoutStrategy,
             struct_::StructLayout,
@@ -383,7 +383,7 @@ fn merge_constant_run(parts: &[(ArrayRef, u64, bool)]) -> Option<ArrayRef> {
         }
         len += part.len();
     }
-    Some(ConstantArray::new(scalar, len).into_array())
+    Some(ConstantArray::new(scalar.clone(), len).into_array())
 }
 
 /// M25: decoded chunks below this size skip compact-for-residence (the copy
@@ -440,7 +440,7 @@ type ChunkTask = vortex::io::runtime::Task<VortexResult<LayoutRef>>;
 struct LeafWriter<'a> {
     handle: &'a Handle,
     session: &'a VortexSession,
-    ctx: &'a ArrayContext,
+    ctx: &'a LayoutWriterContext,
     segment_sink: &'a SegmentSinkRef,
     compressor: &'a Arc<dyn CompressorPlugin>,
     flat: &'a FlatLayoutStrategy,
@@ -496,7 +496,7 @@ impl LeafWriter<'_> {
 fn spawn_chunk_write(
     handle: &Handle,
     session: &VortexSession,
-    ctx: &ArrayContext,
+    ctx: &LayoutWriterContext,
     segment_sink: &SegmentSinkRef,
     compressor: &Arc<dyn CompressorPlugin>,
     flat: &FlatLayoutStrategy,
@@ -563,7 +563,7 @@ fn spawn_chunk_write(
 impl LayoutStrategy for ClusteredDocsStrategy {
     async fn write_stream(
         &self,
-        ctx: ArrayContext,
+        ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         mut stream: SendableSequentialStream,
         _eof: SequencePointer,
@@ -622,7 +622,7 @@ impl LayoutStrategy for ClusteredDocsStrategy {
             }
             let mut exec = session.create_execution_ctx();
             let struct_chunk = chunk.clone().execute::<StructArray>(&mut exec)?;
-            let fields = struct_chunk.unmasked_fields();
+            let fields = struct_chunk.fields();
             if fields.len() != nfields {
                 vortex_bail!(
                     "docs chunk carries {} fields, schema has {nfields}",

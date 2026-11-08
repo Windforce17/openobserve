@@ -537,6 +537,23 @@ fn view_values_are_included_in_logical_charge() {
 }
 
 #[test]
+fn view_slice_is_not_charged_the_whole_backing() {
+    let values: Vec<String> = (0..1000)
+        .map(|i| format!("{i:04}{}", "x".repeat(4092)))
+        .collect();
+    let array = arrow::array::StringViewArray::from_iter_values(values.iter());
+    let backing: usize = array.data_buffers().iter().map(|buffer| buffer.len()).sum();
+    assert!(backing >= 1000 * 4096);
+    let batch = RecordBatch::try_from_iter([("value", Arc::new(array) as ArrayRef)]).unwrap();
+    let slice = batch_slice_memory_size(&batch.slice(100, 2)).unwrap();
+    assert!(slice >= 2 * (4096 + 16), "{slice}");
+    assert!(
+        slice < 2 * (4096 + 16) + 4096,
+        "a two-row slice must not be charged the {backing}-byte shared backing: {slice}"
+    );
+}
+
+#[test]
 fn shared_view_backing_is_charged_once() {
     // Dictionary expansion produces many views over one shared value.
     let value = "x".repeat(4096);

@@ -97,12 +97,8 @@ pub fn create_session_config(
         .with_target_partitions(target_partitions)
         .with_information_schema(true);
 
-    // DF 54's shared Repartition SpillPool can lose an unfinished file when
-    // concurrent writers replace current_write_file (upstream #23447/#24883).
-    // Finish every non-empty spilled batch before sending its channel marker.
-    // A small positive threshold is insufficient for batches below that size.
-    // This affects only Repartition spills, not aggregation/sort spill files.
-    config.options_mut().execution.max_spill_file_size_bytes = 0;
+    // DF56 includes #24891: spill markers retain the correct writer/file.
+    // Use its non-zero default rotation threshold instead of DF54's per-batch sealing workaround.
 
     config
         .options_mut()
@@ -698,7 +694,7 @@ pub async fn register_metrics_table(
 /// Create a datafusion table from a list of files and a schema
 pub struct TableBuilder {
     sorted_by_time: bool,
-    file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
+    file_stat_cache: Option<Arc<FileStatisticsCache>>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     timestamp_filter: Option<(i64, i64)>,
@@ -732,10 +728,7 @@ impl TableBuilder {
         self
     }
 
-    pub fn file_stat_cache(
-        mut self,
-        file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
-    ) -> Self {
+    pub fn file_stat_cache(mut self, file_stat_cache: Option<Arc<FileStatisticsCache>>) -> Self {
         self.file_stat_cache = file_stat_cache;
         self
     }
@@ -985,9 +978,7 @@ impl TableBuilder {
             ),
         };
 
-        let mut listing_options = ListingOptions::new(file_format)
-            .with_target_partitions(target_partitions)
-            .with_collect_stat(self.collect_stat);
+        let mut listing_options = ListingOptions::new(file_format);
 
         if declare_sort {
             // Every format stores its rows ORDER BY _timestamp DESC, so
@@ -1083,6 +1074,7 @@ impl TableBuilder {
             self.timestamp_filter,
             Some(Arc::new(SourceSynthesizingExprAdapterFactory)),
         )?;
+        table = table.with_scan_options(target_partitions, self.collect_stat);
         if self.file_stat_cache.is_some() {
             table = table.with_cache(self.file_stat_cache.clone());
         }
@@ -1557,7 +1549,10 @@ mod tests {
                 .cpu_num
                 .max(get_config().limit.datafusion_min_partition_num)
         );
-        assert_eq!(config.options().execution.batch_size, get_batch_size());
+        assert_eq!(
+            config.options().execution.batch_size.get(),
+            get_batch_size()
+        );
         assert_eq!(config.options().sql_parser.dialect, Dialect::PostgreSQL);
         assert!(!config.options().execution.listing_table_ignore_subdirectory);
         assert!(config.information_schema());

@@ -27,9 +27,9 @@ use datafusion::{
 use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, ExecutionCtx},
-    arrow::{FromArrowArray, FromArrowType},
+    arrow::ArrowSessionExt,
     compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder},
-    dtype::DType,
+    editions::{CORE_2025_10_0, EditionSessionExt, EnabledEditions},
     error::VortexResult,
     file::{VortexWriteOptions, WriteStrategyBuilder},
     io::session::RuntimeSessionExt,
@@ -89,10 +89,10 @@ pub struct Utf8Compressor {
     inner: BtrBlocksCompressor,
 }
 
-impl Default for Utf8Compressor {
-    fn default() -> Self {
+impl Utf8Compressor {
+    pub fn from_session(session: &VortexSession) -> Self {
         Self {
-            inner: BtrBlocksCompressorBuilder::default().build(),
+            inner: BtrBlocksCompressorBuilder::from_session(session).build(),
         }
     }
 }
@@ -119,6 +119,17 @@ pub fn generate_vortex_access_plan(row_ids: &RowIdBitmap) -> Option<VortexAccess
     Some(VortexAccessPlan::default().with_selection(Selection::IncludeRoaring(rows)))
 }
 
+/// Pin every write path to the components understood by Vortex 0.79 readers.
+/// Enabling core alone replaces only that family: clear default JSON editions
+/// before constructing any compressor or write strategy.
+pub(super) fn legacy_write_session(session: VortexSession) -> Result<VortexSession> {
+    session.register(EnabledEditions::default());
+    session.enable_edition(CORE_2025_10_0).map_err(|error| {
+        DataFusionError::Execution(format!("enable Vortex CORE_2025_10_0 edition: {error}"))
+    })?;
+    Ok(session)
+}
+
 /// Drain `rx` into a single in-memory `.vortex` file. Mirrors `write_parquet`
 /// in `merge/mod.rs`: consumes the record-batch channel, then propagates any
 /// error from the producing `read_task`.
@@ -132,21 +143,27 @@ pub async fn write_vortex(
             let handle = vortex_index::shared_vortex_execution_handle().map_err(|error| {
                 DataFusionError::Execution(format!("shared Vortex executor: {error}"))
             })?;
-            let session = VortexSession::default().with_handle(handle);
-            let dtype = DType::from_arrow(schema.as_ref());
-            let strategy = WriteStrategyBuilder::default()
-                .with_compressor(Utf8Compressor::default())
+            let session = legacy_write_session(VortexSession::default().with_handle(handle))?;
+            let dtype = session
+                .arrow()
+                .from_arrow_schema(schema.as_ref())
+                .map_err(|e| DataFusionError::Execution(format!("Vortex schema import: {e}")))?;
+            let strategy = WriteStrategyBuilder::from_session(&session)
+                .with_compressor(Utf8Compressor::from_session(&session))
                 .build();
             let mut buf = Vec::new();
             let mut writer = VortexWriteOptions::new(session.clone())
                 .with_strategy(strategy)
                 .writer(&mut buf, dtype);
             while let Some(batch) = rx.recv().await {
-                let array: ArrayRef = ArrayRef::from_arrow(batch, false).map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "failed to convert arrow batch to vortex array: {e}"
-                    ))
-                })?;
+                let array: ArrayRef = session
+                    .arrow()
+                    .from_arrow_record_batch(batch, schema.as_ref())
+                    .map_err(|e| {
+                        DataFusionError::Execution(format!(
+                            "failed to convert arrow batch to vortex array: {e}"
+                        ))
+                    })?;
                 writer
                     .push(array)
                     .await
@@ -167,4 +184,94 @@ pub async fn write_vortex(
         .await
         .map_err(|e| DataFusionError::External(Box::new(e)))??;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow_schema::{DataType, Field};
+    use vortex::{
+        buffer::ByteBuffer, editions::ComponentKind, file::OpenOptionsSessionExt,
+        layout::layouts::flat::Flat,
+    };
+
+    use super::*;
+
+    #[test]
+    fn write_session_enables_only_079_core_without_json() -> Result<()> {
+        let session = legacy_write_session(VortexSession::default())?;
+        assert_eq!(session.enabled_editions().editions(), vec![CORE_2025_10_0]);
+        assert!(
+            session
+                .enabled_component_ids(ComponentKind::Array)
+                .iter()
+                .all(|id| !id.to_string().contains("json"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn search_writer_footer_uses_only_079_encodings() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("message", DataType::Utf8, true),
+        ]));
+        let rows = 8192;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..rows)),
+                Arc::new(StringArray::from_iter((0..rows).map(|i| {
+                    (i % 7 != 0).then_some("{\"message\":\"repeated JSON text\",\"number\":42}")
+                }))),
+            ],
+        )?;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let read_task = tokio::spawn(async move {
+            tx.send(batch)
+                .await
+                .map_err(|error| DataFusionError::External(Box::new(error)))?;
+            Ok(())
+        });
+        let bytes = write_vortex(schema, rx, read_task).await?;
+        let session = VortexSession::default().with_tokio();
+        let file = session
+            .open_options()
+            .open_buffer(ByteBuffer::copy_from(&bytes))
+            .map_err(|error| DataFusionError::External(Box::new(error)))?;
+        assert_eq!(file.row_count(), rows as u64);
+        // CORE_2025_10_0 is the 0.79 registry. Check actual footer contexts,
+        // not only the configured compressor: JSON-looking input must not
+        // introduce a newer JSON encoding via a default edition.
+        let legacy = legacy_write_session(VortexSession::default())?;
+        let arrays = legacy.enabled_component_ids(ComponentKind::Array);
+        let layouts = legacy.enabled_component_ids(ComponentKind::Layout);
+        let mut stack = vec![file.footer().layout().clone()];
+        let mut flat_count = 0;
+        while let Some(layout) = stack.pop() {
+            assert!(
+                layouts
+                    .iter()
+                    .any(|id| id.to_string() == layout.encoding_id().to_string())
+            );
+            if let Some(flat) = layout.as_opt::<Flat>() {
+                flat_count += 1;
+                for id in flat.array_ctx().ids() {
+                    assert!(
+                        arrays
+                            .iter()
+                            .any(|allowed| allowed.to_string() == id.to_string()),
+                        "unsupported footer encoding: {id}"
+                    );
+                }
+            }
+            stack.extend(
+                layout
+                    .children()
+                    .map_err(|error| DataFusionError::External(Box::new(error)))?,
+            );
+        }
+        assert!(flat_count > 0);
+        Ok(())
+    }
 }

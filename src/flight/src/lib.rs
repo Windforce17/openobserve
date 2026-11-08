@@ -18,3 +18,4 @@ pub mod common;
 pub mod decoder;
 pub mod encoder;
 pub mod encoder_stream;
+pub mod engine;

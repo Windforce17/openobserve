@@ -30,11 +30,13 @@ use vortex::{
     array::{
         ArrayRef as VortexArrayRef, VortexSessionExecute,
         arrays::{
-            Dict, Shared, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt,
-            struct_::StructArrayExt,
+            Dict, Struct,
+            dict::DictArraySlotsExt,
+            struct_::{StructArrayExt, StructArraySlotsExt},
         },
     },
     arrow::ArrowSessionExt,
+    layout::arrays::shared::{Shared, SharedArraySlotsExt},
     session::VortexSession,
 };
 
@@ -515,7 +517,7 @@ fn scan_csr(
         );
         assert_eq!(
             strukt.names().len(),
-            strukt.unmasked_fields().len(),
+            strukt.fields().len(),
             "variant={} phase=struct_fields chunk={}",
             variant.label(),
             chunk_index
@@ -526,7 +528,7 @@ fn scan_csr(
         for (name, encoded) in strukt
             .names()
             .iter()
-            .zip(strukt.unmasked_fields().iter())
+            .zip(strukt.fields().iter())
         {
             let name = name.as_ref();
             if NON_INDEXED_COLS.contains(&name) || name == SOURCE_COL_NAME {

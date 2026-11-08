@@ -105,13 +105,28 @@ impl RemoteScanExec {
             enrich_mode_node_idx,
         ));
 
+        // LIMIT can stop before polling every partition; known missing WAL is still partial.
+        let partial_err = Arc::new(Mutex::new(String::new()));
+        if !remote_scan_node.super_cluster_info.is_super_cluster {
+            for node in remote_scan_node.nodes.iter().filter(|n| n.is_ingester()) {
+                if let Err(status) = flight::engine::check_generation(
+                    node.query_engine_generation(),
+                    "registration (ingester WAL/latest data unavailable)",
+                    &node.get_name(),
+                    &remote_scan_node.query_identifier.trace_id,
+                ) {
+                    process_partial_err(partial_err.clone(), status);
+                }
+            }
+        }
+
         Ok(RemoteScanExec {
             input,
             remote_scan_node,
             partitions: output_partitions,
             cache,
             scan_stats: Arc::new(Mutex::new(ScanStats::default())),
-            partial_err: Arc::new(Mutex::new(String::new())),
+            partial_err,
             cluster_metrics: Arc::new(Mutex::new(Vec::new())),
             peak_memory: Arc::new(AtomicUsize::new(0)),
             enrich_mode_node_idx,
@@ -216,6 +231,30 @@ impl DisplayAs for RemoteScanExec {
 }
 
 impl ExecutionPlan for RemoteScanExec {
+    // Still required by DF56; callers use replace_children.
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_expr::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &'static str {
         "RemoteScanExec"
     }
@@ -232,9 +271,10 @@ impl ExecutionPlan for RemoteScanExec {
         vec![&self.input]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::execution_plan::ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if children.is_empty() || Arc::ptr_eq(&children[0], &self.input) {
             return Ok(self);
@@ -739,6 +779,8 @@ enum AttemptFailure {
     Connect(tonic::Status),
     /// `do_get` returned an error, or the query deadline passed before the node answered.
     Call(tonic::Status),
+    /// No state from this attempt may enter the local engine.
+    EngineGeneration(tonic::Status),
     /// The response stream broke at the transport level before the first batch. The decoder
     /// already recorded the error in the attempt's `partial_err`.
     StreamBroken(tonic::Code),
@@ -748,7 +790,7 @@ impl AttemptFailure {
     /// Whether another querier can answer where this node failed.
     fn is_retryable(&self) -> bool {
         match self {
-            Self::Connect(_) | Self::StreamBroken(_) => true,
+            Self::Connect(_) | Self::StreamBroken(_) | Self::EngineGeneration(_) => true,
             Self::Call(status) => is_transport_code(status.code()),
         }
     }
@@ -759,6 +801,7 @@ impl std::fmt::Display for AttemptFailure {
         match self {
             Self::Connect(status) => write!(f, "connect: {}: {}", status.code(), status.message()),
             Self::Call(status) => write!(f, "call: {}: {}", status.code(), status.message()),
+            Self::EngineGeneration(status) => write!(f, "engine handshake: {}", status.message()),
             Self::StreamBroken(code) => write!(f, "stream broken before data: {code}"),
         }
     }
@@ -800,6 +843,22 @@ async fn run_attempt(
     let node_name = node.get_name();
     let sinks = AttemptSinks::default();
 
+    // Regional NodeInfo has no registration generation; its RPC still must prove it.
+    if !is_super
+        && let Err(status) = flight::engine::check_generation(
+            node.query_engine_generation(),
+            "registration",
+            &node_name,
+            trace_id,
+        )
+    {
+        return Err(FailedAttempt {
+            node_idx,
+            sinks,
+            failure: AttemptFailure::EngineGeneration(status),
+        });
+    }
+
     let mut request = d.remote_scan_node.get_flight_search_request(d.partition);
     request.set_job_id(generate_random_string(7));
     request.set_partition(d.partition);
@@ -832,11 +891,15 @@ async fn run_attempt(
         log::info!(
             "[trace_id {trace_id}] flight->search: prepare to request node: {grpc_addr}, name: {node_name}, is_super: {is_super}, is_querier: {is_querier}",
         );
-        client
-            .do_get(request)
-            .await
-            .map(|response| response.into_inner())
-            .map_err(AttemptFailure::Call)
+        let response = client.do_get(request).await.map_err(|status| {
+            if flight::engine::is_generation_error(&status) {
+                AttemptFailure::EngineGeneration(status)
+            } else {
+                AttemptFailure::Call(status)
+            }
+        })?;
+        flight::engine::verified_response(response, &node_name, trace_id)
+            .map_err(AttemptFailure::EngineGeneration)
     };
     let deadline_failure =
         || AttemptFailure::Call(tonic::Status::new(tonic::Code::DeadlineExceeded, "timeout"));
@@ -973,7 +1036,9 @@ fn finish_failed(
         d.start,
     );
     match failure {
-        AttemptFailure::Connect(e) => Ok(get_empty_stream(empty_stream.with_error(e))),
+        AttemptFailure::Connect(e) | AttemptFailure::EngineGeneration(e) => {
+            Ok(get_empty_stream(empty_stream.with_error(e)))
+        }
         AttemptFailure::StreamBroken(_) => Ok(get_empty_stream(empty_stream)),
         AttemptFailure::Call(e)
             if e.code() == tonic::Code::Cancelled
@@ -1061,7 +1126,12 @@ mod tests {
         let exec = Arc::new(exec);
         let original_schema = exec.schema();
         let original_request = exec.remote_scan_node.get_flight_search_request(0);
-        let unchanged = exec.clone().with_new_children(vec![exec.input.clone()])?;
+        let unchanged = exec.clone().replace_children(
+            vec![exec.input.clone()],
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?;
         let unchanged = unchanged.downcast_ref::<RemoteScanExec>().unwrap();
         assert_eq!(
             unchanged
@@ -1078,7 +1148,12 @@ mod tests {
         )]));
         let changed_input: Arc<dyn ExecutionPlan> =
             Arc::new(EmptyExec::new(changed_schema.clone()));
-        let rebuilt = exec.clone().with_new_children(vec![changed_input])?;
+        let rebuilt = exec.clone().replace_children(
+            vec![changed_input],
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?;
         let rebuilt = rebuilt.downcast_ref::<RemoteScanExec>().unwrap();
         let request = rebuilt.remote_scan_node.get_flight_search_request(0);
         let ctx = datafusion::execution::context::SessionContext::new();
@@ -1109,7 +1184,15 @@ mod tests {
         let exec = Arc::new(make_remote_exec());
         // RemoteScanExec is a dispatch boundary, not a serializable follower operator.
         let unsupported_child: Arc<dyn ExecutionPlan> = Arc::new(make_remote_exec());
-        assert!(exec.with_new_children(vec![unsupported_child]).is_err());
+        assert!(
+            exec.replace_children(
+                vec![unsupported_child],
+                datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute
+                )
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1201,6 +1284,116 @@ mod tests {
 
     fn unavailable() -> AttemptFailure {
         AttemptFailure::Call(tonic::Status::unavailable("connection reset"))
+    }
+
+    fn engine_failure() -> AttemptFailure {
+        AttemptFailure::EngineGeneration(
+            flight::engine::check_generation(None, "response", "old-node", "engine-retry")
+                .unwrap_err(),
+        )
+    }
+
+    #[tokio::test]
+    async fn engine_generation_failure_has_at_most_one_redispatch() {
+        let node = scan_node(&[true, true, false], &[]);
+        for policy in [None, Some(POLICY)] {
+            let state = RedispatchState::new(&node, usize::MAX);
+            let calls = Mutex::new(Vec::new());
+            let result = race_attempts(
+                "engine-retry",
+                0,
+                &node.nodes,
+                &state,
+                policy,
+                tokio::time::Instant::now(),
+                |idx, redispatched| {
+                    calls.lock().push((idx, redispatched));
+                    async move { Err::<(), _>(failed(idx, engine_failure())) }
+                },
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(calls.lock().len(), if policy.is_some() { 2 } else { 1 });
+            if policy.is_some() {
+                assert_eq!(*calls.lock(), vec![(0, false), (2, true)]);
+            }
+        }
+        let state = RedispatchState::new(&node, usize::MAX);
+        let result = race_attempts(
+            "engine-retry",
+            0,
+            &node.nodes,
+            &state,
+            Some(POLICY),
+            tokio::time::Instant::now(),
+            |idx, redispatched| async move {
+                if redispatched {
+                    Ok(idx)
+                } else {
+                    Err(failed(idx, engine_failure()))
+                }
+            },
+        )
+        .await;
+        assert_eq!(result.ok(), Some((2, 2)));
+    }
+
+    #[tokio::test]
+    async fn engine_generation_unknown_node_never_connects_and_reports_partial() {
+        for ingesters in [vec![], vec![0]] {
+            let remote_scan_node = scan_node(&[true], &ingesters);
+            let state = RedispatchState::new(&remote_scan_node, 0);
+            if !ingesters.is_empty() {
+                assert!(
+                    !state.is_eligible(0),
+                    "WAL must never move to another ingester"
+                );
+                let exec = RemoteScanExec::new(
+                    Arc::new(EmptyExec::new(Arc::new(Schema::empty()))),
+                    remote_scan_node.clone(),
+                )
+                .unwrap();
+                assert!(
+                    exec.partial_err
+                        .lock()
+                        .contains("WAL/latest data unavailable"),
+                    "known missing WAL is reported even if LIMIT never polls the partition"
+                );
+            }
+            let d = Arc::new(PartitionDispatch {
+                remote_scan_node,
+                partition: 0,
+                enrich_mode: false,
+                schema: Arc::new(Schema::empty()),
+                trace_id: "engine-partition".to_string(),
+                timeout: 1,
+                grpc_timeout: 1,
+                search_type: None,
+                is_super: false,
+                start: std::time::Instant::now(),
+                deadline: tokio::time::Instant::now() + Duration::from_secs(1),
+                metrics: RemoteScanMetrics::new(0, &ExecutionPlanMetricsSet::new()),
+            });
+            let Err(failed) = run_attempt(d.clone(), 0, false).await else {
+                panic!("unknown generation must fail before connecting");
+            };
+            assert!(matches!(
+                failed.failure,
+                AttemptFailure::EngineGeneration(_)
+            ));
+            let sinks = AttemptSinks::default();
+            let mut stream = finish_failed(failed, sinks.clone(), &d).unwrap();
+            assert!(stream.next().await.is_none());
+            let error = sinks.partial_err.lock();
+            for expected in [
+                "query engine generation mismatch",
+                "unknown (missing)",
+                "n0",
+                "engine-partition",
+            ] {
+                assert!(error.contains(expected), "{error}");
+            }
+        }
     }
 
     const POLICY: RedispatchPolicy = RedispatchPolicy {

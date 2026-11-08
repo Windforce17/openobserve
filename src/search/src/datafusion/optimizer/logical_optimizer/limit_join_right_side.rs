@@ -52,10 +52,6 @@ impl OptimizerRule for LimitJoinRightSide {
         Some(ApplyOrder::TopDown)
     }
 
-    fn supports_rewrite(&self) -> bool {
-        true
-    }
-
     fn rewrite(
         &self,
         plan: LogicalPlan,
@@ -165,12 +161,31 @@ fn generate_deduplication_plan(
         });
     }
 
-    // TODO: if the input already has sort with same columns, we should not add sort again
-    let sort = LogicalPlan::Sort(Sort {
-        expr: sort_columns,
-        input: node,
-        fetch: None,
-    });
+    // For an unordered DISTINCT right side, DF54 enforced our bound on the
+    // dedup sort (TopK). DF56 correctly retains a limit below a sort instead;
+    // that would select a different subset of join keys. Make our intended
+    // selection explicit, without moving an ordered/user-offset limit.
+    let sort = if let LogicalPlan::Limit(limit) = node.as_ref()
+        && matches!(limit.input.as_ref(), LogicalPlan::Aggregate(agg) if agg.aggr_expr.is_empty())
+        && limit
+            .get_skip_type()
+            .ok()
+            .is_some_and(|skip| matches!(skip, datafusion::logical_expr::SkipType::Literal(0)))
+    {
+        let mut limit = limit.clone();
+        limit.input = Arc::new(LogicalPlan::Sort(Sort {
+            expr: sort_columns,
+            input: Arc::clone(&limit.input),
+            fetch: None,
+        }));
+        LogicalPlan::Limit(limit)
+    } else {
+        LogicalPlan::Sort(Sort {
+            expr: sort_columns,
+            input: node,
+            fetch: None,
+        })
+    };
     LogicalPlan::Extension(Extension {
         node: Arc::new(DeduplicationLogicalNode::new(sort, deduplication_columns)),
     })
@@ -252,8 +267,8 @@ mod tests {
             "          DataSourceExec: partitions=1, partition_sizes=[1]",
             "          RepartitionExec: partitioning=RoundRobinBatch(12), input_partitions=1",
             "            DeduplicationExec: columns: [name@0]",
-            "              SortExec: TopK(fetch=50000), expr=[name@0 DESC NULLS LAST], preserve_partitioning=[false]",
-            "                CoalescePartitionsExec",
+            "              SortPreservingMergeExec: [name@0 DESC NULLS LAST], fetch=50000",
+            "                SortExec: TopK(fetch=50000), expr=[name@0 DESC NULLS LAST], preserve_partitioning=[true]",
             "                  AggregateExec: mode=FinalPartitioned, gby=[name@0 as name], aggr=[], lim=[50000]",
             "                    RepartitionExec: partitioning=Hash([name@0], 12), input_partitions=1",
             "                      AggregateExec: mode=Partial, gby=[name@0 as name], aggr=[], lim=[50000]",

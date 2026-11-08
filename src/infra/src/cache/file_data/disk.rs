@@ -882,6 +882,7 @@ async fn get_opts_from(
     let range = resolve_get_range(file, options.range.as_ref(), meta.size)?;
 
     Ok(GetResult {
+        extensions: Default::default(),
         payload: GetResultPayload::File(fp, path),
         attributes: Default::default(),
         range,
@@ -1900,6 +1901,7 @@ mod tests {
                             std::future::pending::<object_store::Result<Bytes>>().await
                         });
                         Ok(object_store::GetResult {
+                            extensions: Default::default(),
                             payload: object_store::GetResultPayload::Stream(Box::pin(body)),
                             meta: object_store::ObjectMeta {
                                 location: object_store::path::Path::from("cancelled.vxi"),

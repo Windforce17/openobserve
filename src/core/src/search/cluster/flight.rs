@@ -537,6 +537,7 @@ pub async fn get_online_querier_nodes(
             return Err(Error::Message("no querier node online".to_string()));
         }
     };
+    nodes = config::meta::cluster::query_engine_nodes(nodes, trace_id).map_err(Error::Message)?;
     // sort nodes by node_id this will improve hit cache ratio
     nodes.sort_by(|a, b| a.grpc_addr.cmp(&b.grpc_addr));
     nodes.dedup_by(|a, b| a.grpc_addr == b.grpc_addr);
@@ -551,6 +552,13 @@ pub async fn get_online_querier_nodes(
     // use enterprise scheduler to filter nodes
     #[cfg(feature = "enterprise")]
     {
+        // Failed WAL partitions must survive scheduling so the response remains partial.
+        let unavailable_wal = nodes
+            .iter()
+            .filter(|n| n.is_ingester() && !n.has_compatible_query_engine())
+            .cloned()
+            .collect::<Vec<_>>();
+        nodes.retain(|n| n.has_compatible_query_engine());
         // filter nodes by cpu
         nodes = o2_enterprise::enterprise::search::scheduler::filter_nodes_by_cpu(nodes);
         // filter nodes by slot admission
@@ -561,6 +569,7 @@ pub async fn get_online_querier_nodes(
             role_group,
         )
         .await;
+        nodes.extend(unavailable_wal);
         log::debug!(
             "[trace_id {trace_id}] flight->search: slot admission select_nodes for org: {_org_id}, nodes: {:?}",
             nodes.iter().map(|node| node.name.clone()).collect_vec()

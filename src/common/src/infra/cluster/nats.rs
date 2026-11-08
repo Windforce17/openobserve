@@ -160,6 +160,7 @@ async fn register() -> Result<()> {
         broadcasted: false,
         metrics: Default::default(),
         version: config::VERSION.to_string(),
+        query_engine_generation: LOCAL_NODE.query_engine_generation.clone(),
     };
     let val = json::to_vec(&node).unwrap();
 
@@ -232,6 +233,7 @@ pub(crate) async fn set_status(status: NodeStatus) -> Result<()> {
             broadcasted: false,
             metrics: Default::default(),
             version: config::VERSION.to_string(),
+            query_engine_generation: LOCAL_NODE.query_engine_generation.clone(),
         },
     };
 
@@ -251,6 +253,7 @@ pub(crate) async fn set_status(status: NodeStatus) -> Result<()> {
     // update node status metrics
     node.metrics = update_node_status_metrics().await;
 
+    node.query_engine_generation = LOCAL_NODE.query_engine_generation.clone();
     let val = json::to_string(&node).unwrap();
 
     LOCAL_NODE_STATUS.store(status as _, Ordering::Release);

@@ -63,10 +63,9 @@ use puffin::{
 use vortex::{
     VortexSessionDefault,
     array::{ArrayRef, VortexSessionExecute},
-    arrow::{ArrowSessionExt, FromArrowArray, FromArrowType, ToArrowType},
+    arrow::ArrowSessionExt,
     buffer::{Alignment, Buffer},
     compressor::BtrBlocksCompressorBuilder,
-    dtype::DType,
     expr::{root, select},
     file::{
         DeserializeStep, Footer, OpenOptionsSessionExt, VortexFile, VortexWriteOptions,
@@ -79,6 +78,7 @@ use vortex::{
     },
     layout::{
         LayoutStrategy,
+        arrays::shared::{Shared, SharedArraySlotsExt},
         layouts::{
             chunked::writer::ChunkedLayoutStrategy, collect::CollectStrategy,
             flat::writer::FlatLayoutStrategy, table::TableStrategy,
@@ -147,33 +147,31 @@ pub(crate) fn enter_native_read_scope() -> NativeReadScope {
     }
 }
 
-/// Only registries may cross scans. VortexSession::clone shares a mutable
-/// type-map, so rebinding its runtime would also rebind every outstanding file.
-/// Nor can SingleThreadRuntime be pooled: its unbounded launch queues can hold
-/// detached tasks after an early-aborted scan. Each scan gets both anew.
-struct NativeReadRegistries {
+/// Process-wide builtin plugins only: no file, runtime, allocator, cancellation
+/// or reader memory can enter this template. All registration finishes before
+/// LazyLock publishes it; our read paths only look up plugins/rewrite rules.
+/// The registry clones share their backing Arc cells (including StatsSession),
+/// so never register plugins through a session made from this private template.
+struct NativeReadTemplate {
     arrays: vortex::array::session::ArraySession,
     kernels: vortex::array::optimizer::kernels::KernelSession,
     dtypes: vortex::dtype::session::DTypeSession,
     layouts: vortex::layout::session::LayoutSession,
     scalars: vortex::scalar_fn::session::ScalarFnSession,
-    stats: vortex::array::stats::session::StatsSession,
+    stats: vortex::expr::stats::session::StatsSession,
     aggregates: vortex::aggregate_fn::session::AggregateFnSession,
     arrow: vortex::arrow::ArrowSession,
-    memory: Arc<crate::reader::ReaderMemory>,
-    workspace: usize,
-    _pending: crate::reader::PendingMemory,
 }
 
-impl NativeReadRegistries {
-    fn new(memory: Arc<crate::reader::ReaderMemory>) -> Result<Self> {
-        let workspace = native_registry_workspace()?;
-        let pending = memory.reserve(workspace)?;
-        #[cfg(test)]
-        NATIVE_OPEN_COUNTS.with(|counts| {
-            let (registries, footers) = counts.get();
-            counts.set((registries + 1, footers));
-        });
+static NATIVE_READ_TEMPLATE: std::sync::LazyLock<NativeReadTemplate> =
+    std::sync::LazyLock::new(NativeReadTemplate::new);
+
+#[cfg(test)]
+static NATIVE_TEMPLATE_BUILDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+impl NativeReadTemplate {
+    fn new() -> Self {
         // Match the builtin registry defaults in VortexSessionDefault without
         // constructing its RuntimeSession, allocator or MultiFileSession cache.
         let registries = Self {
@@ -185,17 +183,17 @@ impl NativeReadRegistries {
             stats: Default::default(),
             aggregates: Default::default(),
             arrow: Default::default(),
-            memory,
-            workspace,
-            _pending: pending,
         };
-        // Registration is completed before publication. No schema/value input
-        // reaches this session, and read helpers only look up these shared maps.
         vortex::file::register_default_encodings(&registries.session());
-        Ok(registries)
+        #[cfg(test)]
+        NATIVE_TEMPLATE_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        registries
     }
 
     fn session(&self) -> VortexSession {
+        // VortexSession::clone shares a mutable type-map, NOT an independent
+        // snapshot. Start empty so late defaults and runtime rebinding stay
+        // scan-local. Only the eight immutable builtin registries are shared.
         VortexSession::empty()
             .with_some(self.dtypes.clone())
             .with_some(self.arrays.clone())
@@ -205,6 +203,42 @@ impl NativeReadRegistries {
             .with_some(self.stats.clone())
             .with_some(self.aggregates.clone())
             .with_some(self.arrow.clone())
+    }
+}
+
+/// The operation still owns exactly the same admission envelope. In particular
+/// reserve BEFORE first initializing the template, and do not discount shared
+/// registry memory on later operations. No query tracker is retained globally.
+/// SingleThreadRuntime must not be pooled: aborted scans can leave launch tasks.
+struct NativeReadRegistries {
+    template: &'static NativeReadTemplate,
+    memory: Arc<crate::reader::ReaderMemory>,
+    workspace: usize,
+    _pending: crate::reader::PendingMemory,
+}
+
+impl NativeReadRegistries {
+    fn new(memory: Arc<crate::reader::ReaderMemory>) -> Result<Self> {
+        let workspace = native_registry_workspace()?;
+        let pending = memory.reserve(workspace)?;
+        let template = &*NATIVE_READ_TEMPLATE;
+        // Another thread may have initialized the template while we waited.
+        crate::check_read_cancelled()?;
+        #[cfg(test)]
+        NATIVE_OPEN_COUNTS.with(|counts| {
+            let (registries, footers) = counts.get();
+            counts.set((registries + 1, footers));
+        });
+        Ok(Self {
+            template,
+            memory,
+            workspace,
+            _pending: pending,
+        })
+    }
+
+    fn session(&self) -> VortexSession {
+        self.template.session()
     }
 }
 
@@ -1867,7 +1901,7 @@ fn run_docs_encoder(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_docs_stream<W: std::io::Write + Unpin>(
+fn encode_docs_stream<W: std::io::Write + Unpin + Send>(
     runtime: &SingleThreadRuntime,
     session: VortexSession,
     schema: &Schema,
@@ -1878,19 +1912,27 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
     rx: &std::sync::mpsc::Receiver<DocsEncodeMsg>,
     sink: &mut W,
 ) -> Result<()> {
-    let dtype = DType::from_arrow(schema);
+    let session = legacy_write_session(session)?;
+    let dtype = session
+        .arrow()
+        .from_arrow_schema(schema)
+        .map_err(|e| VixError::Writer(format!("import Vortex write schema: {e}")))?;
     // #51c: the passthrough strategy computes NO vortex file statistics —
     // computing min/max over already-encoded chunks would decode them,
     // defeating the point. Read-side consumers of the footer stats treat
     // their absence as "cannot prune" (fail-open), verified on
     // `blob_column_stats` and its callers.
-    let mut options = VortexWriteOptions::new(session);
+    let mut options = VortexWriteOptions::new(legacy_write_session(session.clone())?);
     if docs_passthrough {
         options = options
-            .with_strategy(docs_passthrough_strategy(fail_open, resident_budget))
+            .with_strategy(docs_passthrough_strategy(
+                fail_open,
+                resident_budget,
+                &session,
+            ))
             .with_file_statistics(Vec::new());
     } else {
-        options = options.with_strategy(docs_strategy(rows_per_chunk));
+        options = options.with_strategy(docs_strategy(rows_per_chunk, &session));
     }
     let mut writer = options.blocking(runtime).writer(&mut *sink, dtype);
     let mut finished = false;
@@ -1910,11 +1952,15 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
                     while offset < rows {
                         let len = rows_per_chunk.min(rows - offset);
                         let part = batch.slice(offset, len);
-                        writer.push(ArrayRef::from_arrow(&part, false)?)?;
+                        writer.push(session.arrow().from_arrow_record_batch(part, schema)?)?;
                         offset += len;
                     }
                 } else {
-                    writer.push(ArrayRef::from_arrow(&batch, false)?)?;
+                    writer.push(
+                        session
+                            .arrow()
+                            .from_arrow_record_batch(batch.clone(), batch.schema().as_ref())?,
+                    )?;
                 }
             }
             DocsEncodeMsg::Encoded(chunk) => {
@@ -1949,17 +1995,48 @@ fn encode_docs_stream<W: std::io::Write + Unpin>(
     Ok(())
 }
 
+/// Pin every file writer and compressor to the last stable edition certified for 0.79 readers.
+/// Do this before constructing a strategy: builders snapshot the allowed IDs.
+fn legacy_write_session(session: VortexSession) -> Result<VortexSession> {
+    use vortex::editions::{CORE_2025_10_0, EditionSessionExt, EnabledEditions};
+    // Enabling core replaces only that family. Default plugins may also enable
+    // newer families (for example json2026.08.0); none may leak into 0.79 files.
+    session.register(EnabledEditions::default());
+    session.enable_edition(CORE_2025_10_0).map_err(|e| {
+        VixError::Writer(format!("enable Vortex 0.79-compatible write edition: {e}"))
+    })?;
+    Ok(session)
+}
+
+/// The exact array subset permitted by the pinned edition, also used by the
+/// passthrough guard. No runtime-only or post-0.79 wire encoding can escape it.
+static LEGACY_ARRAY_ENCODINGS: std::sync::LazyLock<
+    std::collections::HashSet<vortex::session::registry::Id>,
+> = std::sync::LazyLock::new(|| {
+    use vortex::editions::{
+        CORE_2025_05_0, CORE_2025_06_0, CORE_2025_10_0, ComponentKind, EDITION_DECLARATIONS,
+    };
+    EDITION_DECLARATIONS
+        .iter()
+        .filter(|d| [CORE_2025_05_0, CORE_2025_06_0, CORE_2025_10_0].contains(&d.edition.id))
+        .flat_map(|d| d.added.iter())
+        .filter(|m| m.kind == ComponentKind::Array)
+        .map(|m| m.component.component_id())
+        .collect()
+});
+
 /// The default compressed write strategy (BtrBlocks pipeline).
 /// `row_block_size == 0` keeps vortex's default. Retained as the legacy
 /// docs-compression baseline for tests comparing [`docs_strategy`]'s compact
 /// encodings and verifying stored-source round trips.
 #[cfg_attr(not(test), expect(dead_code))]
-pub(crate) fn compressed_strategy(row_block_size: usize) -> Arc<dyn LayoutStrategy> {
-    let mut builder = WriteStrategyBuilder::default();
+pub(crate) fn compressed_strategy(row_block_size: usize) -> Result<Arc<dyn LayoutStrategy>> {
+    let session = legacy_write_session(VortexSession::default())?;
+    let mut builder = WriteStrategyBuilder::from_session(&session);
     if row_block_size > 0 {
         builder = builder.with_row_block_size(row_block_size);
     }
-    builder.build()
+    Ok(builder.build())
 }
 
 /// The write strategy of the `docs` blob: the BtrBlocks pipeline
@@ -1979,9 +2056,12 @@ pub(crate) fn compressed_strategy(row_block_size: usize) -> Arc<dyn LayoutStrate
 /// read, so it is capped by a byte budget instead of following the data
 /// file's row-group size (128Ki rows would make every point read decode a
 /// multi-hundred-MB chunk). `0` keeps vortex's default.
-pub(crate) fn docs_strategy(row_block_size: usize) -> Arc<dyn LayoutStrategy> {
-    let mut builder = WriteStrategyBuilder::default()
-        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact());
+pub(crate) fn docs_strategy(
+    row_block_size: usize,
+    session: &VortexSession,
+) -> Arc<dyn LayoutStrategy> {
+    let mut builder = WriteStrategyBuilder::from_session(session)
+        .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact());
     if row_block_size > 0 {
         builder = builder.with_row_block_size(row_block_size);
     }
@@ -2083,9 +2163,12 @@ fn is_decoded_node(node: &ArrayRef) -> bool {
 pub(crate) fn docs_passthrough_strategy(
     fail_open: Arc<std::sync::atomic::AtomicU64>,
     resident_budget: u64,
+    session: &VortexSession,
 ) -> Arc<dyn LayoutStrategy> {
     use vortex::array::{Canonical, ExecutionCtx, IntoArray};
-    let compressor = BtrBlocksCompressorBuilder::default().with_compact().build();
+    let compressor = BtrBlocksCompressorBuilder::from_session(session)
+        .with_compact()
+        .build();
     let compress_or_pass =
         move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| -> vortex::error::VortexResult<ArrayRef> {
             // M25: a decoded-family ROOT takes the compress branch even when
@@ -2123,7 +2206,7 @@ pub(crate) fn docs_passthrough_strategy(
 }
 
 /// M18: whether every node of `array`'s tree carries an encoding the vortex
-/// FILE WRITER can serialize — membership in [`vortex::file::ALLOWED_ENCODINGS`],
+/// FILE WRITER can serialize — membership in [`LEGACY_ARRAY_ENCODINGS`],
 /// the exact id set the writer pre-seeds its `ArrayContext` with (its
 /// registry restriction can only be wider: every allowed id is registered).
 /// Runtime-only execution nodes (`vortex.slice`, `vortex.shared`,
@@ -2132,7 +2215,7 @@ pub(crate) fn docs_passthrough_strategy(
 pub(crate) fn is_ctx_serializable(array: &ArrayRef) -> bool {
     array
         .depth_first_traversal()
-        .all(|node| vortex::file::ALLOWED_ENCODINGS.contains(&node.encoding_id()))
+        .all(|node| LEGACY_ARRAY_ENCODINGS.contains(&node.encoding_id()))
 }
 
 /// The first non-serializable encoding id under `array` (diagnostics).
@@ -2140,12 +2223,12 @@ fn first_unserializable_id(array: &ArrayRef) -> Option<vortex::session::registry
     array
         .depth_first_traversal()
         .map(|node| node.encoding_id())
-        .find(|id| !vortex::file::ALLOWED_ENCODINGS.contains(id))
+        .find(|id| !LEGACY_ARRAY_ENCODINGS.contains(id))
 }
 
 /// Whether any node of `array`'s tree is a `vortex.shared` wrapper.
 pub(crate) fn contains_shared(array: &ArrayRef) -> bool {
-    use vortex::array::arrays::Shared;
+    use vortex::layout::arrays::shared::Shared;
     array
         .depth_first_traversal()
         .any(|node| node.is::<Shared>())
@@ -2178,9 +2261,8 @@ pub(crate) fn unwrap_shared(array: &ArrayRef) -> Option<ArrayRef> {
     use vortex::array::{
         IntoArray,
         arrays::{
-            Dict, DictArray, Shared,
+            Dict, DictArray,
             dict::{DictArrayExt, DictArraySlotsExt},
-            shared::SharedArrayExt,
         },
     };
     if !contains_shared(array) {
@@ -2226,10 +2308,11 @@ fn column_leaf_boundaries(vxf: &VortexFile) -> Option<Vec<Vec<u64>>> {
     use vortex::layout::LayoutChildType;
 
     fn collect(layout: &vortex::layout::LayoutRef, base: u64, out: &mut Vec<u64>) -> bool {
-        let types: Vec<LayoutChildType> = layout.child_types().collect();
+        let types: Vec<_> = (0..layout.nslots()).map(|i| layout.slot_type(i)).collect();
         let mut row_children: Vec<(u64, vortex::layout::LayoutRef)> = Vec::new();
         let mut transparent = 0usize;
         for (index, ty) in types.iter().enumerate() {
+            let Some(ty) = ty else { continue };
             let child_base = match ty {
                 LayoutChildType::Chunk((_, offset)) => base + offset,
                 LayoutChildType::Transparent(_) => {
@@ -2240,7 +2323,7 @@ fn column_leaf_boundaries(vxf: &VortexFile) -> Option<Vec<Vec<u64>>> {
                 // a nested struct column is not a docs-blob shape
                 LayoutChildType::Field(_) => return false,
             };
-            let Ok(child) = layout.child(index) else {
+            let Ok(Some(child)) = layout.slot(index) else {
                 return false;
             };
             row_children.push((child_base, child));
@@ -2261,13 +2344,14 @@ fn column_leaf_boundaries(vxf: &VortexFile) -> Option<Vec<Vec<u64>>> {
     }
 
     let root = vxf.footer().layout().clone();
-    let types: Vec<LayoutChildType> = root.child_types().collect();
+    let types: Vec<_> = (0..root.nslots()).map(|i| root.slot_type(i)).collect();
     let mut out: Vec<Vec<u64>> = Vec::with_capacity(types.len());
     for (index, ty) in types.iter().enumerate() {
+        let Some(ty) = ty else { continue };
         if !matches!(ty, LayoutChildType::Field(_)) {
             return None;
         }
-        let child = root.child(index).ok()?;
+        let child = root.slot(index).ok()??;
         let mut bounds = vec![0u64];
         if !collect(&child, 0, &mut bounds) {
             return None;
@@ -2319,7 +2403,10 @@ pub(crate) fn scan_blob_encoded_chunks(
 ) -> Result<u64> {
     use vortex::array::{
         Canonical, IntoArray,
-        arrays::{Struct, StructArray, struct_::StructArrayExt},
+        arrays::{
+            Struct, StructArray,
+            struct_::{StructArrayExt, StructArraySlotsExt},
+        },
         validity::Validity,
     };
 
@@ -2354,7 +2441,7 @@ pub(crate) fn scan_blob_encoded_chunks(
         let (window_start, window_end) = (offset, offset + len as u64);
         offset = window_end;
         let names = sa.names().clone();
-        let mut fields: Vec<ArrayRef> = sa.unmasked_fields().to_vec();
+        let mut fields: Vec<ArrayRef> = sa.fields().to_vec();
         if let Some(bounds) = &boundaries
             && bounds.len() != fields.len()
         {
@@ -2519,8 +2606,11 @@ impl TermsBlobSpooler {
             .spawn(move || -> Result<BlobPart> {
                 let runtime = SingleThreadRuntime::default();
                 let session = VortexSession::default().with_handle(runtime.handle());
-                let dtype = DType::from_arrow(schema.as_ref());
-                let mut writer = VortexWriteOptions::new(session)
+                let dtype = session
+                    .arrow()
+                    .from_arrow_schema(schema.as_ref())
+                    .map_err(|e| VixError::Writer(format!("import terms spool schema: {e}")))?;
+                let mut writer = VortexWriteOptions::new(legacy_write_session(session.clone())?)
                     .with_strategy(addressable_strategy())
                     .blocking(&runtime)
                     .writer(std::io::BufWriter::with_capacity(1024 * 1024, sink), dtype);
@@ -2528,7 +2618,11 @@ impl TermsBlobSpooler {
                     if batch.num_rows() == 0 {
                         continue;
                     }
-                    writer.push(ArrayRef::from_arrow(&batch, false)?)?;
+                    writer.push(
+                        session
+                            .arrow()
+                            .from_arrow_record_batch(batch.clone(), batch.schema().as_ref())?,
+                    )?;
                 }
                 if worker_abort.load(std::sync::atomic::Ordering::Acquire) {
                     return Err(VixError::Writer("terms spool aborted".to_string()));
@@ -2613,9 +2707,13 @@ fn write_vortex_blob_inner(
     batches: &[RecordBatch],
     strategy: Arc<dyn LayoutStrategy>,
 ) -> Result<Vec<u8>> {
-    let dtype = DType::from_arrow(schema);
+    let session = legacy_write_session(session)?;
+    let dtype = session
+        .arrow()
+        .from_arrow_schema(schema)
+        .map_err(|e| VixError::Writer(format!("import Vortex write schema: {e}")))?;
     let mut buf = Vec::new();
-    let mut writer = VortexWriteOptions::new(session)
+    let mut writer = VortexWriteOptions::new(legacy_write_session(session.clone())?)
         .with_strategy(strategy)
         .blocking(runtime)
         .writer(&mut buf, dtype);
@@ -2623,7 +2721,11 @@ fn write_vortex_blob_inner(
         if batch.num_rows() == 0 {
             continue;
         }
-        writer.push(ArrayRef::from_arrow(batch, false)?)?;
+        writer.push(
+            session
+                .arrow()
+                .from_arrow_record_batch(batch.clone(), schema)?,
+        )?;
     }
     writer.finish()?;
     Ok(buf)
@@ -2832,7 +2934,19 @@ fn open_blob_inner(
 /// Keep native metadata admission alive through the caller's schema
 /// publication rather than dropping it at the return boundary.
 pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, OpenedBlob)> {
-    // A new schema replaces the previous one before admitting its allocation.
+    read_blob_metadata(blob, |session, file| {
+        Ok(session.arrow().to_arrow_schema(file.dtype())?)
+    })
+}
+
+/// Resolve metadata once and let the immediately following scan consume its
+/// footer. This uses the same single-slot, operation-local ownership as schema
+/// reads: no runtime, IO bridge or uncharged metadata escapes the operation.
+fn read_blob_metadata<T>(
+    blob: &BlobHandle,
+    read: impl FnOnce(&VortexSession, &VortexFile) -> Result<T>,
+) -> Result<(T, OpenedBlob)> {
+    // New metadata replaces the previous slot before admitting its allocation.
     drop(NATIVE_SCHEMA_FOOTER.with(|slot| slot.take()));
     let mut setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
@@ -2851,7 +2965,7 @@ pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, Open
     };
     let metadata_session = reuse.as_ref().map(|_| setup.registries.session());
     let mut file = open_blob_inner(&runtime, &session, blob, metadata_session)?;
-    let schema = file.dtype().to_arrow_schema()?;
+    let result = read(&session, &file)?;
     if let Some((ranged, extra)) = reuse
         && let Some(pending) = file._pending.take()
     {
@@ -2868,7 +2982,7 @@ pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, Open
     drop(setup.memory_scope.take());
     file._runtime = Some(runtime);
     file._setup = Some(setup);
-    Ok((schema, file))
+    Ok((result, file))
 }
 
 /// Row selection for [`scan_blob`].
@@ -2961,7 +3075,7 @@ pub(crate) fn scan_blob_streaming(
     });
     let mut scan = vxf.scan()?;
     if let Some(columns) = projection {
-        scan = scan.with_projection(select(columns.to_vec(), root()));
+        scan = scan.with_projection(select(columns.to_vec(), root()).bind(vxf.dtype())?);
     }
     match selection {
         RowSelection::All => {}
@@ -2977,7 +3091,12 @@ pub(crate) fn scan_blob_streaming(
             if let (Some(&first), Some(&last)) = (indices.first(), indices.last()) {
                 scan = scan.with_row_range(first..last + 1);
             }
-            scan = scan.with_row_indices(Buffer::from(indices));
+            scan = scan.with_row_indices(
+                vortex::scan::strict_sorted_buffer::StrictSortedBuffer::try_new(Buffer::from(
+                    indices,
+                ))
+                .map_err(|e| VixError::Malformed(format!("sorted scan row indices: {e}")))?,
+            );
         }
         RowSelection::Range(range) => {
             scan = scan.with_row_range(range);
@@ -2989,9 +3108,9 @@ pub(crate) fn scan_blob_streaming(
             scan = scan.with_row_range(range).with_selection(selection);
         }
     }
-    scan = scan.with_some_filter(filter);
+    scan = scan.with_some_filter(filter.map(|f| f.bind(vxf.dtype())).transpose()?);
     scan = scan.with_some_limit(limit);
-    let arrow_schema = scan.dtype()?.to_arrow_schema()?;
+    let arrow_schema = session.arrow().to_arrow_schema(&scan.dtype()?)?;
     let data_type = DataType::Struct(arrow_schema.fields().clone());
     let mut chunks = scan.into_array_iter(&runtime)?;
     if let Some(operation) = conversion_operation {
@@ -3040,10 +3159,11 @@ pub(crate) fn blob_column_leaves(
         align: u64,
         out: &mut Vec<ColumnLeaf>,
     ) -> bool {
-        let types: Vec<LayoutChildType> = layout.child_types().collect();
+        let types: Vec<_> = (0..layout.nslots()).map(|i| layout.slot_type(i)).collect();
         let mut row_children: Vec<(u64, vortex::layout::LayoutRef)> = Vec::new();
         let mut transparent = 0usize;
         for (index, ty) in types.iter().enumerate() {
+            let Some(ty) = ty else { continue };
             let child_base = match ty {
                 LayoutChildType::Chunk((_, offset)) => base + offset,
                 LayoutChildType::Transparent(_) => {
@@ -3053,7 +3173,7 @@ pub(crate) fn blob_column_leaves(
                 LayoutChildType::Auxiliary(_) => continue,
                 LayoutChildType::Field(_) => return false,
             };
-            let Ok(child) = layout.child(index) else {
+            let Ok(Some(child)) = layout.slot(index) else {
                 return false;
             };
             row_children.push((child_base, child));
@@ -3080,33 +3200,35 @@ pub(crate) fn blob_column_leaves(
             .all(|(child_base, child)| collect(&child, child_base, segments, align, out))
     }
 
-    let setup = NativeReadSetup::new()?;
-    let runtime = SingleThreadRuntime::default();
-    let session = setup.session(runtime.handle());
-    let vxf = open_blob(&runtime, &session, blob)?;
-    let footer = vxf.footer();
-    let root = footer.layout().clone();
-    let Some(index) = root.child_names().position(|name| name.as_ref() == column) else {
-        return Ok(None);
-    };
-    if !matches!(root.child_type(index), LayoutChildType::Field(_)) {
-        return Ok(None);
-    }
-    let Ok(child) = root.child(index) else {
-        return Ok(None);
-    };
-    let segments = footer.segment_map();
-    let align = segments
-        .iter()
-        .map(|segment| *segment.alignment as u64)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let mut leaves = Vec::new();
-    if !collect(&child, 0, segments, align, &mut leaves) {
-        return Ok(None);
-    }
-    Ok(Some(leaves))
+    let (leaves, _file) = read_blob_metadata(blob, |_, vxf| {
+        let footer = vxf.footer();
+        let root = footer.layout().clone();
+        let Some(index) = (0..root.nslots()).find(|&i| {
+            root.slot_type(i)
+                .is_some_and(|ty| ty.name().as_ref() == column)
+        }) else {
+            return Ok(None);
+        };
+        if !matches!(root.slot_type(index), Some(LayoutChildType::Field(_))) {
+            return Ok(None);
+        }
+        let Ok(Some(child)) = root.slot(index) else {
+            return Ok(None);
+        };
+        let segments = footer.segment_map();
+        let align = segments
+            .iter()
+            .map(|segment| segment.alignment.as_usize() as u64)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        let mut leaves = Vec::new();
+        if !collect(&child, 0, segments, align, &mut leaves) {
+            return Ok(None);
+        }
+        Ok(Some(leaves))
+    })?;
+    Ok(leaves)
 }
 
 /// File-level `(min, max)` of one numeric column, straight from the vortex
@@ -3132,27 +3254,24 @@ pub(crate) fn blob_column_stats(
     let Some(stats) = footer.statistics() else {
         return Ok(None);
     };
-    let DType::Struct(sdt, _) = footer.dtype() else {
+    // New files may carry post-order nested statistics; their ordinal no longer
+    // equals the top-level schema ordinal. Legacy stats also expose field paths.
+    let path = vortex::dtype::FieldPath::from_name(column);
+    let Some((set, dtype)) = stats.get_by_path(&path) else {
         return Ok(None);
     };
-    let Some(index) = sdt.names().iter().position(|name| name.as_ref() == column) else {
-        return Ok(None);
-    };
-    if index >= stats.stats_sets().len() {
-        return Ok(None);
-    }
-    let (set, dtype) = stats.get(index);
     // only EXACT stats prune (an inexact bound must never skip a file)
     let numeric = |stat: Stat| -> Option<NumScalar> {
+        let Precision::Exact(value) = set.get(&stat.aggregate_fn()?) else {
+            return None;
+        };
         match dtype {
-            DType::Primitive(ptype, _) if ptype.is_int() => match set.get_as::<i64>(stat, dtype) {
-                Precision::Exact(v) => Some(NumScalar::I64(v)),
-                _ => None,
-            },
-            DType::Primitive(..) => match set.get_as::<f64>(stat, dtype) {
-                Precision::Exact(v) => Some(NumScalar::F64(v)),
-                _ => None,
-            },
+            DType::Primitive(ptype, _) if ptype.is_int() => {
+                i64::try_from(&value).ok().map(NumScalar::I64)
+            }
+            DType::Primitive(ptype, _) if ptype.is_float() => {
+                f64::try_from(&value).ok().map(NumScalar::F64)
+            }
             _ => None,
         }
     };
@@ -3302,9 +3421,7 @@ pub(crate) fn eq_string_rows_ranges(
     budget: &EqMatchBudget,
 ) -> Result<Option<Vec<u64>>> {
     use arrow::array::{StringArray, UInt64Array};
-    use vortex::array::arrays::{
-        Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt, struct_::StructArrayExt,
-    };
+    use vortex::array::arrays::{Dict, Struct, dict::DictArraySlotsExt, struct_::StructArrayExt};
 
     let setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
@@ -3334,7 +3451,7 @@ pub(crate) fn eq_string_rows_ranges(
         }
         let scan = vxf
             .scan()?
-            .with_projection(select(vec![name], root()))
+            .with_projection(select(vec![name], root()).bind(vxf.dtype())?)
             .with_row_range(range.clone());
         let mut row = range.start;
         for array in scan.into_array_iter(&runtime)? {
@@ -3352,7 +3469,7 @@ pub(crate) fn eq_string_rows_ranges(
                 .clone();
             let rows = field.len();
             // unwrap execution-cache wrappers so a stored dict is visible
-            let stored = match field.as_typed::<vortex::array::arrays::Shared>() {
+            let stored = match field.as_typed::<vortex::layout::arrays::shared::Shared>() {
                 Some(shared) => shared.source().clone(),
                 None => field.clone(),
             };
@@ -3475,10 +3592,10 @@ pub(crate) fn scan_eq_string_candidates_range(
     );
     let scan = vxf
         .scan()?
-        .with_projection(projection)
-        .with_filter(filter)
+        .with_projection(projection.bind(vxf.dtype())?)
+        .with_filter(filter.bind(vxf.dtype())?)
         .with_row_range(range);
-    let arrow_schema = scan.dtype()?.to_arrow_schema()?;
+    let arrow_schema = session.arrow().to_arrow_schema(&scan.dtype()?)?;
     let data_type = DataType::Struct(arrow_schema.fields().clone());
     for array in scan.into_array_iter(&runtime)? {
         let batch = vortex_to_record_batch(&session, array?, &data_type)?;
@@ -3565,8 +3682,8 @@ pub(crate) fn count_eq_string_matches(
     let projection = pack([(ROW_ID_COL, row_idx())], Nullability::NonNullable);
     let scan = vxf
         .scan()?
-        .with_projection(projection)
-        .with_filter(filter)
+        .with_projection(projection.bind(vxf.dtype())?)
+        .with_filter(filter.bind(vxf.dtype())?)
         .with_row_range(range);
     let mut count = 0u64;
     for array in scan.into_array_iter(&runtime)? {
@@ -3668,12 +3785,12 @@ fn visit_vortex_dict_chunks(
     let projection = select(columns, root());
     let boundaries = {
         let layout_reader = vxf.layout_reader()?;
-        let masks = referenced_field_masks(&projection, None, vxf.dtype())?;
+        let masks = referenced_field_masks(&projection.bind(vxf.dtype())?, None)?;
         SplitBy::Layout.splits(layout_reader.as_ref(), &range, &masks)?
     };
-    let values_type = projection
-        .return_dtype(vxf.dtype())?
-        .to_arrow_schema()?
+    let values_type = session
+        .arrow()
+        .to_arrow_schema(&projection.return_dtype(vxf.dtype())?)?
         .field_with_name(name)
         .map_err(|_| VixError::Malformed(format!("blob is missing column {name:?}")))?
         .data_type()
@@ -3689,7 +3806,7 @@ fn visit_vortex_dict_chunks(
         // dictionary values when this window finishes instead of accumulating
         // the values from every preceding physical dictionary.
         let scan = vxf.scan()?
-            .with_projection(projection.clone())
+            .with_projection(projection.bind(vxf.dtype())?)
             .with_row_range(window[0]..window_end)
             .with_ordered(true)
             // The outer projected natural grid already bounds this window.
@@ -3835,12 +3952,12 @@ pub(crate) fn hash_blob_column_bloom_encoded(
     use vortex::{
         array::{
             arrays::{
-                Dict, Struct, dict::DictArraySlotsExt, shared::SharedArrayExt,
-                struct_::StructArrayExt, varbin::VarBinArrayExt,
+                Dict, Struct, dict::DictArraySlotsExt, struct_::StructArrayExt,
+                varbin::VarBinArrayExt,
             },
             validity::Validity,
         },
-        encodings::fsst::{FSST, FSSTArrayExt},
+        encodings::fsst::{FSST, FSSTArrayExt, FSSTArraySlotsExt},
     };
 
     let mut census = BloomEncodingCensus::default();
@@ -3848,12 +3965,14 @@ pub(crate) fn hash_blob_column_bloom_encoded(
     let runtime = SingleThreadRuntime::default();
     let session = setup.session(runtime.handle());
     let vxf = open_blob(&runtime, &session, blob)?;
-    let scan = vxf.scan()?.with_projection(select(vec![name], root()));
+    let scan = vxf
+        .scan()?
+        .with_projection(select(vec![name], root()).bind(vxf.dtype())?);
     // the decoded path hashes nothing for non-string columns
     // (StringColumn::try_new returns None) — parity demands the same here
-    let stored_type = scan
-        .dtype()?
-        .to_arrow_schema()?
+    let stored_type = session
+        .arrow()
+        .to_arrow_schema(&scan.dtype()?)?
         .field_with_name(name)
         .map_err(|_| VixError::Malformed(format!("blob is missing column {name:?}")))?
         .data_type()
@@ -3891,7 +4010,7 @@ pub(crate) fn hash_blob_column_bloom_encoded(
             .clone();
         let rows = field.len();
         // unwrap execution-cache wrappers so the stored encoding is visible
-        let stored = match field.as_typed::<vortex::array::arrays::Shared>() {
+        let stored = match field.as_typed::<vortex::layout::arrays::shared::Shared>() {
             Some(shared) => shared.source().clone(),
             None => field.clone(),
         };
@@ -3971,7 +4090,8 @@ pub(crate) fn hash_blob_column_bloom_encoded(
                     return Ok(false);
                 }
                 let total: usize = lens.values().iter().map(|&l| l as usize).sum();
-                let compressed = codes.sliced_bytes();
+                let mut ctx = session.create_execution_ctx();
+                let compressed = codes.sliced_bytes(&mut ctx);
                 let decompressor = fsst.decompressor();
                 let mut heap: Vec<u8> = Vec::with_capacity(total + 7);
                 let produced =
@@ -4109,7 +4229,7 @@ pub(crate) fn probe_column_encodings(docs: &crate::VixDocs, name: &str) {
     let scan = vxf
         .scan()
         .unwrap()
-        .with_projection(select(vec![name], root()));
+        .with_projection(select(vec![name], root()).bind(vxf.dtype()).unwrap());
     for (i, array) in scan.into_array_iter(&runtime).unwrap().enumerate() {
         let array = array.unwrap();
         let field = array

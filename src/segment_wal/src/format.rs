@@ -994,10 +994,10 @@ fn detach_pinned_columns(batch: RecordBatch) -> Result<RecordBatch, ArrowError> 
             if pins_larger_allocation(data) {
                 deep_copy_array(data)
             } else {
-                Arc::clone(column)
+                Ok(Arc::clone(column))
             }
         })
-        .collect();
+        .collect::<Result<Vec<_>, ArrowError>>()?;
     RecordBatch::try_new_with_options(
         batch.schema(),
         columns,
@@ -1013,17 +1013,17 @@ fn pins_larger_allocation(data: &ArrayData) -> bool {
         || data.child_data().iter().any(pins_larger_allocation)
 }
 
-fn deep_copy_array(data: &ArrayData) -> ArrayRef {
+fn deep_copy_array(data: &ArrayData) -> Result<ArrayRef, ArrowError> {
     let mut copy = MutableArrayData::new(vec![data], false, data.len());
-    copy.extend(0, 0, data.len());
+    copy.try_extend(0, 0, data.len())?;
     let array = make_array(copy.freeze());
     // MutableArrayData shares the variadic payload buffers of view arrays;
     // gc() rewrites them into owned, exactly sized buffers.
-    match array.data_type() {
+    Ok(match array.data_type() {
         DataType::Utf8View => Arc::new(array.as_string_view().gc()),
         DataType::BinaryView => Arc::new(array.as_binary_view().gc()),
         _ => array,
-    }
+    })
 }
 
 /// Exact inverse of `StreamType`'s `Display` impl. Returns None on unknown

@@ -132,13 +132,21 @@ impl VisitorMut for ColumnVisitor<'_> {
             && let OrderByKind::Expressions(exprs) = &mut order_by.kind
         {
             for order in exprs.iter_mut() {
+                // A custom USING operator is not proof of ascending/descending
+                // order. Keep only the known leading prefix, never later keys.
+                if matches!(
+                    order.options.sort,
+                    Some(sqlparser::ast::OrderBySort::Using(_))
+                ) {
+                    break;
+                }
                 let mut name_visitor = FieldNameVisitor::new();
                 let _ = order.expr.visit(&mut name_visitor);
                 if name_visitor.field_names.len() == 1 {
                     let expr_name = name_visitor.field_names.iter().next().unwrap().to_string();
                     self.order_by.push((
                         expr_name,
-                        if order.options.asc.unwrap_or(true) {
+                        if !matches!(order.options.sort, Some(sqlparser::ast::OrderBySort::Desc)) {
                             OrderBy::Asc
                         } else {
                             OrderBy::Desc
@@ -634,5 +642,31 @@ mod tests {
 
         assert_eq!(visitor.limit, Some(5));
         assert_eq!(visitor.offset, Some(0));
+    }
+
+    #[test]
+    fn using_sort_is_not_an_ascending_order_proof() {
+        for (sql, expected_len) in [
+            ("SELECT * FROM users ORDER BY name USING >, age ASC", 0),
+            (
+                "SELECT * FROM users ORDER BY age DESC, name USING >, id ASC",
+                1,
+            ),
+        ] {
+            let mut statement = sqlparser::parser::Parser::parse_sql(
+                &sqlparser::dialect::PostgreSqlDialect {},
+                sql,
+            )
+            .unwrap()
+            .pop()
+            .unwrap();
+            let schemas = make_schemas();
+            let mut visitor = ColumnVisitor::new(&schemas);
+            let _ = statement.visit(&mut visitor);
+            assert_eq!(visitor.order_by.len(), expected_len, "{sql}");
+            if expected_len == 1 {
+                assert_eq!(visitor.order_by[0], ("age".to_string(), OrderBy::Desc));
+            }
+        }
     }
 }

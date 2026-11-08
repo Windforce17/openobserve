@@ -446,7 +446,7 @@ impl TableProvider for NewMemTable {
     async fn scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
+        projection: Option<&[usize]>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -464,7 +464,7 @@ impl TableProvider for NewMemTable {
         {
             needed.push(timestamp_idx);
         }
-        if let Some(v) = projection.as_ref() {
+        if let Some(v) = projection {
             needed.extend(v.iter().copied());
         } else {
             needed.extend(0..plan_schema.fields().len());
@@ -475,7 +475,7 @@ impl TableProvider for NewMemTable {
         // the requested projection, remapped to positions within `needed`
         // (the adapted output's column order) — the final narrowing that
         // `apply_combined_filter` applies after filtering
-        let requested_in_needed = projection.as_ref().map(|p| {
+        let requested_in_needed = projection.map(|p| {
             p.iter()
                 .filter_map(|i| needed.iter().position(|f| f == i))
                 .collect::<Vec<_>>()
@@ -527,7 +527,7 @@ impl TableProvider for NewMemTable {
             &projection_exec.schema(),
             &self.fst_fields,
             projection_exec,
-            requested_in_needed.as_ref(),
+            requested_in_needed.as_deref(),
         )?;
 
         apply_sort(filter_exec, self.sorted_by_time)

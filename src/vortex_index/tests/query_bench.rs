@@ -307,7 +307,7 @@ fn bench_demoted_trace_classes(
                 .count() as u64
         }
     };
-    let mut scan_eq = |threads: usize| -> u64 {
+    let scan_eq = |threads: usize| -> u64 {
         let mut hits = 0u64;
         docs.scan_docs_opts(
             Some(&projection),

@@ -29,11 +29,11 @@ use arrow::{
 };
 use datafusion::{
     common::{Result, ScalarValue, exec_err, plan_err, types::NativeType},
-    functions_aggregate::approx_percentile_cont::ApproxPercentileCont,
     logical_expr::{
         Accumulator, AggregateUDF, AggregateUDFImpl, Coercion, EmitTo, GroupsAccumulator,
         Signature, TypeSignature, TypeSignatureClass, Volatility,
         function::{AccumulatorArgs, StateFieldsArgs},
+        utils::format_state_name,
     },
 };
 use datafusion_functions_aggregate_common::tdigest::TDigest;
@@ -171,8 +171,29 @@ impl AggregateUDFImpl for SharedPercentiles {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        // Keep the public stock digest state schema, including its list item nullability.
-        ApproxPercentileCont::new().state_fields(args)
+        // Our configured quantiles travel in the extension codec, not in each
+        // digest. DF56 stock APPROX_PERCENTILE_CONT adds a seventh state field
+        // for its runtime percentile; preserve our existing six-column wire.
+        Ok([
+            ("max_size", DataType::UInt64),
+            ("sum", DataType::Float64),
+            ("count", DataType::Float64),
+            ("max", DataType::Float64),
+            ("min", DataType::Float64),
+            (
+                "centroids",
+                DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true))),
+            ),
+        ]
+        .into_iter()
+        .map(|(name, data_type)| {
+            Arc::new(Field::new(
+                format_state_name(args.name, name),
+                data_type,
+                false,
+            ))
+        })
+        .collect())
     }
 
     fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
@@ -527,7 +548,6 @@ impl GroupsAccumulator for SharedGroupsAccumulator {
         &mut self,
         states: &[ArrayRef],
         group_indices: &[usize],
-        opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
         validate_states(states)?;
@@ -535,7 +555,7 @@ impl GroupsAccumulator for SharedGroupsAccumulator {
             return exec_err!("{NAME} state/group lengths do not match");
         }
         self.gather
-            .prepare(group_indices, opt_filter, total_num_groups, None)?;
+            .prepare(group_indices, None, total_num_groups, None)?;
         self.digests
             .resize_with(total_num_groups, || TDigest::new(self.config.max_centroids));
         let mut incoming = Vec::new();
@@ -583,10 +603,6 @@ impl GroupsAccumulator for SharedGroupsAccumulator {
         });
         // Stream through the public serializer rather than retain one digest per row.
         digest_states(digests)
-    }
-
-    fn supports_convert_to_state(&self) -> bool {
-        true
     }
 
     fn size(&self) -> usize {
@@ -703,7 +719,11 @@ where
 #[cfg(test)]
 mod tests {
     use datafusion::{
-        functions_aggregate::approx_percentile_cont::ApproxPercentileAccumulator,
+        functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf,
+        physical_expr::{
+            aggregate::AggregateExprBuilder,
+            expressions::{col as physical_col, lit},
+        },
         prelude::{SessionContext, col},
     };
     use datafusion_functions_aggregate_common::tdigest::DEFAULT_MAX_SIZE;
@@ -716,21 +736,35 @@ mod tests {
             .config
     }
 
-    fn stock(config: &Config, value_type: &DataType) -> Vec<ApproxPercentileAccumulator> {
+    fn stock(config: &Config, value_type: &DataType) -> Vec<Box<dyn Accumulator>> {
         config
             .quantile_bits
             .iter()
             .map(|bits| {
-                ApproxPercentileAccumulator::new_with_max_size(
-                    f64::from_bits(*bits),
+                let schema = Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                    "v",
                     value_type.clone(),
-                    config.max_centroids,
+                    true,
+                )]));
+                AggregateExprBuilder::new(
+                    approx_percentile_cont_udaf(),
+                    vec![
+                        physical_col("v", &schema).unwrap(),
+                        lit(f64::from_bits(*bits)),
+                        lit(config.max_centroids as i64),
+                    ],
                 )
+                .schema(schema)
+                .alias("stock")
+                .build()
+                .unwrap()
+                .create_accumulator()
+                .unwrap()
             })
             .collect()
     }
 
-    fn assert_row(result: &StructArray, row: usize, expected: &mut [ApproxPercentileAccumulator]) {
+    fn assert_row(result: &StructArray, row: usize, expected: &mut [Box<dyn Accumulator>]) {
         for (column, expected) in result.columns().iter().zip(expected) {
             assert_eq!(
                 ScalarValue::try_from_array(column, row).unwrap(),
@@ -831,7 +865,7 @@ mod tests {
     }
 
     fn update_stock_groups(
-        expected: &mut [Vec<ApproxPercentileAccumulator>],
+        expected: &mut [Vec<Box<dyn Accumulator>>],
         values: &ArrayRef,
         groups: &[usize],
         filter: Option<&BooleanArray>,
@@ -856,10 +890,7 @@ mod tests {
     fn grouped_special_floats_update_merge_and_bypass_match_stock() {
         // Compare NaN classification rather than payloads, while retaining exact
         // finite values, infinity signs, signed zero, output types and NULLs.
-        fn assert_special_result(
-            result: &ArrayRef,
-            expected: &mut [Vec<ApproxPercentileAccumulator>],
-        ) {
+        fn assert_special_result(result: &ArrayRef, expected: &mut [Vec<Box<dyn Accumulator>>]) {
             let result = result.as_any().downcast_ref::<StructArray>().unwrap();
             let as_float = |value: ScalarValue| match value {
                 ScalarValue::Float16(value) => value.map(|v| v.to_f64()),
@@ -974,12 +1005,7 @@ mod tests {
                     .unwrap();
                 update_stock_groups(&mut expected_partial, &batch, groups, Some(&filter));
                 merged
-                    .merge_batch(
-                        &partial.state(EmitTo::All).unwrap(),
-                        &[0, 1, 2, 3, 4],
-                        None,
-                        5,
-                    )
+                    .merge_batch(&partial.state(EmitTo::All).unwrap(), &[0, 1, 2, 3, 4], 5)
                     .unwrap();
                 for group in 0..5 {
                     for slot in 0..config.quantile_bits.len() {
@@ -993,7 +1019,7 @@ mod tests {
                 let states = partial
                     .convert_to_state(&[Arc::clone(&batch)], Some(&filter))
                     .unwrap();
-                bypassed.merge_batch(&states, groups, None, 5).unwrap();
+                bypassed.merge_batch(&states, groups, 5).unwrap();
                 for group in 0..5 {
                     for slot in 0..config.quantile_bits.len() {
                         let mut states = Vec::new();
@@ -1025,8 +1051,11 @@ mod tests {
     #[test]
     fn float64_sliced_special_values_preserve_stock_state_bits() {
         fn assert_state_bits(actual: &[ScalarValue], expected: &[ScalarValue]) {
-            assert_eq!(actual.len(), expected.len());
-            for (actual, expected) in actual.iter().zip(expected) {
+            // DF56 appends runtime q; SharedPercentiles carries q in its codec.
+            assert_eq!(actual.len(), 6);
+            assert_eq!(expected.len(), 7);
+            assert_eq!(expected[6], ScalarValue::Float64(Some(0.5)));
+            for (actual, expected) in actual.iter().zip(&expected[..6]) {
                 match (actual, expected) {
                     (ScalarValue::Float64(actual), ScalarValue::Float64(expected)) => {
                         assert_eq!(actual.map(f64::to_bits), expected.map(f64::to_bits));
@@ -1191,7 +1220,7 @@ mod tests {
         let mut expected_final: Vec<_> =
             (0..2).map(|_| stock(&config, &DataType::Float64)).collect();
         let prefix = partial.state(EmitTo::First(1)).unwrap();
-        final_acc.merge_batch(&prefix, &[0], None, 2).unwrap();
+        final_acc.merge_batch(&prefix, &[0], 2).unwrap();
         for (slot, acc) in expected_final[0].iter_mut().enumerate() {
             acc.merge_batch(&state_columns(vec![
                 expected_partial[0][slot].state().unwrap(),
@@ -1200,7 +1229,7 @@ mod tests {
         }
         // The retained groups were shifted by state(First), not discarded.
         let rest = partial.state(EmitTo::All).unwrap();
-        final_acc.merge_batch(&rest, &[1, 0], None, 2).unwrap();
+        final_acc.merge_batch(&rest, &[1, 0], 2).unwrap();
         for (source, target) in [(1, 1), (2, 0)] {
             for (slot, acc) in expected_final[target].iter_mut().enumerate() {
                 acc.merge_batch(&state_columns(vec![
@@ -1221,7 +1250,7 @@ mod tests {
         let states = partial
             .convert_to_state(&[Arc::clone(&values)], Some(&filter))
             .unwrap();
-        final_acc.merge_batch(&states, &groups, None, 2).unwrap();
+        final_acc.merge_batch(&states, &groups, 2).unwrap();
         for group in 0..2 {
             for slot in 0..config.quantile_bits.len() {
                 let mut rows = Vec::new();
@@ -1255,7 +1284,10 @@ mod tests {
                 .iter()
                 .map(|array| ScalarValue::try_from_array(array, row).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(actual, expected_partial[source][0].state().unwrap());
+            let expected = expected_partial[source][0].state().unwrap();
+            assert_eq!(expected.len(), 7);
+            assert_eq!(expected[6], ScalarValue::Float64(Some(0.0)));
+            assert_eq!(actual, expected[..6]);
         }
     }
 

@@ -2819,7 +2819,12 @@ fn build_tables_from_batches(
     time_range: (i64, i64),
     retained: Option<Arc<RetainedBytes>>,
 ) -> Result<Vec<Arc<dyn TableProvider>>> {
-    let latest_schema = Arc::new(schema.as_ref().clone().with_metadata(Default::default()));
+    let latest_schema = Arc::new(
+        schema
+            .as_ref()
+            .clone()
+            .with_metadata(arrow_schema::Metadata::default()),
+    );
     let batch_groups = group_by_batch_schema(batches);
 
     let mut tables: Vec<Arc<dyn TableProvider>> = Vec::with_capacity(batch_groups.len());

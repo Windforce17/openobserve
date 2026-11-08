@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, DictionaryArray, RecordBatch};
-use datafusion::arrow::datatypes::{Field, Int64Type, Int8Type, Schema};
+use datafusion::arrow::array::{Array, ArrayRef, AsArray, DictionaryArray, RecordBatch};
+use datafusion::arrow::datatypes::{Field, Int64Type, Int8Type, Metadata, Schema};
 use datafusion::arrow::{array::StringDictionaryBuilder, datatypes::DataType};
 use datafusion::assert_batches_eq;
 use datafusion::common::ScalarValue;
@@ -184,7 +183,7 @@ async fn test_json_get_array_inner_field_json_metadata() {
     assert_json_field_metadata(produced_inner.metadata());
 }
 
-fn assert_json_field_metadata(metadata: &HashMap<String, String>) {
+fn assert_json_field_metadata(metadata: &Metadata) {
     assert_eq!(
         metadata.get("ARROW:extension:name").map(String::as_str),
         Some("arrow.json")
@@ -194,14 +193,37 @@ fn assert_json_field_metadata(metadata: &HashMap<String, String>) {
 
 #[tokio::test]
 async fn test_json_get_equals() {
-    let e = run_query(r"select name, json_get(json_data, 'foo')='abc' from test")
+    // DataFusion 56 coerces the json_get Union for comparisons (`union_coercion`);
+    // DataFusion 54 rejected this query at planning time, see
+    // https://github.com/apache/datafusion/issues/10180
+    let batches = run_query(r"select name, json_get(json_data, 'foo')='abc' from test")
         .await
-        .unwrap_err();
-
-    // see https://github.com/apache/datafusion/issues/10180
-    assert!(e
-        .to_string()
-        .starts_with("Error during planning: Cannot infer common argument type for comparison operation Union"));
+        .unwrap();
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    assert_eq!(
+        batch.schema().field(1).name(),
+        r#"json_get(test.json_data,Utf8("foo")) = Utf8("abc")"#
+    );
+    let names = batch.column(0).as_string_view();
+    let matches = batch.column(1).as_boolean();
+    let rows: Vec<(&str, Option<bool>)> = names
+        .iter()
+        .zip(matches.iter())
+        .map(|(name, matched)| (name.unwrap(), matched))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("object_foo", Some(true)),
+            ("object_foo_array", None),
+            ("object_foo_obj", None),
+            ("object_foo_null", None),
+            ("object_bar", None),
+            ("list_foo", None),
+            ("invalid_json", None),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1465,12 +1487,19 @@ async fn test_plan_double_arrow_double_nested_cast() {
     let lines = logical_plan(r"explain select (json_data->>'foo'->>0)::int from test").await;
 
     // NB: json_as_text(..)::int is NOT the same as `json_get_int(..)`, hence the cast is not rewritten
+    // DataFusion 56 displays the operator alias inside the cast; the output
+    // column keeps the operator name, as with DataFusion 54.
     let expected = [
-        "Projection: CAST(json_as_text(test.json_data, Utf8(\"foo\"), Int64(0)) AS Int32) AS json_data ->> 'foo' ->> 0",
+        "Projection: CAST(json_as_text(test.json_data, Utf8(\"foo\"), Int64(0)) AS json_data ->> 'foo' ->> 0 AS Int32)",
         "  TableScan: test projection=[json_data]",
     ];
 
     assert_eq!(lines, expected);
+
+    let batches = run_query(r"select (json_data->>'foo'->>0)::int from test")
+        .await
+        .unwrap();
+    assert_eq!(batches[0].schema().field(0).name(), "json_data ->> 'foo' ->> 0");
 }
 
 #[tokio::test]

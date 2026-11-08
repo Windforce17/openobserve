@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::StreamExt as _;
-use vortex_array::ArrayContext;
 use vortex_array::ArrayRef;
 use vortex_array::ExecutionCtx;
 use vortex_array::VortexSessionExecute;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::UncompressedSizeInBytes;
+use vortex_array::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use vortex_array::expr::stats::Stat;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_error::VortexResult;
@@ -18,6 +19,7 @@ use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutRef;
 use crate::LayoutStrategy;
+use crate::LayoutWriterContext;
 use crate::segments::SegmentSinkRef;
 use crate::sequence::SendableSequentialStream;
 use crate::sequence::SequencePointer;
@@ -89,7 +91,7 @@ impl CompressingStrategy {
 impl LayoutStrategy for CompressingStrategy {
     async fn write_stream(
         &self,
-        ctx: ArrayContext,
+        ctx: LayoutWriterContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
         eof: SequencePointer,
@@ -110,8 +112,12 @@ impl LayoutStrategy for CompressingStrategy {
                 handle.spawn_cpu(move || {
                     let (sequence_id, chunk) = chunk?;
                     let mut ctx = session.create_execution_ctx();
-                    // Compute the stats for the chunk prior to compression
+                    // Compute the stats for the chunk prior to compression. The exact
+                    // uncompressed size is measured once here and cached for the compressor.
                     chunk.statistics().compute_all(&stats, &mut ctx)?;
+                    if UncompressedSizeInBytes::supports_dtype(chunk.dtype()) {
+                        uncompressed_size_in_bytes(&chunk, &mut ctx)?;
+                    }
                     Ok((sequence_id, compressor.compress_chunk(&chunk, &mut ctx)?))
                 })
             })
@@ -126,9 +132,5 @@ impl LayoutStrategy for CompressingStrategy {
                 &session,
             )
             .await
-    }
-
-    fn buffered_bytes(&self) -> u64 {
-        self.child.buffered_bytes()
     }
 }

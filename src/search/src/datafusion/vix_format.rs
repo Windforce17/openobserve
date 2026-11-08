@@ -660,6 +660,26 @@ impl fmt::Debug for VixCoreSource {
 }
 
 impl FileSource for VixCoreSource {
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn PhysicalExpr>,
+        ) -> Result<datafusion::common::tree_node::TreeNodeRecursion>,
+    ) -> Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.projection
+                .source
+                .iter()
+                .map(|projection| &projection.expr)
+                .chain(
+                    self.late_source_predicate
+                        .iter()
+                        .map(LateSourcePredicate::expression),
+                ),
+            f,
+        )
+    }
+
     fn create_file_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
@@ -955,8 +975,7 @@ fn batch_slice_memory_size(batch: &RecordBatch) -> Result<usize> {
     }
     fn array_bytes(array: &dyn Array) -> Result<usize> {
         let data = array.to_data();
-        let bytes = data
-            .get_slice_memory_size()?
+        let bytes = config::utils::arrow::slice_memory_size_without_view_buffers(&data)?
             .saturating_add(view_backing_bytes(&data));
         Ok(bytes.saturating_add(std::mem::size_of::<arrow::array::ArrayData>()))
     }
@@ -2959,7 +2978,9 @@ mod tests {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_object_store_registry(Arc::new(registry))
             .build()?;
-        let mut session_config = SessionConfig::new().with_target_partitions(3);
+        let mut session_config = SessionConfig::new()
+            .with_collect_statistics(true)
+            .with_target_partitions(3);
         session_config
             .options_mut()
             .execution
@@ -2978,8 +2999,6 @@ mod tests {
             Field::new("level", DataType::Utf8, true),
         ]));
         let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)))
-            .with_collect_stat(true)
-            .with_target_partitions(3)
             .with_file_sort_order(vec![vec![
                 datafusion::prelude::col(TIMESTAMP_COL_NAME).sort(false, false),
             ]]);
@@ -3189,7 +3208,9 @@ mod tests {
             .build()?;
         // canonical storage keys live DEEP under the listing prefix —
         // mirror exec.rs: nested files must not be ignored
-        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        let mut session_config = SessionConfig::new()
+            .with_collect_statistics(true)
+            .with_target_partitions(2);
         session_config
             .options_mut()
             .execution
@@ -3205,9 +3226,7 @@ mod tests {
             Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
             Field::new("level", DataType::Utf8, true),
         ]));
-        let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)))
-            .with_collect_stat(true)
-            .with_target_partitions(2);
+        let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)));
         let config = ListingTableConfig::new(ListingTableUrl::parse(format!(
             "test:///files/m19org{run}/"
         ))?)
@@ -3489,7 +3508,9 @@ mod tests {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_object_store_registry(Arc::new(registry))
             .build()?;
-        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        let mut session_config = SessionConfig::new()
+            .with_collect_statistics(true)
+            .with_target_partitions(2);
         session_config
             .options_mut()
             .execution
@@ -3507,9 +3528,7 @@ mod tests {
         ]));
         let mut listing_options = ListingOptions::new(Arc::new(
             VixCoreFormat::new(None).with_ordered_output(ordered_source),
-        ))
-        .with_collect_stat(true)
-        .with_target_partitions(2);
+        ));
         if declare_sort {
             listing_options = listing_options.with_file_sort_order(vec![vec![
                 datafusion::prelude::col(TIMESTAMP_COL_NAME).sort(false, false),
@@ -4080,7 +4099,9 @@ mod review_tests {
         let runtime_env = RuntimeEnvBuilder::new()
             .with_object_store_registry(Arc::new(registry))
             .build()?;
-        let mut session_config = SessionConfig::new().with_target_partitions(2);
+        let mut session_config = SessionConfig::new()
+            .with_collect_statistics(true)
+            .with_target_partitions(2);
         session_config
             .options_mut()
             .execution
@@ -4098,8 +4119,6 @@ mod review_tests {
             false,
         )]));
         let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)))
-            .with_collect_stat(true)
-            .with_target_partitions(2)
             .with_file_sort_order(vec![vec![
                 datafusion::prelude::col(TIMESTAMP_COL_NAME).sort(false, false),
             ]]);
@@ -4157,13 +4176,16 @@ mod review_tests {
                 .with_memory_pool(Arc::clone(&peak_pool) as _)
                 .build()?;
             let state = SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(1))
+                .with_config(
+                    SessionConfig::new()
+                        .with_collect_statistics(true)
+                        .with_target_partitions(1),
+                )
                 .with_runtime_env(Arc::new(runtime_env))
                 .with_default_features()
                 .build();
             let ctx = SessionContext::new_with_state(state);
-            let listing_options =
-                ListingOptions::new(Arc::new(VixCoreFormat::new(None))).with_collect_stat(true);
+            let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)));
             let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/")?)
                 .with_listing_options(listing_options)
                 .with_schema(logical_schema());
@@ -4721,8 +4743,7 @@ mod ranged_tests {
                     create_session_config(false, 1).unwrap(),
                     Arc::new(runtime),
                 );
-                let options = ListingOptions::new(Arc::new(VixCoreFormat::new(Some((1001, 1003)))))
-                    .with_collect_stat(true);
+                let options = ListingOptions::new(Arc::new(VixCoreFormat::new(Some((1001, 1003)))));
                 let config = ListingTableConfig::new(
                     ListingTableUrl::parse(format!("test:///{trace}/schema=schema/format=vix/"))
                         .unwrap(),
@@ -4842,7 +4863,11 @@ mod prod_probe_tests {
                 .with_object_store_registry(Arc::new(registry))
                 .build()?;
             let state = SessionStateBuilder::new()
-                .with_config(SessionConfig::new().with_target_partitions(1))
+                .with_config(
+                    SessionConfig::new()
+                        .with_collect_statistics(true)
+                        .with_target_partitions(1),
+                )
                 .with_runtime_env(Arc::new(runtime_env))
                 .with_default_features()
                 .build();
@@ -4851,8 +4876,7 @@ mod prod_probe_tests {
                 Field::new(TIMESTAMP_COL_NAME, DataType::Int64, false),
                 Field::new(SOURCE_COL_NAME, DataType::Utf8, true),
             ]));
-            let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(ts_filter)))
-                .with_collect_stat(true);
+            let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(ts_filter)));
             let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/")?)
                 .with_listing_options(listing_options)
                 .with_schema(Arc::clone(&table_schema));
@@ -5065,7 +5089,11 @@ mod m4_pruning_tests {
             .with_object_store_registry(Arc::new(registry))
             .build()?;
         let state = SessionStateBuilder::new()
-            .with_config(SessionConfig::new().with_target_partitions(1))
+            .with_config(
+                SessionConfig::new()
+                    .with_collect_statistics(true)
+                    .with_target_partitions(1),
+            )
             .with_runtime_env(Arc::new(runtime_env))
             .with_default_features()
             .build();
@@ -5076,8 +5104,7 @@ mod m4_pruning_tests {
             Field::new("level", DataType::Utf8, true),
             Field::new("ghost", DataType::Utf8, true),
         ]));
-        let listing_options =
-            ListingOptions::new(Arc::new(VixCoreFormat::new(None))).with_collect_stat(true);
+        let listing_options = ListingOptions::new(Arc::new(VixCoreFormat::new(None)));
         let config = ListingTableConfig::new(ListingTableUrl::parse("test:///data/")?)
             .with_listing_options(listing_options)
             .with_schema(table_schema);
@@ -5344,10 +5371,7 @@ fn inject_vix_scan_pruning_with_all(
     use datafusion::{
         common::tree_node::{Transformed, TreeNode},
         logical_expr::Operator,
-        physical_plan::{
-            coalesce_batches::CoalesceBatchesExec, expressions as phys, filter::FilterExec,
-            repartition::RepartitionExec,
-        },
+        physical_plan::{expressions as phys, filter::FilterExec, repartition::RepartitionExec},
     };
 
     fn literal_value(value: &ScalarValue) -> Option<BoundValue> {
@@ -5735,8 +5759,7 @@ fn inject_vix_scan_pruning_with_all(
             }
             return Ok(Transformed::no(node));
         }
-        let passthrough = node.downcast_ref::<RepartitionExec>().is_some()
-            || node.downcast_ref::<CoalesceBatchesExec>().is_some();
+        let passthrough = node.downcast_ref::<RepartitionExec>().is_some();
         if !passthrough {
             return Ok(Transformed::no(node));
         }
@@ -5752,7 +5775,12 @@ fn inject_vix_scan_pruning_with_all(
             })
             .collect::<datafusion::common::Result<_>>()?;
         if changed {
-            Ok(Transformed::yes(node.with_new_children(children)?))
+            Ok(Transformed::yes(node.replace_children(
+                children,
+                datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?))
         } else {
             Ok(Transformed::no(node))
         }
@@ -5807,9 +5835,12 @@ fn inject_vix_scan_pruning_with_all(
             extracted.bounds,
             extracted.null_rejected,
         );
-        Ok(Transformed::yes(
-            node.with_new_children(vec![injected.data])?,
-        ))
+        Ok(Transformed::yes(node.replace_children(
+            vec![injected.data],
+            datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(
+                datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute,
+            ),
+        )?))
     })
     .map(|t| t.data)
 }

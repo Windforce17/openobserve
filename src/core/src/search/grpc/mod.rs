@@ -44,7 +44,7 @@ pub async fn create_tables_from_files<F>(
     schema_ref: Arc<Schema>,
     sorted_by_time: bool,
     collect_stat: bool,
-    file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
+    file_stat_cache: Option<Arc<FileStatisticsCache>>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     on_error: F,
@@ -57,7 +57,7 @@ where
         schema_ref
             .as_ref()
             .clone()
-            .with_metadata(Default::default()),
+            .with_metadata(arrow_schema::Metadata::default()),
     );
 
     let scan_file_count = std::num::NonZeroUsize::new(files.len());

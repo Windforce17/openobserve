@@ -69,7 +69,7 @@ pub async fn search_parquet(
     schema: Arc<Schema>,
     search_partition_keys: &[(String, String)],
     sorted_by_time: bool,
-    file_stat_cache: Option<Arc<dyn FileStatisticsCache>>,
+    file_stat_cache: Option<Arc<FileStatisticsCache>>,
     index_condition: Option<IndexCondition>,
     fst_fields: Vec<String>,
     memtable_ids: HashSet<u64>,
@@ -358,7 +358,12 @@ pub async fn search_memtable(
     ingester::check_memory_circuit_breaker().map_err(|e| Error::ResourceError(e.to_string()))?;
 
     // construct latest schema map
-    let latest_schema = Arc::new(schema.as_ref().clone().with_metadata(Default::default()));
+    let latest_schema = Arc::new(
+        schema
+            .as_ref()
+            .clone()
+            .with_metadata(arrow_schema::Metadata::default()),
+    );
     let mut latest_schema_map = HashMap::with_capacity(latest_schema.fields().len());
     for field in latest_schema.fields() {
         latest_schema_map.insert(field.name(), field);

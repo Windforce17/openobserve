@@ -44,6 +44,7 @@ fn load_local_node() -> Node {
         status: NodeStatus::Online,
         metrics: Default::default(),
         version: crate::VERSION.to_string(),
+        query_engine_generation: Some(crate::meta::cluster::QUERY_ENGINE_GENERATION.to_string()),
     }
 }
 

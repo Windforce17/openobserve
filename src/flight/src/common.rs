@@ -257,10 +257,11 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use config::meta::search::ScanStats;
     use datafusion::{
-        common::Result,
+        common::{Result, tree_node::TreeNodeRecursion},
         execution::{SendableRecordBatchStream, TaskContext},
         physical_plan::{
-            DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, empty::EmptyExec,
+            DisplayAs, DisplayFormatType, ExecutionPlan, PhysicalExpr, PlanProperties,
+            empty::EmptyExec,
         },
     };
     use parking_lot::Mutex;
@@ -313,6 +314,13 @@ mod tests {
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
         }
 
         fn with_new_children(

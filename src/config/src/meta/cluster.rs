@@ -21,6 +21,10 @@ use utoipa::ToSchema;
 use crate::{
     get_config, get_instance_id, meta::search::SearchEventType, utils::sysinfo::NodeMetrics,
 };
+
+/// Physical-plan and aggregate-state wire compatibility, independent of product version.
+pub const QUERY_ENGINE_GENERATION: &str = "df56-arrow60-v1";
+
 pub trait NodeInfo: Debug + Send + Sync {
     fn is_querier(&self) -> bool {
         true
@@ -31,6 +35,9 @@ pub trait NodeInfo: Debug + Send + Sync {
     fn get_grpc_addr(&self) -> String;
     fn get_auth_token(&self) -> String;
     fn get_name(&self) -> String;
+    fn query_engine_generation(&self) -> Option<&str> {
+        None
+    }
     fn get_region(&self) -> String {
         "openobserve".to_string()
     }
@@ -60,6 +67,8 @@ pub struct Node {
     pub metrics: NodeMetrics,
     #[serde(default)]
     pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_engine_generation: Option<String>,
 }
 
 impl Node {
@@ -78,6 +87,7 @@ impl Node {
             status: NodeStatus::Prepare,
             metrics: Default::default(),
             version: crate::VERSION.to_string(),
+            query_engine_generation: None,
         }
     }
 
@@ -92,6 +102,11 @@ impl Node {
             && self.scheduled == other.scheduled
             && self.broadcasted == other.broadcasted
             && self.status == other.status
+            && self.query_engine_generation == other.query_engine_generation
+    }
+
+    pub fn has_compatible_query_engine(&self) -> bool {
+        self.query_engine_generation.as_deref() == Some(QUERY_ENGINE_GENERATION)
     }
 
     pub fn is_single_node(&self) -> bool {
@@ -143,9 +158,52 @@ impl Default for Node {
     }
 }
 
+/// Keep incompatible ingesters as failed partitions, never as dispatch targets.
+pub fn query_engine_nodes(mut nodes: Vec<Node>, trace_id: &str) -> Result<Vec<Node>, String> {
+    if let Some(node) = nodes
+        .iter()
+        .find(|n| n.is_ingester() && n.is_querier() && !n.has_compatible_query_engine())
+    {
+        return Err(format!(
+            "query engine generation mismatch: mixed-role node={}, local={QUERY_ENGINE_GENERATION}, peer={}, trace_id={trace_id}; cannot cover its WAL partition",
+            node.name,
+            node.query_engine_generation
+                .as_deref()
+                .unwrap_or("unknown (missing)"),
+        ));
+    }
+    if !nodes
+        .iter()
+        .any(|n| n.is_querier() && n.has_compatible_query_engine())
+    {
+        let peers = nodes
+            .iter()
+            .map(|n| {
+                format!(
+                    "{}={}",
+                    n.name,
+                    n.query_engine_generation
+                        .as_deref()
+                        .unwrap_or("unknown (missing)")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "no compatible querier: local={QUERY_ENGINE_GENERATION}, nodes=[{peers}], trace_id={trace_id}"
+        ));
+    }
+    nodes.retain(|n| n.has_compatible_query_engine() || n.is_ingester());
+    Ok(nodes)
+}
+
 impl NodeInfo for Node {
     fn get_name(&self) -> String {
         self.name.clone()
+    }
+
+    fn query_engine_generation(&self) -> Option<&str> {
+        self.query_engine_generation.as_deref()
     }
 
     fn is_querier(&self) -> bool {
@@ -316,6 +374,109 @@ pub enum CompactionJobType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Frozen DF54 Node schema: new fields must remain unknown to this reader.
+    #[derive(Serialize, Deserialize)]
+    struct LegacyNode {
+        id: i32,
+        uuid: String,
+        name: String,
+        http_addr: String,
+        grpc_addr: String,
+        role: Vec<Role>,
+        #[serde(default)]
+        role_group: RoleGroup,
+        cpu_num: u64,
+        #[serde(default)]
+        scheduled: bool,
+        #[serde(default)]
+        broadcasted: bool,
+        status: NodeStatus,
+        #[serde(default)]
+        metrics: NodeMetrics,
+        #[serde(default)]
+        version: String,
+    }
+
+    fn engine_node(name: &str, role: Role, generation: Option<&str>) -> Node {
+        Node {
+            name: name.to_string(),
+            role: vec![role],
+            query_engine_generation: generation.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn engine_generation_node_json_is_bidirectionally_compatible() {
+        let current = engine_node("q-new", Role::Querier, Some(QUERY_ENGINE_GENERATION));
+        let json = crate::utils::json::to_vec(&current).unwrap();
+        let legacy: LegacyNode = crate::utils::json::from_slice(&json).unwrap();
+        assert_eq!(legacy.name, "q-new");
+        assert_eq!(legacy.role, vec![Role::Querier]);
+        let old_json = crate::utils::json::to_vec(&legacy).unwrap();
+        let read_old: Node = crate::utils::json::from_slice(&old_json).unwrap();
+        assert_eq!(read_old.query_engine_generation, None);
+        assert!(!read_old.has_compatible_query_engine());
+        assert!(
+            !current.is_same(&read_old),
+            "generation changes must refresh the node cache"
+        );
+        let read_new: Node = crate::utils::json::from_slice(&json).unwrap();
+        assert_eq!(read_new, current);
+        assert_eq!(
+            crate::utils::json::to_value(&read_old).unwrap(),
+            crate::utils::json::to_value(&legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn engine_generation_filters_queriers_but_keeps_missing_wal_partitions() {
+        let current = engine_node("q-new", Role::Querier, Some(QUERY_ENGINE_GENERATION));
+        let wal = engine_node("i-old", Role::Ingester, None);
+        let nodes = vec![
+            engine_node("q-old", Role::Querier, None),
+            current.clone(),
+            engine_node("q-other", Role::Querier, Some("other")),
+            wal.clone(),
+        ];
+        assert_eq!(
+            query_engine_nodes(nodes, "trace-filter").unwrap(),
+            vec![current.clone(), wal]
+        );
+        let same = vec![
+            current,
+            engine_node("i-new", Role::Ingester, Some(QUERY_ENGINE_GENERATION)),
+        ];
+        assert_eq!(query_engine_nodes(same.clone(), "t").unwrap(), same);
+    }
+
+    #[test]
+    fn engine_generation_no_querier_or_mixed_role_fails_with_context() {
+        let err = query_engine_nodes(
+            vec![engine_node("q-old", Role::Querier, None)],
+            "trace-empty",
+        )
+        .unwrap_err();
+        for expected in [
+            "no compatible querier",
+            QUERY_ENGINE_GENERATION,
+            "q-old=unknown",
+            "trace-empty",
+        ] {
+            assert!(err.contains(expected), "{err}");
+        }
+        let err = query_engine_nodes(
+            vec![
+                engine_node("q-new", Role::Querier, Some(QUERY_ENGINE_GENERATION)),
+                engine_node("all-old", Role::All, None),
+            ],
+            "trace-all",
+        )
+        .unwrap_err();
+        assert!(err.contains("all-old") && err.contains("WAL") && err.contains("trace-all"));
+        assert!(crate::cluster::LOCAL_NODE.has_compatible_query_engine());
+    }
 
     #[test]
     fn test_node_is_local() {

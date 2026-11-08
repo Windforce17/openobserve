@@ -24,6 +24,7 @@ use datafusion::{
         expressions::{Column, Literal},
         filter::FilterExec,
         projection::ProjectionExec,
+        sorts::sort::SortExec,
     },
 };
 
@@ -157,16 +158,18 @@ fn raw_column_at(
         );
     }
     if children.len() != 1
-        || !matches!(
+        // SortExec::name() is "SortExec(TopK)" when fetch is set. DF56 can
+        // push Sort below Projection, so column identity must cross this node.
+        // Identify the type, not its display name; sorting never rewrites a column.
+        || !(plan.downcast_ref::<SortExec>().is_some() || matches!(
             plan.name(),
             "CoalesceBatchesExec"
                 | "CoalescePartitionsExec"
                 | "RepartitionExec"
-                | "SortExec"
                 | "SortPreservingMergeExec"
                 | "CooperativeExec"
                 | "RemoteScanExec"
-        )
+        ))
         || schema.as_ref() != children[0].schema().as_ref()
     {
         return false;
