@@ -21,6 +21,8 @@ pub mod enrichment;
 pub mod index;
 pub mod index_optimizer;
 pub mod join_reorder;
+#[cfg(test)]
+mod leader_plan_sanity_tests;
 pub mod remote_scan;
 pub mod rewrite_match;
 pub mod utils;

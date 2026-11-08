@@ -38,7 +38,7 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
@@ -82,7 +82,7 @@ impl RemoteScanExec {
         mut remote_scan_node: RemoteScanNode,
     ) -> Result<Self> {
         let output_partitions = remote_scan_node.nodes.len();
-        let cache = Self::compute_properties(Arc::clone(&input.schema()), output_partitions);
+        let cache = Self::compute_properties(&input, output_partitions);
 
         // serialize the input plan and set it as the plan for the remote scan node
         let proto = get_physical_extension_codec();
@@ -182,8 +182,22 @@ impl RemoteScanExec {
 
     /// This function creates the cache object that stores the plan properties such as schema,
     /// equivalence properties, ordering, partitioning, etc.
-    fn compute_properties(schema: SchemaRef, n_partitions: usize) -> Arc<PlanProperties> {
-        let eq_properties = EquivalenceProperties::new(schema);
+    ///
+    /// Output partition `i` is the response of node `i`, which runs `input` and streams its
+    /// output partitions back. A single input partition is streamed inline in order, so every
+    /// output partition keeps the input's ordering and equivalences — the leader's
+    /// `SortPreservingMergeExec` over the per-node streams relies on exactly that, and
+    /// DataFusion's final plan check requires it to be declared. Several input partitions are
+    /// interleaved on the follower, so no ordering is declared for them.
+    fn compute_properties(
+        input: &Arc<dyn ExecutionPlan>,
+        n_partitions: usize,
+    ) -> Arc<PlanProperties> {
+        let eq_properties = if input.output_partitioning().partition_count() == 1 {
+            input.equivalence_properties().clone()
+        } else {
+            EquivalenceProperties::new(input.schema())
+        };
         let output_partitioning = Self::output_partitioning_helper(n_partitions);
         Arc::new(PlanProperties::new(
             eq_properties,
@@ -1104,18 +1118,69 @@ mod tests {
         }
     }
 
-    fn make_remote_exec() -> RemoteScanExec {
-        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
-        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        let node = RemoteScanNode {
+    fn test_remote_node() -> RemoteScanNode {
+        RemoteScanNode {
             nodes: vec![Arc::new(TestNode) as Arc<dyn config::meta::cluster::NodeInfo>].into(),
             opentelemetry_context: opentelemetry::Context::current(),
             query_identifier: Default::default(),
             search_infos: Default::default(),
             index_info: Default::default(),
             super_cluster_info: Default::default(),
+        }
+    }
+
+    fn make_remote_exec() -> RemoteScanExec {
+        let schema = Arc::new(Schema::new(vec![Field::new("col", DataType::Utf8, false)]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        RemoteScanExec::new(input, test_remote_node()).unwrap()
+    }
+
+    #[test]
+    fn remote_scan_declares_input_ordering_only_for_a_single_input_partition() -> Result<()> {
+        use datafusion::{
+            arrow::compute::SortOptions,
+            physical_expr::{LexOrdering, PhysicalSortExpr, expressions::Column},
+            physical_plan::{
+                repartition::RepartitionExec,
+                sorts::{sort::SortExec, sort_preserving_merge::SortPreservingMergeExec},
+            },
         };
-        RemoteScanExec::new(input, node).unwrap()
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let ordering = LexOrdering::new(vec![PhysicalSortExpr::new(
+            Arc::new(Column::new("ts", 0)),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        )])
+        .unwrap();
+        let partitions = Arc::new(RepartitionExec::try_new(
+            Arc::new(EmptyExec::new(schema)),
+            Partitioning::RoundRobinBatch(4),
+        )?);
+        let sorted_partitions: Arc<dyn ExecutionPlan> =
+            Arc::new(SortExec::new(ordering.clone(), partitions).with_preserve_partitioning(true));
+        assert_eq!(sorted_partitions.output_partitioning().partition_count(), 4);
+        assert_eq!(sorted_partitions.output_ordering(), Some(&ordering));
+
+        // The follower interleaves several partitions: the per-node stream is unordered.
+        let interleaved: Arc<dyn ExecutionPlan> = Arc::new(RemoteScanExec::new(
+            sorted_partitions.clone(),
+            test_remote_node(),
+        )?);
+        assert_eq!(interleaved.output_ordering(), None);
+
+        // One merged partition is streamed in order by every node.
+        let merged: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(
+            ordering.clone(),
+            sorted_partitions,
+        ));
+        let ordered: Arc<dyn ExecutionPlan> =
+            Arc::new(RemoteScanExec::new(merged, test_remote_node())?);
+        assert_eq!(ordered.output_ordering(), Some(&ordering));
+        assert_eq!(ordered.output_partitioning().partition_count(), 1);
+        Ok(())
     }
 
     #[test]

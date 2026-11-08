@@ -292,8 +292,20 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                         new_children.push(remote_scan);
                     } else {
                         let table_name = visitor.table_name.clone().unwrap();
+                        // The follower interleaves a multi-partition child, so a child whose
+                        // partitions are each sorted is merged there first: every node then
+                        // streams it in that order, as a merge above the union expects.
+                        let remote_input: Arc<dyn ExecutionPlan> = match child.output_ordering() {
+                            Some(ordering) if child.output_partitioning().partition_count() > 1 => {
+                                Arc::new(
+                                    SortPreservingMergeExec::new(ordering.clone(), child.clone())
+                                        .with_fetch(child.fetch()),
+                                )
+                            }
+                            _ => child.clone(),
+                        };
                         let remote_scan = Arc::new(RemoteScanExec::new(
-                            child.clone(),
+                            remote_input,
                             self.remote_scan_nodes.get_remote_node(&table_name),
                         )?);
                         new_children.push(remote_scan);
@@ -417,11 +429,35 @@ pub fn wrap_partial_reduce_for_aggregate(
 }
 
 fn is_single_node_optimize(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    #[cfg(test)]
+    if test_cluster_role::is_multi_node() {
+        return false;
+    }
     let mut visitor = NewEmptyExecCountVisitor::default();
     plan.visit(&mut visitor)
         .expect("visit physical plan failed in is_single_node_optimize");
     let empty_exec_count = visitor.get_count();
     empty_exec_count <= 1 && config::cluster::LOCAL_NODE.is_single_node()
+}
+
+/// Test processes run as a single all-roles node, so `LOCAL_NODE.is_single_node()`
+/// is always true there. Tests that plan for a querier in a multi-node cluster
+/// switch the current thread to that role instead.
+#[cfg(test)]
+pub(crate) mod test_cluster_role {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MULTI_NODE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn is_multi_node() -> bool {
+        MULTI_NODE.with(Cell::get)
+    }
+
+    pub(crate) fn set_multi_node(multi_node: bool) {
+        MULTI_NODE.with(|role| role.set(multi_node));
+    }
 }
 
 pub fn remote_scan_to_top_if_needed(
