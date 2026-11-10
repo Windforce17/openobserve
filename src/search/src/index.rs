@@ -1699,37 +1699,36 @@ fn create_str_match_expr(
     value: &str,
     case_sensitive: bool,
 ) -> Result<Arc<dyn PhysicalExpr>, anyhow::Error> {
-    let index = schema.index_of(name).unwrap();
+    let index = schema.index_of(name)?;
     let field = schema.field(index);
-    let col = Arc::new(Column::new(name, index));
-
-    // if the field is Utf8View, we need to cast it to Utf8 for str_match udf
-    let left: Arc<dyn PhysicalExpr> = if *field.data_type() == DataType::Utf8View {
-        Arc::new(CastExpr::new(col, DataType::Utf8, None))
-    } else {
-        col
-    };
-
-    // if the field is Utf8View, we need to cast it to Utf8 for str_match udf
-    let data_type = if *field.data_type() == DataType::Utf8View {
-        DataType::Utf8
-    } else {
-        field.data_type().clone()
-    };
-
-    let right = get_scalar_value(value, &data_type)?;
+    if !pruning::string_type(field.data_type()) {
+        anyhow::bail!(
+            "str_match field {name} has non-string scan type {}",
+            field.data_type()
+        );
+    }
+    let left: Arc<dyn PhysicalExpr> = Arc::new(Column::new(name, index));
+    let right = get_scalar_value(value, field.data_type())?;
     let udf = if case_sensitive {
         Arc::new(str_match_udf::STR_MATCH_UDF.clone())
     } else {
         Arc::new(str_match_udf::STR_MATCH_IGNORE_CASE_UDF.clone())
     };
 
-    let udf_expr = Arc::new(ScalarFunctionExpr::try_new(
+    // This expression is rebuilt for local scans/residuals, not the leader's SQL
+    // wire plan. Keep the registered Utf8 signature so old followers still receive
+    // the same casts; the implementation also accepts the checked native types.
+    let udf_expr = Arc::new(ScalarFunctionExpr::new(
+        udf.name(),
         udf.clone(),
         vec![left, right],
-        schema,
+        Arc::new(arrow_schema::Field::new(
+            udf.name(),
+            DataType::Boolean,
+            true,
+        )),
         Arc::new(ConfigOptions::default()),
-    )?);
+    ));
     Ok(udf_expr)
 }
 
