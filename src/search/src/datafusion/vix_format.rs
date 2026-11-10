@@ -854,6 +854,36 @@ impl CoreScanOperation {
             bytes,
         }))
     }
+
+    /// Charge decoded values while projection can hold them next to its
+    /// output, then keep only the output's referenced bytes charged until
+    /// every downstream slice of it is dropped.
+    fn own_projected_batch(
+        &self,
+        plan: &LogicalProjectionPlan,
+        decoded: RecordBatch,
+    ) -> anyhow::Result<RecordBatch> {
+        let decoded_charge = self.reserve(batch_slice_memory_size(&decoded)?)?;
+        let projected = plan.project(&decoded)?;
+        drop(decoded);
+        let charge = self.reserve(batch_slice_memory_size(&projected)?)?;
+        drop(decoded_charge);
+        Ok(own_output_batch(projected, charge)?)
+    }
+}
+
+/// Reader growth rounded up to 1 MiB below 16 MiB, 4 MiB below 64 MiB and
+/// 8 MiB above, bounding pool calls while over-reserving at most one step.
+fn quantized_reader_reservation(bytes: usize) -> usize {
+    const MIB: usize = 1024 * 1024;
+    let quantum = if bytes < 16 * MIB {
+        MIB
+    } else if bytes < 64 * MIB {
+        4 * MIB
+    } else {
+        8 * MIB
+    };
+    bytes.div_ceil(quantum).saturating_mul(quantum)
 }
 
 impl vortex_index::VixReadOperation for CoreScanOperation {
@@ -864,12 +894,15 @@ impl vortex_index::VixReadOperation for CoreScanOperation {
     fn check_memory(&self, bytes: usize) -> vortex_index::Result<()> {
         let mut high_water = self.reader_high_water.lock();
         if bytes > *high_water {
+            // Grow in coarse steps so small reader increments do not each
+            // take the shared pool lock.
+            let target = quantized_reader_reservation(bytes);
             if let Some(reservation) = self.reservation.lock().as_ref() {
                 reservation
-                    .try_grow(bytes - *high_water)
+                    .try_grow(target - *high_water)
                     .map_err(|error| vortex_index::VixError::Callback(error.into()))?;
             }
-            *high_water = bytes;
+            *high_water = target;
         }
         Ok(())
     }
@@ -1396,25 +1429,15 @@ impl VixCoreOpener {
             let wants_ranged =
                 docs_range_source(&store, &file.object_meta, ranged_wanted).is_some();
 
-            // Preserve the existing serial source/open/controller allowance
-            // before holding input. Writer chunk targets are not a decoded
-            // memory or RSS proof. Parallel conversion separately reserves its
-            // audited encoding workspace and transferable backing below.
-            let chunk_bytes = {
-                let configured = config::get_config().common.vix_docs_chunk_bytes;
-                if configured > 0 {
-                    configured
-                } else {
-                    vortex_index::DEFAULT_DOCS_CHUNK_BYTES
-                }
-            };
+            // Charge what the scan actually holds: reader-retained bytes
+            // (check_memory), IO payloads (reserve_io), decoded and projected
+            // batches (own_projected_batch / own_merge_batch) and conversion
+            // workspace. A whole-object read holds the object before the reader
+            // reports it, so admit those bytes first; a ranged read starts empty.
             let estimate = if wants_ranged {
-                // Existing ranged-controller and channel allowance only.
-                chunk_bytes.saturating_mul(4)
+                0
             } else {
-                usize::try_from(file.object_meta.size)
-                    .unwrap_or(usize::MAX)
-                    .saturating_add(chunk_bytes.saturating_mul(2))
+                usize::try_from(file.object_meta.size).unwrap_or(usize::MAX)
             };
             // Shared so the ordered merge path can GROW it per opened
             // region from the blocking scan thread (pool pushback instead
@@ -1607,6 +1630,7 @@ impl VixCoreOpener {
                             timestamp_filter,
                             &column_bounds,
                             batch_size,
+                            Some(&operation),
                             &mut send,
                         )
                     })
@@ -1741,6 +1765,7 @@ fn scan_core_file(
         timestamp_filter,
         &[],
         usize::MAX,
+        None,
         on_batch,
     )
 }
@@ -1748,6 +1773,7 @@ fn scan_core_file(
 /// Blocking scan of one opened docs blob: read the needed physical columns
 /// (row selection + `_timestamp` range pushed down) and materialize the
 /// requested logical columns batch by batch.
+#[allow(clippy::too_many_arguments)]
 fn scan_core_docs(
     docs: VixDocs,
     projected_schema: &SchemaRef,
@@ -1755,9 +1781,11 @@ fn scan_core_docs(
     timestamp_filter: Option<(i64, i64)>,
     column_bounds: &[ColumnBound],
     batch_size: usize,
+    operation: Option<&CoreScanOperation>,
     on_batch: &mut dyn FnMut(RecordBatch) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let plan = LogicalProjectionPlan::new(&docs, projected_schema)?;
+    let operation = operation.filter(|operation| operation.reservation.lock().is_some());
     let rows = selection.map(|bits| Selection::IncludeRoaring(bits.to_roaring_treemap()));
     if selection.is_some_and(RowIdBitmap::is_empty) {
         // The index selected nothing (defensive: such files are usually
@@ -1779,7 +1807,13 @@ fn scan_core_docs(
         column_bounds,
         None,
         decode_threads,
-        &mut |batch| emit_bounded_batch(plan.project(&batch)?, batch_size, on_batch),
+        &mut |batch| {
+            let batch = match operation {
+                Some(operation) => operation.own_projected_batch(&plan, batch)?,
+                None => plan.project(&batch)?,
+            };
+            emit_bounded_batch(batch, batch_size, on_batch)
+        },
     )
 }
 
@@ -2482,6 +2516,7 @@ mod tests {
             None,
             &[],
             3,
+            None,
             &mut |batch| {
                 ordinary.push(batch);
                 Ok(())
@@ -4149,8 +4184,8 @@ mod review_tests {
     }
 
     /// FIXED (was a memory-accounting finding): the vix scan now registers
-    /// a reservation with the DataFusion memory pool, sized to the object /
-    /// docs-read bytes plus two in-flight chunks. An ample pool observes a
+    /// a reservation with the DataFusion memory pool, starting from the
+    /// object bytes for a whole read. An ample pool observes a
     /// non-zero peak covering at least the object bytes, and a tiny pool
     /// pushes back with a resources error instead of letting the scan
     /// allocate invisibly.
@@ -4310,6 +4345,101 @@ mod ranged_tests {
         ) -> ObjectStoreResult<()> {
             self.inner.copy_opts(from, to, options).await
         }
+    }
+
+    /// A ranged source scan admits no fixed allowance up front: projected
+    /// output retained downstream after the scan has finished stays charged,
+    /// and the pool returns to zero once that output is dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ranged_source_scan_charges_retained_output() {
+        use arrow::array::StringArray;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        use vortex_index::{VixWriter, VixWriterOptions};
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            TIMESTAMP_COL_NAME,
+            DataType::Int64,
+            false,
+        )]));
+        let mut writer = VixWriter::new(&schema, VixWriterOptions::default(), false);
+        let mut state = 7u64;
+        let sources: Vec<String> = (0..512)
+            .map(|_| {
+                let text: String = (0..32 * 1024)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (b'a' + (state % 26) as u8) as char
+                    })
+                    .collect();
+                format!(r#"{{"message":"{text}"}}"#)
+            })
+            .collect();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(1..513))])
+                .unwrap();
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(sources.clone()), None)
+            .unwrap();
+        let data = bytes::Bytes::from(writer.finish().unwrap().0);
+        assert!(data.len() > 8 * 1024 * 1024 && data.len() < 256 * 1024 * 1024);
+        let store = Arc::new(RangeOnlyStore {
+            inner: InMemory::new(),
+            reads: Default::default(),
+        });
+        let path = Path::from(
+            "trace/schema=x/format=vix/$$/account/::/files/default/logs/app/2026/11/03/00/retained.vix",
+        );
+        store.put(&path, data.clone().into()).await.unwrap();
+        let pool = Arc::new(GreedyMemoryPool::new(256 * 1024 * 1024));
+        let opener = VixCoreOpener {
+            object_store: store.clone(),
+            projected_schema: Arc::new(Schema::new(vec![Field::new(
+                SOURCE_COL_NAME,
+                DataType::Utf8,
+                true,
+            )])),
+            timestamp_filter: None,
+            column_bounds: Vec::new(),
+            null_rejected_columns: Vec::new(),
+            late_source_predicate: None,
+            selective_source_range_prepass: true,
+            emit_ts_desc: false,
+            batch_size: 64,
+            memory_pool: Some(pool.clone()),
+            conversion_width: None,
+            metrics: ExecutionPlanMetricsSet::new(),
+            partition: 0,
+        };
+        let file = PartitionedFile::new(path.to_string(), data.len() as u64);
+        let mut stream = opener
+            .open_with_block_tier(file, true)
+            .unwrap()
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        while let Some(batch) = stream.try_next().await.unwrap() {
+            held.push(batch);
+        }
+        // The stream ends only after the scan thread and its watchdog have
+        // dropped every sender, so no reader or IO charge is still live.
+        drop(stream);
+        let rows: usize = held.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(rows, sources.len());
+        let source_bytes: usize = sources.iter().map(String::len).sum();
+        assert!(
+            pool.reserved() >= source_bytes,
+            "retained output must stay charged: reserved {} < {source_bytes}",
+            pool.reserved(),
+        );
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while pool.reserved() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     /// A medium source scan must reuse the block path without changing rows
@@ -4538,6 +4668,7 @@ mod ranged_tests {
                 None,
                 &[],
                 usize::MAX,
+                None,
                 &mut |batch| {
                     out.push(batch);
                     Ok(())
@@ -5200,10 +5331,19 @@ mod m4_pruning_tests {
         ]));
 
         let mut batches = Vec::new();
-        scan_core_docs(docs, &mixed, None, None, &[], usize::MAX, &mut |batch| {
-            batches.push(batch);
-            Ok(())
-        })
+        scan_core_docs(
+            docs,
+            &mixed,
+            None,
+            None,
+            &[],
+            usize::MAX,
+            None,
+            &mut |batch| {
+                batches.push(batch);
+                Ok(())
+            },
+        )
         .unwrap();
         let batch = &batches[0];
         let level = batch.column_by_name("level").unwrap();

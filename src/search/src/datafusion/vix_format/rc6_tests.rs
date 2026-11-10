@@ -301,6 +301,7 @@ fn rc6_bounded_scan_propagates_consumer_cancellation() {
         None,
         &bounds,
         32,
+        None,
         &mut |_| {
             calls += 1;
             anyhow::bail!("rc6 test consumer cancelled")
@@ -323,6 +324,7 @@ fn rc6_bounded_scan_propagates_consumer_cancellation() {
         None,
         &bounds,
         32,
+        None,
         &mut |batch| {
             rows += batch.num_rows();
             Ok(())
