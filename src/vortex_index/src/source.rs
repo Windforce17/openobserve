@@ -860,6 +860,18 @@ async fn fetch_native_range(
     if let Some(bytes) = source.resident(range.clone()) {
         return Ok(bytes);
     }
+    // Admit the payload before the backend allocates it: a fetch holds its
+    // whole buffer while in flight, so charging only on return would let
+    // concurrent reads exceed the pool unseen.
+    let charge = if account_payload {
+        operation
+            .map(|op| op.reserve_io((range.end - range.start) as usize))
+            .transpose()
+            .map_err(|error| vortex_err!(External: error))?
+            .flatten()
+    } else {
+        None
+    };
     let bytes = source
         .fetch(range.clone())
         .await
@@ -874,11 +886,13 @@ async fn fetch_native_range(
             bytes.len()
         ));
     }
-    if account_payload {
-        own_io_bytes(bytes, operation).map_err(|error| vortex_err!(External: error))
-    } else {
-        Ok(bytes)
-    }
+    Ok(match charge {
+        Some(charge) => Bytes::from_owner(OwnedIoBytes {
+            bytes,
+            _charge: charge,
+        }),
+        None => bytes,
+    })
 }
 
 impl RangedBlob {
@@ -1516,6 +1530,61 @@ mod tests {
             // Deliberately unaligned to exercise the alignment-copy owner.
             let data = Bytes::from(vec![7; (range.end - range.start) as usize + 1]).slice(1..);
             futures::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    /// Records what the operation had admitted when the backend was asked.
+    struct AdmissionProbe {
+        live: Arc<AtomicUsize>,
+        fetches: AtomicUsize,
+        admitted_at_fetch: AtomicUsize,
+    }
+    impl VixRangeSource for AdmissionProbe {
+        fn len(&self) -> u64 {
+            128
+        }
+        fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.admitted_at_fetch
+                .store(self.live.load(Ordering::SeqCst), Ordering::SeqCst);
+            let data = Bytes::from(vec![7; (range.end - range.start) as usize]);
+            futures::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    #[test]
+    fn io_payload_is_admitted_before_the_backend_allocates_it() {
+        for limit in [1024, 0] {
+            let op = io_budget(limit);
+            let probe = Arc::new(AdmissionProbe {
+                live: op.live.clone(),
+                fetches: AtomicUsize::new(0),
+                admitted_at_fetch: AtomicUsize::new(0),
+            });
+            let blob = RangedBlob::new(probe.clone(), 0..128);
+            let read = with_read_operation(op.clone(), || blob.read_at());
+            let result = futures::executor::block_on(read.read_at(0, 64, Alignment::of::<u64>()));
+            if limit > 0 {
+                let bytes = result.unwrap().unwrap_host();
+                assert_eq!(probe.fetches.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    probe.admitted_at_fetch.load(Ordering::SeqCst),
+                    64,
+                    "an in-flight read is already charged"
+                );
+                drop(bytes);
+            } else {
+                let text = result.unwrap_err().to_string();
+                assert!(text.contains("Resources exhausted"), "{text}");
+                assert_eq!(
+                    probe.fetches.load(Ordering::SeqCst),
+                    0,
+                    "a refused read never reaches the backend"
+                );
+            }
+            drop(read);
+            drop(blob);
+            assert_eq!(op.live.load(Ordering::SeqCst), 0);
         }
     }
 

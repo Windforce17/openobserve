@@ -182,12 +182,18 @@ fn residual_cold_parent_scope_reuses_footer_and_charges_current_io_owner() {
         );
         let events = events.lock();
         let mut fetches = 0;
-        for pair in events.windows(2) {
-            if let Event::Fetch { before, bytes } = pair[0] {
+        for (index, event) in events.iter().enumerate() {
+            if let Event::Fetch { before, bytes } = *event {
                 fetches += 1;
+                let around = &events[index.saturating_sub(1)..(index + 2).min(events.len())];
                 assert!(
-                    matches!(pair[1], Event::Check(owned) if owned == before + bytes),
-                    "fresh payload must be charged exactly once through residual pending: {pair:?}"
+                    index > 0
+                        && matches!(events[index - 1], Event::Check(owned) if owned == before && owned >= bytes),
+                    "fresh payload must be admitted through residual pending before the fetch: {around:?}"
+                );
+                assert!(
+                    !matches!(events.get(index + 1), Some(Event::Check(owned)) if *owned == before + bytes),
+                    "fresh payload must be charged exactly once: {around:?}"
                 );
             }
         }
@@ -243,15 +249,17 @@ fn residual_io_payload_is_reported_to_parent_after_fetch() {
     let events = events.lock();
     let mut fetched = 0;
     let mut charged = 0;
-    // A coalesced payload may also own resident footer bytes. Its charge is
-    // at least the fetch, at most the whole immutable object, not a later
-    // decoded Arrow output charge (this low-compression fixture distinguishes them).
-    for pair in events.windows(2) {
-        if let Event::Fetch { before, bytes } = pair[0] {
+    // The payload is admitted before the backend allocates it: the check
+    // right before each fetch already holds the retained footer plus this
+    // payload, and nothing else is charged between admission and fetch.
+    for (index, event) in events.iter().enumerate() {
+        if let Event::Fetch { before, bytes } = *event {
             fetched += bytes;
+            let around = &events[index.saturating_sub(1)..=index];
             assert!(
-                matches!(pair[1], Event::Check(owned) if owned >= before + bytes && owned <= before + source.bytes.len()),
-                "IO must enter ReaderMemory pending immediately after fetch: {pair:?}"
+                index > 0
+                    && matches!(events[index - 1], Event::Check(owned) if owned == before && owned >= retained + bytes),
+                "IO must enter ReaderMemory pending before the fetch: {around:?}"
             );
             charged += bytes;
         }

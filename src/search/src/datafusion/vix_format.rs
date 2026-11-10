@@ -854,6 +854,33 @@ impl CoreScanOperation {
             bytes,
         }))
     }
+    /// Turn a charge only this operation holds into one of exactly `bytes`,
+    /// moving just the difference through the pool.
+    fn settle(
+        &self,
+        mut charge: Arc<CoreMemoryCharge>,
+        bytes: usize,
+    ) -> Result<Arc<CoreMemoryCharge>> {
+        let unshared =
+            || DataFusionError::Internal("VIX can only settle an unshared memory charge".into());
+        let held = Arc::get_mut(&mut charge).ok_or_else(unshared)?;
+        if bytes > held.bytes {
+            let mut extra = self.reserve(bytes - held.bytes)?;
+            let extra_held = Arc::get_mut(&mut extra).ok_or_else(unshared)?;
+            held.bytes += std::mem::take(&mut extra_held.bytes);
+        } else {
+            let release = held.bytes - bytes;
+            {
+                let reservation = held.reservation.lock();
+                if let Some(reservation) = reservation.as_ref() {
+                    reservation.shrink(release);
+                }
+                held.live.fetch_sub(release, Ordering::Relaxed);
+            }
+            held.bytes = bytes;
+        }
+        Ok(charge)
+    }
 
     /// Charge decoded values while projection can hold them next to its
     /// output, then keep only the output's referenced bytes charged until
@@ -863,10 +890,15 @@ impl CoreScanOperation {
         plan: &LogicalProjectionPlan,
         decoded: RecordBatch,
     ) -> anyhow::Result<RecordBatch> {
-        let decoded_charge = self.reserve(batch_slice_memory_size(&decoded)?)?;
+        let decoded_bytes = batch_slice_memory_size(&decoded)?;
+        let decoded_charge = self.reserve(decoded_bytes)?;
+        // A computed column builds new values next to the decoded ones: admit
+        // an output of the decoded size before building it, then settle on
+        // the output's referenced bytes while the input is still charged.
+        let allowance = self.reserve(if plan.copies_values { decoded_bytes } else { 0 })?;
         let projected = plan.project(&decoded)?;
+        let charge = self.settle(allowance, batch_slice_memory_size(&projected)?)?;
         drop(decoded);
-        let charge = self.reserve(batch_slice_memory_size(&projected)?)?;
         drop(decoded_charge);
         Ok(own_output_batch(projected, charge)?)
     }
@@ -1966,6 +1998,9 @@ struct LogicalProjectionPlan {
     exprs: Vec<Arc<dyn PhysicalExpr>>,
     /// The logical output schema.
     output_schema: SchemaRef,
+    /// Whether an output column is computed (cast or JSON extraction), so
+    /// projecting a batch allocates new values instead of referencing them.
+    copies_values: bool,
 }
 
 impl LogicalProjectionPlan {
@@ -2033,12 +2068,16 @@ impl LogicalProjectionPlan {
                 }
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let copies_values = exprs
+            .iter()
+            .any(|expr| !expr.is::<Column>() && !expr.is::<Literal>());
 
         Ok(Self {
             physical_projection,
             scan_schema,
             exprs,
             output_schema: Arc::clone(projected_schema),
+            copies_values,
         })
     }
 
@@ -4432,6 +4471,13 @@ mod ranged_tests {
             "retained output must stay charged: reserved {} < {source_bytes}",
             pool.reserved(),
         );
+        // The cast output is settled to its own bytes: no projection allowance
+        // or decoded input stays charged next to it.
+        assert!(
+            pool.reserved() < source_bytes + source_bytes / 8,
+            "retained output is over-charged: reserved {} for {source_bytes}",
+            pool.reserved(),
+        );
         drop(held);
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while pool.reserved() != 0 {
@@ -4442,6 +4488,119 @@ mod ranged_tests {
         .unwrap();
     }
 
+    /// A scan operation charging `pool`, with the live-owned counter it
+    /// keeps next to the pool reservation.
+    fn charging_operation(
+        pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+    ) -> (CoreScanOperation, Arc<AtomicUsize>) {
+        let reservation = Arc::new(parking_lot::Mutex::new(Some(
+            MemoryConsumer::new("settle").register(pool),
+        )));
+        let metrics = ExecutionPlanMetricsSet::new();
+        let live_owned_bytes = Arc::new(AtomicUsize::new(0));
+        let io_stats = Arc::new(FetchStats::for_source(
+            metrics.clone(),
+            0,
+            "settle".to_string(),
+        ));
+        let operation = CoreScanOperation {
+            io: ReadOperation::new(io_stats, None),
+            reservation: Arc::clone(&reservation),
+            _workspace: Arc::new(FileWorkspace {
+                reservation: Arc::clone(&reservation),
+                live: Arc::clone(&live_owned_bytes),
+            }),
+            reader_high_water: parking_lot::Mutex::new(0),
+            options: parking_lot::Mutex::new(vortex_index::NativeScanOptions::default()),
+            downstream_wait_ns: MetricBuilder::new(&metrics).counter("wait", 0),
+            live_owned_bytes: Arc::clone(&live_owned_bytes),
+            peak_owned_bytes: AtomicUsize::new(0),
+            peak_reserved_bytes: MetricBuilder::new(&metrics).counter("peak", 0),
+            metrics,
+            partition: 0,
+            location: "settle".to_string(),
+        };
+        (operation, live_owned_bytes)
+    }
+
+    /// A computed output column is admitted at the decoded size before it is
+    /// built, then the charge settles on what the returned batch references:
+    /// a large decoded column the plan does not output stops being charged.
+    #[test]
+    fn projected_batch_charge_settles_on_the_output() {
+        use arrow::array::StringArray;
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
+        let (operation, live_owned_bytes) = charging_operation(&pool);
+        let scan_schema = Arc::new(Schema::new(vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("n", DataType::Int64, false),
+        ]));
+        let decoded = RecordBatch::try_new(
+            Arc::clone(&scan_schema),
+            vec![
+                Arc::new(StringArray::from_iter_values(
+                    (0..512).map(|i| format!("{i:04}").repeat(1024)),
+                )),
+                Arc::new(Int64Array::from_iter_values(0..512)),
+            ],
+        )
+        .unwrap();
+        let decoded_bytes = batch_slice_memory_size(&decoded).unwrap();
+        let plan = LogicalProjectionPlan {
+            physical_projection: vec!["body".to_string(), "n".to_string()],
+            scan_schema: Arc::clone(&scan_schema),
+            exprs: vec![cast_to(
+                Arc::new(Column::new("n", 1)),
+                &DataType::Int64,
+                &DataType::Float64,
+            )],
+            output_schema: Arc::new(Schema::new(vec![Field::new("n", DataType::Float64, false)])),
+            copies_values: true,
+        };
+        let projected = operation.own_projected_batch(&plan, decoded).unwrap();
+        let output_bytes = batch_slice_memory_size(&projected).unwrap();
+        assert!(
+            output_bytes * 64 < decoded_bytes,
+            "fixture must make the decoded input dominate: {output_bytes} vs {decoded_bytes}"
+        );
+        assert_eq!(pool.reserved(), output_bytes);
+        assert_eq!(live_owned_bytes.load(Ordering::Relaxed), output_bytes);
+        drop(projected);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(live_owned_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    /// Settling a charge moves only the difference through the pool in both
+    /// directions; a refused growth releases the charge it consumed.
+    #[test]
+    fn settle_moves_only_the_difference() {
+        use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1000));
+        let (operation, live_owned_bytes) = charging_operation(&pool);
+        let held = || (pool.reserved(), live_owned_bytes.load(Ordering::Relaxed));
+        let charge = operation
+            .settle(operation.reserve(600).unwrap(), 100)
+            .unwrap();
+        assert_eq!(held(), (100, 100));
+        let charge = operation.settle(charge, 900).unwrap();
+        assert_eq!(held(), (900, 900));
+        let error = match operation.settle(charge, 1001) {
+            Err(error) => error,
+            Ok(_) => panic!("growth past the pool must be refused"),
+        };
+        assert!(
+            matches!(error, DataFusionError::ResourcesExhausted(_)),
+            "{error}"
+        );
+        assert_eq!(held(), (0, 0));
+        let charge = operation
+            .settle(operation.reserve(0).unwrap(), 300)
+            .unwrap();
+        assert_eq!(held(), (300, 300));
+        drop(charge);
+        assert_eq!(held(), (0, 0));
+    }
     /// A medium source scan must reuse the block path without changing rows
     /// or retaining its reservation after completion, failure, or cancellation.
     #[tokio::test(flavor = "multi_thread")]
