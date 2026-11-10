@@ -115,7 +115,7 @@ fn native_registry_workspace() -> Result<usize> {
 
 thread_local! {
     static NATIVE_READ_REGISTRIES: RefCell<Option<Rc<NativeReadRegistries>>> = const { RefCell::new(None) };
-    static NATIVE_SCHEMA_FOOTER: RefCell<Option<Rc<NativeSchemaFooter>>> = const { RefCell::new(None) };
+    static NATIVE_FOOTERS: RefCell<NativeFooterMemo> = const { RefCell::new(NativeFooterMemo::new()) };
     #[cfg(test)]
     static NATIVE_OPEN_COUNTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
@@ -127,14 +127,14 @@ pub(crate) fn native_open_counts() -> (usize, usize) {
 
 pub(crate) struct NativeReadScope {
     registries: Option<Rc<NativeReadRegistries>>,
-    footer: Option<Rc<NativeSchemaFooter>>,
+    footers: NativeFooterMemo,
 }
 
 impl Drop for NativeReadScope {
     fn drop(&mut self) {
         // Drop the inner owners outside the TLS borrow (also safe on unwind).
-        let footer = NATIVE_SCHEMA_FOOTER.with(|slot| slot.replace(self.footer.take()));
-        drop(footer);
+        let footers = NATIVE_FOOTERS.with(|slot| slot.replace(std::mem::take(&mut self.footers)));
+        drop(footers);
         let inner = NATIVE_READ_REGISTRIES.with(|slot| slot.replace(self.registries.take()));
         drop(inner);
     }
@@ -143,7 +143,7 @@ impl Drop for NativeReadScope {
 pub(crate) fn enter_native_read_scope() -> NativeReadScope {
     NativeReadScope {
         registries: NATIVE_READ_REGISTRIES.with(|slot| slot.take()),
-        footer: NATIVE_SCHEMA_FOOTER.with(|slot| slot.take()),
+        footers: NATIVE_FOOTERS.with(|slot| slot.take()),
     }
 }
 
@@ -2731,14 +2731,75 @@ fn write_vortex_blob_inner(
     Ok(buf)
 }
 
-/// One schema footer, consumed by the next matching open in this operation.
-/// Do not retain the schema file's session, runtime, IO or layout readers.
+// Retain at most four native footers and 32 MiB of their existing admission
+// envelopes. Oversized/full memos simply bypass retention; no eviction policy,
+// heap-backed directory, IO owner or runtime survives a scan.
+const NATIVE_FOOTER_MEMO_ENTRIES: usize = 4;
+const NATIVE_FOOTER_MEMO_BYTES: usize = 32 * 1024 * 1024;
+
 struct NativeSchemaFooter {
     footer: vortex::file::Footer,
     identity: crate::source::FooterIdentity,
+    source: std::sync::Weak<dyn VixRangeSource>,
     range: std::ops::Range<u64>,
-    // Both the schema file and the consuming file share this original charge.
     _pending: crate::reader::PendingMemory,
+}
+
+struct NativeFooterMemo {
+    entries: [Option<Rc<NativeSchemaFooter>>; NATIVE_FOOTER_MEMO_ENTRIES],
+}
+
+impl Default for NativeFooterMemo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NativeFooterMemo {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; NATIVE_FOOTER_MEMO_ENTRIES],
+        }
+    }
+
+    fn get(&self, ranged: &RangedBlob) -> Option<Rc<NativeSchemaFooter>> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| {
+                ranged.has_footer_identity(&entry.identity)
+                    && ranged.range == entry.range
+                    && std::ptr::eq(Arc::as_ptr(&ranged.source), entry.source.as_ptr())
+            })
+            .cloned()
+    }
+
+    fn can_insert(&self, bytes: usize) -> bool {
+        let retained: usize = self
+            .entries
+            .iter()
+            .flatten()
+            .map(|entry| entry._pending.bytes())
+            .sum();
+        self.entries.iter().any(Option::is_none)
+            && bytes <= NATIVE_FOOTER_MEMO_BYTES.saturating_sub(retained)
+    }
+
+    fn insert(&mut self, footer: Rc<NativeSchemaFooter>) {
+        if self.can_insert(footer._pending.bytes())
+            && let Some(slot) = self.entries.iter_mut().find(|slot| slot.is_none())
+        {
+            *slot = Some(footer);
+        }
+    }
+
+    fn take_other_reader(&mut self, memory: &Arc<crate::reader::ReaderMemory>) -> Option<Self> {
+        self.entries
+            .iter()
+            .flatten()
+            .any(|entry| !entry._pending.belongs_to(memory))
+            .then(|| std::mem::take(self))
+    }
 }
 
 /// Native file plus opening/layout workspace. Drop the native owners before
@@ -2775,12 +2836,16 @@ fn open_blob_inner(
     metadata_session: Option<VortexSession>,
 ) -> Result<OpenedBlob> {
     crate::check_read_cancelled()?;
-    // Every open consumes or evicts the single slot, including non-matches.
-    let cached = NATIVE_SCHEMA_FOOTER.with(|slot| slot.take());
-    if let (Some(cached), BlobHandle::Ranged(ranged)) = (&cached, blob)
-        && ranged.has_footer_identity(&cached.identity)
-        && ranged.range == cached.range
-    {
+    let cached = if let BlobHandle::Ranged(ranged) = blob {
+        // Switching reader trackers ends the previous reader's memo. Drop outside
+        // TLS borrows, before admission on the new reader can call user code.
+        let memory = ranged.reader_memory();
+        drop(NATIVE_FOOTERS.with(|memo| memo.borrow_mut().take_other_reader(&memory)));
+        NATIVE_FOOTERS.with(|memo| memo.borrow().get(ranged))
+    } else {
+        None
+    };
+    if let (Some(cached), BlobHandle::Ranged(ranged)) = (cached, blob) {
         let _recheck = ranged.reader_memory().reserve(0)?;
         let file = runtime.block_on(
             session
@@ -2793,11 +2858,17 @@ fn open_blob_inner(
             file,
             _runtime: None,
             _pending: None,
-            _schema_footer: Some(Rc::clone(cached)),
+            _schema_footer: Some(cached),
             _setup: None,
         });
     }
-    drop(cached);
+    // Lazy layout children may outlive this scan. Only a registries-only session
+    // may be retained: never capture the scan's runtime, IO or MemorySession.
+    let metadata_session = metadata_session.or_else(|| {
+        crate::source::current_read_operation().and_then(|_| {
+            NATIVE_READ_REGISTRIES.with(|slot| slot.borrow().as_ref().map(|r| r.session()))
+        })
+    });
     match blob {
         BlobHandle::Mem(bytes) => {
             if crate::source::current_read_operation().is_none() {
@@ -2850,6 +2921,17 @@ fn open_blob_inner(
         }
         BlobHandle::Ranged(ranged) => {
             let (read, opening) = ranged.opening_read_at();
+            let memo_extra = if metadata_session.is_some()
+                && crate::source::current_read_operation().is_some()
+            {
+                Some(ranged.reader_memory().reserve(
+                    NATIVE_SESSION_WORKSPACE
+                        + std::mem::size_of::<NativeSchemaFooter>()
+                        + 2 * std::mem::size_of::<usize>(),
+                )?)
+            } else {
+                None
+            };
             #[cfg(test)]
             NATIVE_OPEN_COUNTS.with(|counts| {
                 let (registries, footers) = counts.get();
@@ -2917,13 +2999,30 @@ fn open_blob_inner(
                     .with_file_size(ranged.len())
                     .open_read(read),
             )?;
-            let pending = opening.finish();
+            crate::check_read_cancelled()?;
+            let mut pending = opening.finish();
+            let mut shared = None;
+            if let Some(extra) = memo_extra
+                && let Some(opening) = pending.as_ref()
+                && NATIVE_FOOTERS
+                    .with(|memo| memo.borrow().can_insert(opening.bytes() + extra.bytes()))
+            {
+                let footer = Rc::new(NativeSchemaFooter {
+                    footer: file.footer().clone(),
+                    identity: ranged.footer_identity(),
+                    source: Arc::downgrade(&ranged.source),
+                    range: ranged.range.clone(),
+                    _pending: pending.take().expect("opening reservation").merge(extra),
+                });
+                NATIVE_FOOTERS.with(|memo| memo.borrow_mut().insert(Rc::clone(&footer)));
+                shared = Some(footer);
+            }
             Ok(OpenedBlob {
                 file,
                 _runtime: None,
                 _setup: None,
                 _pending: pending,
-                _schema_footer: None,
+                _schema_footer: shared,
             })
         }
     }
@@ -2939,45 +3038,19 @@ pub(crate) fn blob_arrow_schema_owned(blob: &BlobHandle) -> Result<(Schema, Open
     })
 }
 
-/// Resolve metadata once and let the immediately following scan consume its
-/// footer. This uses the same single-slot, operation-local ownership as schema
-/// reads: no runtime, IO bridge or uncharged metadata escapes the operation.
+/// Metadata reads and scans share operation-local, admitted native footers.
 fn read_blob_metadata<T>(
     blob: &BlobHandle,
     read: impl FnOnce(&VortexSession, &VortexFile) -> Result<T>,
 ) -> Result<(T, OpenedBlob)> {
-    // New metadata replaces the previous slot before admitting its allocation.
-    drop(NATIVE_SCHEMA_FOOTER.with(|slot| slot.take()));
     let mut setup = NativeReadSetup::new()?;
     let runtime = SingleThreadRuntime::default();
     let session = setup.session(runtime.handle());
-    let reuse = if crate::source::current_read_operation().is_some()
-        && let BlobHandle::Ranged(ranged) = blob
-    {
-        let extra = ranged.reader_memory().reserve(
-            NATIVE_SESSION_WORKSPACE
-                + std::mem::size_of::<NativeSchemaFooter>()
-                + 2 * std::mem::size_of::<usize>(),
-        )?;
-        Some((ranged, extra))
-    } else {
-        None
-    };
-    let metadata_session = reuse.as_ref().map(|_| setup.registries.session());
+    let metadata_session = (crate::source::current_read_operation().is_some()
+        && matches!(blob, BlobHandle::Ranged(_)))
+    .then(|| setup.registries.session());
     let mut file = open_blob_inner(&runtime, &session, blob, metadata_session)?;
     let result = read(&session, &file)?;
-    if let Some((ranged, extra)) = reuse
-        && let Some(pending) = file._pending.take()
-    {
-        let footer = Rc::new(NativeSchemaFooter {
-            footer: file.footer().clone(),
-            identity: ranged.footer_identity(),
-            range: ranged.range.clone(),
-            _pending: pending.merge(extra),
-        });
-        NATIVE_SCHEMA_FOOTER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&footer)));
-        file._schema_footer = Some(footer);
-    }
     // Only owned reservations/runtime escape this helper, never its TLS scope.
     drop(setup.memory_scope.take());
     file._runtime = Some(runtime);

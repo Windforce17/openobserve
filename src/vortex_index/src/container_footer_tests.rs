@@ -115,7 +115,7 @@ fn schema_footer_does_not_cross_operation_boundary() {
 }
 
 #[test]
-fn leaf_planning_reuses_footer_once_with_operation_admission() {
+fn leaf_planning_reuses_footer_through_operation_with_admission() {
     let (blob, reads) = fixture(64);
     with_read_operation(Operation::new(), || {
         let before = native_open_counts();
@@ -128,14 +128,14 @@ fn leaf_planning_reuses_footer_once_with_operation_admission() {
         assert_eq!(native_open_counts().1, planned.1);
         assert_eq!(reads.load(Ordering::Acquire), cached_reads);
         let second = reopen(&blob);
-        assert_eq!(native_open_counts().1, planned.1 + 1);
-        assert!(!Arc::ptr_eq(
+        assert_eq!(native_open_counts().1, planned.1);
+        assert!(Arc::ptr_eq(
             first.footer().layout(),
             second.footer().layout()
         ));
     });
     // Neither the operation-local slot nor its metadata runtime can escape.
-    assert!(NATIVE_SCHEMA_FOOTER.with(|slot| slot.borrow().is_none()));
+    assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().entries.iter().all(Option::is_none)));
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn read_template_cached_plugins_do_not_bypass_budget_or_cancellation() {
 }
 
 #[test]
-fn schema_footer_keeps_original_admission_until_consumed() {
+fn schema_footer_keeps_original_admission_until_operation_end() {
     let (blob, _) = fixture(64);
     let BlobHandle::Ranged(ranged) = &blob else {
         unreachable!()
@@ -344,12 +344,12 @@ fn schema_footer_keeps_original_admission_until_consumed() {
         assert!(consumed >= after);
         drop(second);
         memory.reserve(0).unwrap();
-        assert!(operation.last.load(Ordering::Acquire) < after);
+        assert_eq!(operation.last.load(Ordering::Acquire), after);
     });
 }
 
 #[test]
-fn schema_footer_is_consumed_once_and_not_retained_without_operation() {
+fn schema_footer_reused_repeatedly_but_not_retained_without_operation() {
     let (blob, _) = fixture(3);
     let (_, first) = blob_arrow_schema_owned(&blob).unwrap();
     assert!(!Arc::ptr_eq(
@@ -363,7 +363,7 @@ fn schema_footer_is_consumed_once_and_not_retained_without_operation() {
             schema.footer().layout(),
             second.footer().layout()
         ));
-        assert!(!Arc::ptr_eq(
+        assert!(Arc::ptr_eq(
             second.footer().layout(),
             reopen(&blob).footer().layout()
         ));
@@ -745,4 +745,235 @@ fn file_statistics_resolve_paths_after_nested_fields_and_literal_dots() {
         assert_eq!(blob_column_stats(&blob, "missing").unwrap(), None);
         assert_eq!(blob_column_stats(&blob, "nested").unwrap(), None);
     }
+}
+
+#[test]
+fn native_footer_plain_scans_and_stats_share_one_parse() {
+    let (blob, _) = fixture(64);
+    let columns = ["col0", "col1", "col63"];
+    let expected: Vec<_> = columns
+        .iter()
+        .map(|column| {
+            (
+                scan_blob(&blob, Some(&[*column]), RowSelection::Indices(vec![0, 2])).unwrap(),
+                blob_column_stats(&blob, column).unwrap(),
+            )
+        })
+        .collect();
+    with_read_operation(Operation::new(), || {
+        let before = native_open_counts().1;
+        for (column, (batches, stats)) in columns.iter().zip(&expected) {
+            assert_eq!(
+                &scan_blob(&blob, Some(&[*column]), RowSelection::Indices(vec![0, 2])).unwrap(),
+                batches
+            );
+            assert_eq!(&blob_column_stats(&blob, column).unwrap(), stats);
+        }
+        assert_eq!(native_open_counts().1 - before, 1);
+    });
+}
+
+#[test]
+fn native_footer_exact_range_and_source_identity_are_required() {
+    let (mut blob, _) = fixture(3);
+    with_read_operation(Operation::new(), || {
+        drop(reopen(&blob));
+        let BlobHandle::Ranged(ranged) = &mut blob else {
+            unreachable!()
+        };
+        assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().get(ranged).is_some()));
+        ranged.range.start += 1;
+        assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().get(ranged).is_none()));
+        ranged.range.start -= 1;
+        let original = ranged.source.clone();
+        let (other, _) = fixture(3);
+        let BlobHandle::Ranged(other) = other else {
+            unreachable!()
+        };
+        ranged.source = other.source;
+        assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().get(ranged).is_none()));
+        ranged.source = original;
+        assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().get(ranged).is_some()));
+    });
+}
+
+#[test]
+fn native_footer_parse_failure_is_not_memoized() {
+    let reads = Arc::new(AtomicUsize::new(0));
+    let source = Arc::new(Source {
+        bytes: Bytes::from_static(b"not a vortex file"),
+        reads: reads.clone(),
+    });
+    let blob = BlobHandle::Ranged(RangedBlob::new(source.clone(), 0..source.len()));
+    with_read_operation(Operation::new(), || {
+        let before = native_open_counts().1;
+        for _ in 0..2 {
+            assert!(blob_arrow_schema_owned(&blob).is_err());
+            assert!(NATIVE_FOOTERS.with(|memo| memo.borrow().entries.iter().all(Option::is_none)));
+        }
+        assert_eq!(native_open_counts().1 - before, 2);
+        assert_eq!(reads.load(Ordering::Acquire), 2);
+    });
+}
+
+#[test]
+fn native_footer_count_and_admission_bytes_are_bounded() {
+    let memory = Arc::new(crate::reader::ReaderMemory::new());
+    let blobs: Vec<_> = (0..NATIVE_FOOTER_MEMO_ENTRIES + 1)
+        .map(|_| {
+            let (blob, _) = fixture(3);
+            let BlobHandle::Ranged(ranged) = blob else {
+                unreachable!()
+            };
+            let ranged = RangedBlob::new(ranged.source, ranged.range);
+            ranged.track_memory(memory.clone());
+            BlobHandle::Ranged(ranged)
+        })
+        .collect();
+    with_read_operation(Operation::new(), || {
+        for blob in &blobs {
+            drop(reopen(blob));
+        }
+        NATIVE_FOOTERS.with(|memo| {
+            let memo = memo.borrow();
+            assert_eq!(
+                memo.entries.iter().flatten().count(),
+                NATIVE_FOOTER_MEMO_ENTRIES
+            );
+            assert!(!memo.can_insert(0));
+            assert!(
+                memo.entries
+                    .iter()
+                    .flatten()
+                    .map(|entry| entry._pending.bytes())
+                    .sum::<usize>()
+                    <= NATIVE_FOOTER_MEMO_BYTES
+            );
+        });
+        let before = native_open_counts().1;
+        drop(reopen(blobs.last().unwrap()));
+        assert_eq!(
+            native_open_counts().1,
+            before + 1,
+            "full memo must bypass retention"
+        );
+        let before = native_open_counts().1;
+        drop(reopen(&blobs[0]));
+        assert_eq!(
+            native_open_counts().1,
+            before,
+            "full memo must preserve existing entries"
+        );
+    });
+    let mut memo = NativeFooterMemo::new();
+    assert!(!memo.can_insert(NATIVE_FOOTER_MEMO_BYTES + 1));
+    assert!(memo.can_insert(NATIVE_FOOTER_MEMO_BYTES));
+    let opened = reopen(&blobs[0]);
+    let BlobHandle::Ranged(ranged) = &blobs[0] else {
+        unreachable!()
+    };
+    memo.insert(Rc::new(NativeSchemaFooter {
+        footer: opened.footer().clone(),
+        identity: ranged.footer_identity(),
+        source: Arc::downgrade(&ranged.source),
+        range: ranged.range.clone(),
+        _pending: memory.reserve(NATIVE_FOOTER_MEMO_BYTES).unwrap(),
+    }));
+    assert!(!memo.can_insert(1));
+}
+
+#[test]
+fn native_footer_plain_open_layout_is_released_at_operation_end() {
+    let (blob, _) = fixture(64);
+    let weak = with_read_operation(Operation::new(), || {
+        let opened = reopen(&blob);
+        let weak = Arc::downgrade(opened.footer().layout());
+        drop(opened);
+        assert!(weak.upgrade().is_some());
+        weak
+    });
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn native_footer_reader_cross_or_select_and_multifield_results_match_reparse() {
+    use crate::{VixQuery, VixReader, VixWriter, VixWriterOptions};
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("_timestamp", DataType::Int64, false),
+        Field::new("a", DataType::Utf8, false),
+        Field::new("b", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![40, 30, 20, 10])),
+            Arc::new(StringArray::from(vec!["x", "y", "x", "z"])),
+            Arc::new(StringArray::from(vec!["m", "n", "n", "m"])),
+        ],
+    )
+    .unwrap();
+    let mut writer = VixWriter::new(
+        &schema,
+        VixWriterOptions {
+            encode_threads: 1,
+            ..Default::default()
+        },
+        false,
+    );
+    writer
+        .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; 4]), None)
+        .unwrap();
+    let (data, index) = writer.finish().unwrap();
+    let source = |bytes: Vec<u8>| -> Arc<dyn VixRangeSource> {
+        Arc::new(Source {
+            bytes: bytes.into(),
+            reads: Arc::new(AtomicUsize::new(0)),
+        })
+    };
+    let run = || {
+        let reader = VixReader::open_ranged_with_index_mode(
+            source(data.clone()),
+            index.clone().map(source),
+            0,
+            true,
+        )
+        .unwrap();
+        reader.docs_schema().unwrap();
+        let query = VixQuery::Or(vec![
+            VixQuery::Exact {
+                field: "a".into(),
+                token: b"x".to_vec(),
+            },
+            VixQuery::Exact {
+                field: "b".into(),
+                token: b"n".to_vec(),
+            },
+        ]);
+        let bitmap = reader.eval(&query).unwrap();
+        assert_eq!(bitmap.set_indices().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(reader.count(&query).unwrap(), 3);
+        let rows: Vec<_> = bitmap.set_indices().map(|i| i as u64).collect();
+        let columns: Vec<_> = ["_timestamp", "a", "b"]
+            .iter()
+            .map(|column| {
+                reader
+                    .read_docs_column_rows(column, &rows)
+                    .unwrap()
+                    .to_data()
+            })
+            .collect();
+        (bitmap, columns)
+    };
+    let expected = run();
+    let actual = with_read_operation(Operation::new(), || {
+        let before = native_open_counts().1;
+        let result = run();
+        assert_eq!(
+            native_open_counts().1 - before,
+            2,
+            "one terms and one docs parse"
+        );
+        result
+    });
+    assert_eq!(actual, expected);
 }

@@ -252,6 +252,14 @@ pub(crate) struct PendingMemory {
 }
 
 impl PendingMemory {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn belongs_to(&self, memory: &Arc<ReaderMemory>) -> bool {
+        Arc::ptr_eq(&self.memory, memory)
+    }
+
     pub(crate) fn merge(mut self, other: Self) -> Self {
         assert!(Arc::ptr_eq(&self.memory, &other.memory));
         self.bytes += other.bytes;
