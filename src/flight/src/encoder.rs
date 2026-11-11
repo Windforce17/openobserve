@@ -146,8 +146,11 @@ fn dtype_has_dictionary(dt: &DataType) -> bool {
     }
 }
 
-/// Coalesces RecordBatches into 8192-row chunks (the expensive per-chunk IPC + ZSTD encoding is
-/// [`FlightDataEncoder::encode_chunk`]).
+/// Rows per coalesced chunk.
+const CHUNK_ROWS: usize = 8192;
+
+/// Coalesces RecordBatches into [`CHUNK_ROWS`]-row chunks (the expensive per-chunk IPC + ZSTD
+/// encoding is [`FlightDataEncoder::encode_chunk`]).
 #[derive(Default)]
 pub struct ChunkCoalescer {
     /// Lazily initialised; reused to avoid re-allocating per-column builders every call.
@@ -161,12 +164,21 @@ impl ChunkCoalescer {
 
     /// Push a RecordBatch; returns completed 8192-row chunks. Call [`Self::finish`] at stream end.
     ///
-    /// BatchCoalescer also GCs sparse Utf8View/BinaryView buffers — see
-    /// <https://github.com/openobserve/openobserve/issues/8280> and
-    /// <https://github.com/apache/datafusion/pull/11587>.
+    /// Compact data-backed top-level views of batches smaller than a chunk before Arrow
+    /// coalesces them. Alternating sparse and compact inputs otherwise seal partially filled
+    /// buffers in Arrow's byte-view coalescer, and every buffered small batch keeps its source
+    /// buffers alive until the chunk is flushed. Even capacity == referenced bytes is
+    /// insufficient: externally owned buffers can report a slice's length while keeping a much
+    /// larger allocation alive. Full-size batches are emitted right away, and arrays without
+    /// data buffers hold nothing upstream, so both stay on the zero-copy path.
     pub fn push_batch(&mut self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
+        let batch = if batch.num_rows() < CHUNK_ROWS {
+            compact_view_columns(batch)?
+        } else {
+            batch
+        };
         if self.coalescer.is_none() {
-            self.coalescer = Some(BatchCoalescer::new(batch.schema(), 8192));
+            self.coalescer = Some(BatchCoalescer::new(batch.schema(), CHUNK_ROWS));
         }
 
         let coalescer = self.coalescer.as_mut().unwrap();
@@ -194,6 +206,32 @@ impl ChunkCoalescer {
         }
         Ok(chunks)
     }
+}
+
+/// Replaces every data-backed top-level Utf8View/BinaryView column with a compacted copy that
+/// owns exactly the bytes it references. Returns the input unchanged when no column qualifies.
+fn compact_view_columns(batch: RecordBatch) -> Result<RecordBatch> {
+    let mut columns = None;
+    for (index, column) in batch.columns().iter().enumerate() {
+        let compacted: Option<ArrayRef> = match column.data_type() {
+            DataType::Utf8View => {
+                let views = column.as_string_view();
+                (!views.data_buffers().is_empty()).then(|| Arc::new(views.gc()) as ArrayRef)
+            }
+            DataType::BinaryView => {
+                let views = column.as_binary_view();
+                (!views.data_buffers().is_empty()).then(|| Arc::new(views.gc()) as ArrayRef)
+            }
+            _ => None,
+        };
+        if let Some(compacted) = compacted {
+            columns.get_or_insert_with(|| batch.columns().to_vec())[index] = compacted;
+        }
+    }
+    Ok(match columns {
+        Some(columns) => RecordBatch::try_new(batch.schema(), columns)?,
+        None => batch,
+    })
 }
 
 /// Conservative IPC payload bound for the slices [`split_batch_for_grpc_response`] produced.
@@ -570,6 +608,198 @@ mod tests {
 
     use super::*;
     use crate::common::CustomMessage;
+
+    fn alternating_view_batch(sparse: bool) -> RecordBatch {
+        use arrow::array::BinaryViewArray;
+        let values = StringViewArray::from(vec![
+            Some("a long string stored outside its view"),
+            None,
+            Some("inline"),
+            Some("another long string with different bytes"),
+        ])
+        .gc();
+        let values = if sparse {
+            let mut bytes = values.data_buffers()[0].as_slice().to_vec();
+            bytes.resize(64 * 1024, b'x');
+            StringViewArray::new(
+                values.views().clone(),
+                vec![arrow::buffer::Buffer::from_vec(bytes)],
+                values.nulls().cloned(),
+            )
+        } else {
+            values
+        };
+        let binary = BinaryViewArray::new(
+            values.views().clone(),
+            values.data_buffers().clone(),
+            values.nulls().cloned(),
+        );
+        RecordBatch::try_from_iter(vec![
+            ("text", Arc::new(values.clone()) as ArrayRef),
+            ("other", Arc::new(values) as ArrayRef),
+            ("binary", Arc::new(binary) as ArrayRef),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn test_coalescer_alternating_view_capacity_and_values() {
+        let mut coalescer = ChunkCoalescer::new();
+        // Reuse after finish to exercise Arrow's persistent buffer-growth state.
+        for _ in 0..2 {
+            let inputs: Vec<_> = (0..256)
+                .map(|i| alternating_view_batch(i % 2 == 0))
+                .collect();
+            let expected = arrow::compute::concat_batches(&inputs[0].schema(), &inputs).unwrap();
+            let mut output = Vec::new();
+            for input in inputs {
+                output.extend(coalescer.push_batch(input).unwrap());
+            }
+            output.extend(coalescer.finish().unwrap());
+            let actual = arrow::compute::concat_batches(&expected.schema(), &output).unwrap();
+            assert_eq!(actual.num_rows(), expected.num_rows());
+            for (column, wanted) in actual.columns().iter().zip(expected.columns()) {
+                for row in 0..actual.num_rows() {
+                    assert_eq!(column.is_null(row), wanted.is_null(row));
+                    if !column.is_null(row) {
+                        match column.data_type() {
+                            DataType::Utf8View => assert_eq!(
+                                column.as_string_view().value(row),
+                                wanted.as_string_view().value(row)
+                            ),
+                            DataType::BinaryView => assert_eq!(
+                                column.as_binary_view().value(row),
+                                wanted.as_binary_view().value(row)
+                            ),
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+            }
+            for batch in output {
+                for column in batch.columns() {
+                    let (capacity, used) = match column.data_type() {
+                        DataType::Utf8View => {
+                            let v = column.as_string_view();
+                            (
+                                v.data_buffers().iter().map(|b| b.capacity()).sum::<usize>(),
+                                v.total_buffer_bytes_used(),
+                            )
+                        }
+                        DataType::BinaryView => {
+                            let v = column.as_binary_view();
+                            (
+                                v.data_buffers().iter().map(|b| b.capacity()).sum::<usize>(),
+                                v.total_buffer_bytes_used(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+                    assert!(
+                        capacity <= used * 2 + 4096,
+                        "capacity={capacity}, used={used}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_coalescer_releases_external_view_owner() {
+        // A Bytes slice reports only its slice length to Arrow, but owns all 8 MiB.
+        let owner: Arc<[u8]> = vec![b'a'; 8 * 1024 * 1024].into();
+        let weak = Arc::downgrade(&owner);
+        let bytes = Bytes::from_owner(owner).slice(1024..1056);
+        let buffer = arrow::buffer::Buffer::from(bytes);
+        assert_eq!(buffer.capacity(), 32);
+        let reference = StringViewArray::from(vec!["a".repeat(32)]).gc();
+        let array = StringViewArray::new(reference.views().clone(), vec![buffer], None);
+        assert_eq!(array.total_buffer_bytes_used(), 32);
+        let original_ptr = array.data_buffers()[0].as_ptr();
+        let batch =
+            RecordBatch::try_from_iter(vec![("text", Arc::new(array) as ArrayRef)]).unwrap();
+        let mut coalescer = ChunkCoalescer::new();
+        assert!(coalescer.push_batch(batch).unwrap().is_empty());
+        assert!(
+            weak.upgrade().is_none(),
+            "coalescer retained the external 8 MiB owner"
+        );
+        let output = coalescer.finish().unwrap();
+        let values = output[0].column(0).as_string_view();
+        assert_eq!(values.value(0), "a".repeat(32));
+        assert!(
+            values
+                .data_buffers()
+                .iter()
+                .all(|b| b.as_ptr() != original_ptr)
+        );
+    }
+
+    #[test]
+    fn test_coalescer_full_chunk_views_stay_zero_copy() {
+        let views = StringViewArray::from_iter_values(
+            (0..CHUNK_ROWS).map(|i| format!("long value {i:08}")),
+        )
+        .gc();
+        let input_ptrs: Vec<_> = views.data_buffers().iter().map(|b| b.as_ptr()).collect();
+        assert!(!input_ptrs.is_empty());
+        let batch =
+            RecordBatch::try_from_iter(vec![("text", Arc::new(views) as ArrayRef)]).unwrap();
+        let mut coalescer = ChunkCoalescer::new();
+        let output = coalescer.push_batch(batch).unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].num_rows(), CHUNK_ROWS);
+        let output_ptrs: Vec<_> = output[0]
+            .column(0)
+            .as_string_view()
+            .data_buffers()
+            .iter()
+            .map(|b| b.as_ptr())
+            .collect();
+        assert_eq!(output_ptrs, input_ptrs, "full-size batch was copied");
+        assert!(coalescer.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual push-only timing; run release with --nocapture"]
+    fn bench_coalescer_view_push() {
+        use std::{hint::black_box, time::Instant};
+        let dense =
+            StringViewArray::from_iter_values((0..8192).map(|_| "dense long string payload")).gc();
+        let dense =
+            RecordBatch::try_from_iter(vec![("text", Arc::new(dense) as ArrayRef)]).unwrap();
+        let inline = StringViewArray::from_iter_values((0..8192).map(|_| "inline"));
+        assert!(inline.data_buffers().is_empty());
+        let inline =
+            RecordBatch::try_from_iter(vec![("text", Arc::new(inline) as ArrayRef)]).unwrap();
+        for (name, inputs) in [
+            ("dense-inline", vec![inline; 128]),
+            ("dense-long", vec![dense; 128]),
+            (
+                "sparse",
+                (0..256)
+                    .map(|i| alternating_view_batch(i % 2 == 0))
+                    .collect(),
+            ),
+        ] {
+            for round in 0..7 {
+                let mut coalescer = ChunkCoalescer::new();
+                let mut ns = 0;
+                for batch in &inputs {
+                    let input = batch.clone();
+                    let start = Instant::now();
+                    let output = coalescer.push_batch(input).unwrap();
+                    ns += start.elapsed().as_nanos();
+                    black_box(output);
+                }
+                black_box(coalescer.finish().unwrap());
+                println!(
+                    "PUSH_BENCH {name} round={round} batches={} ns={ns}",
+                    inputs.len()
+                );
+            }
+        }
+    }
 
     fn create_test_schema() -> Schema {
         Schema::new(vec![
