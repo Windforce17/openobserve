@@ -80,8 +80,7 @@ use vortex::{
         LayoutStrategy,
         arrays::shared::{Shared, SharedArraySlotsExt},
         layouts::{
-            chunked::writer::ChunkedLayoutStrategy, collect::CollectStrategy,
-            flat::writer::FlatLayoutStrategy, table::TableStrategy,
+            chunked::writer::ChunkedLayoutStrategy, collect::CollectStrategy, table::TableStrategy,
         },
     },
     scan::selection::Selection,
@@ -90,6 +89,7 @@ use vortex::{
 
 use crate::{
     error::{Result, VixError},
+    flat::{BufferBoundedFlatStrategy, fits_flat_buffer_limit},
     source::{RangedBlob, VixRangeSource, block_fetch, compact_bytes},
 };
 
@@ -2032,7 +2032,8 @@ static LEGACY_ARRAY_ENCODINGS: std::sync::LazyLock<
 #[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn compressed_strategy(row_block_size: usize) -> Result<Arc<dyn LayoutStrategy>> {
     let session = legacy_write_session(VortexSession::default())?;
-    let mut builder = WriteStrategyBuilder::from_session(&session);
+    let mut builder = WriteStrategyBuilder::from_session(&session)
+        .with_flat_strategy(Arc::new(BufferBoundedFlatStrategy::default()));
     if row_block_size > 0 {
         builder = builder.with_row_block_size(row_block_size);
     }
@@ -2061,6 +2062,7 @@ pub(crate) fn docs_strategy(
     session: &VortexSession,
 ) -> Arc<dyn LayoutStrategy> {
     let mut builder = WriteStrategyBuilder::from_session(session)
+        .with_flat_strategy(Arc::new(BufferBoundedFlatStrategy::default()))
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact());
     if row_block_size > 0 {
         builder = builder.with_row_block_size(row_block_size);
@@ -2169,6 +2171,7 @@ pub(crate) fn docs_passthrough_strategy(
     let compressor = BtrBlocksCompressorBuilder::from_session(session)
         .with_compact()
         .build();
+    let write_session = session.clone();
     let compress_or_pass =
         move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| -> vortex::error::VortexResult<ArrayRef> {
             // M25: a decoded-family ROOT takes the compress branch even when
@@ -2180,15 +2183,17 @@ pub(crate) fn docs_passthrough_strategy(
             if is_decoded_root(chunk) {
                 return compressor.compress(chunk, ctx);
             }
-            if is_ctx_serializable(chunk) {
+            // A dict-layout reader may reconstruct more buffers than ONE flat
+            // message can address, even though every encoding is allowed.
+            if is_ctx_serializable(chunk) && fits_flat_buffer_limit(chunk, &write_session) {
                 return Ok(chunk.clone());
             }
             // M18 per-chunk fail-open (counts at info in the merge summary,
             // detail at debug — hot path)
             fail_open.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             log::debug!(
-                "vix docs passthrough: column chunk ({} rows) carries encoding {:?} the write \
-                 context cannot serialize; canonicalizing + re-encoding that chunk (fail-open)",
+                "vix docs passthrough: column chunk ({} rows) has an unsupported encoding {:?} \
+                 or exceeds the flat buffer limit; canonicalizing + re-encoding (fail-open)",
                 chunk.len(),
                 first_unserializable_id(chunk)
             );
@@ -2488,11 +2493,11 @@ pub(crate) fn scan_blob_encoded_chunks(
                     }
                 }
             }
-            // (3) backstop: any other node the file writer cannot intern
-            if !is_ctx_serializable(field) {
+            // (3) backstop: encoding AND recursive wire-buffer addressability.
+            if !is_ctx_serializable(field) || !fits_flat_buffer_limit(field, &session) {
                 log::debug!(
-                    "vix docs chunk scan: column {:?} carries encoding {:?} the write context \
-                     cannot serialize; canonicalizing that column (recompress)",
+                    "vix docs chunk scan: column {:?} has an unsupported encoding {:?} or \
+                     exceeds the flat buffer limit; canonicalizing that column (recompress)",
                     names[index],
                     first_unserializable_id(field)
                 );
@@ -2544,8 +2549,10 @@ pub(crate) fn scan_blob_encoded_chunks(
 /// costs little; `doc_count` chunks mirror the postings row blocks.
 pub(crate) fn addressable_strategy() -> Arc<dyn LayoutStrategy> {
     Arc::new(TableStrategy::new(
-        Arc::new(CollectStrategy::new(FlatLayoutStrategy::default())),
-        Arc::new(ChunkedLayoutStrategy::new(FlatLayoutStrategy::default())),
+        Arc::new(CollectStrategy::new(BufferBoundedFlatStrategy::default())),
+        Arc::new(ChunkedLayoutStrategy::new(
+            BufferBoundedFlatStrategy::default(),
+        )),
     ))
 }
 

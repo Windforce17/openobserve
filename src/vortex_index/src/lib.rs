@@ -77,6 +77,7 @@ mod cpu_executor;
 mod dict_blocks;
 mod docs;
 mod error;
+mod flat;
 mod merge;
 mod numeric;
 pub mod postings;
@@ -143,3 +144,6 @@ pub use writer::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod u16_tests;

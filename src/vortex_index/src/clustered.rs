@@ -78,10 +78,7 @@ use vortex::{
     io::{runtime::Handle, session::RuntimeSessionExt},
     layout::{
         LayoutChildren, LayoutRef, LayoutStrategy, LayoutWriterContext,
-        layouts::{
-            chunked::ChunkedLayout, compressed::CompressorPlugin, flat::writer::FlatLayoutStrategy,
-            struct_::StructLayout,
-        },
+        layouts::{chunked::ChunkedLayout, compressed::CompressorPlugin, struct_::StructLayout},
         segments::SegmentSinkRef,
         sequence::{
             SendableSequentialStream, SequenceId, SequencePointer, SequentialStreamAdapter,
@@ -91,7 +88,7 @@ use vortex::{
     session::VortexSession,
 };
 
-use crate::container::is_decoded_root;
+use crate::{container::is_decoded_root, flat::BufferBoundedFlatStrategy};
 
 /// Stripe budget in estimated OUTPUT bytes: how much compressed data is
 /// grouped into one column-major byte cluster. Larger stripes mean fewer,
@@ -187,12 +184,13 @@ impl LayoutChildren for OwnedChildren {
 /// passthrough write (see the module docs). `compressor` is the
 /// compress-or-pass plugin from
 /// [`crate::container::docs_passthrough_strategy`]; leaves are written by a
-/// plain [`FlatLayoutStrategy`] (no chunk statistics — computing them on
-/// encoded chunks would decode them; readers fail open, the o2 footer
+/// [`BufferBoundedFlatStrategy`] that enforces the recursive wire-buffer limit
+/// before delegating to the flat writer (no chunk statistics — computing them
+/// on encoded chunks would decode them; readers fail open, the o2 footer
 /// carries the pruning metadata).
 pub(crate) struct ClusteredDocsStrategy {
     compressor: Arc<dyn CompressorPlugin>,
-    flat: FlatLayoutStrategy,
+    flat: BufferBoundedFlatStrategy,
     stripe_bytes: u64,
     coalesce_max_rows: usize,
     coalesce_max_bytes: u64,
@@ -204,7 +202,7 @@ impl ClusteredDocsStrategy {
     pub(crate) fn new<C: CompressorPlugin>(compressor: C) -> Self {
         Self {
             compressor: Arc::new(compressor),
-            flat: FlatLayoutStrategy::default(),
+            flat: BufferBoundedFlatStrategy::default(),
             stripe_bytes: STRIPE_BYTES,
             coalesce_max_rows: COALESCE_MAX_ROWS,
             coalesce_max_bytes: COALESCE_MAX_BYTES,
@@ -443,7 +441,7 @@ struct LeafWriter<'a> {
     ctx: &'a LayoutWriterContext,
     segment_sink: &'a SegmentSinkRef,
     compressor: &'a Arc<dyn CompressorPlugin>,
-    flat: &'a FlatLayoutStrategy,
+    flat: &'a BufferBoundedFlatStrategy,
     ratio: &'a Arc<OutputRatio>,
     field_dtypes: &'a [DType],
     inflight: Arc<Semaphore>,
@@ -499,7 +497,7 @@ fn spawn_chunk_write(
     ctx: &LayoutWriterContext,
     segment_sink: &SegmentSinkRef,
     compressor: &Arc<dyn CompressorPlugin>,
-    flat: &FlatLayoutStrategy,
+    flat: &BufferBoundedFlatStrategy,
     ratio: &Arc<OutputRatio>,
     field_ptr: &mut SequencePointer,
     field_dtype: &DType,
