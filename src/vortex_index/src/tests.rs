@@ -6556,6 +6556,97 @@ mod ranged {
         );
     }
 
+    /// The sidecar's embedded data footer only caches the data object's
+    /// footer: a corrupt copy still falls back to the data tail, while a
+    /// cancellation or a refused memory admission observed while synthesizing
+    /// the data container propagates without a data-tail read. Each operation
+    /// fails only its first check, so a data-tail retry would succeed and hide
+    /// the operation's outcome.
+    #[test]
+    fn embedded_footer_falls_back_only_for_a_corrupt_copy() {
+        use std::sync::atomic::AtomicBool;
+
+        use crate::source::{VixReadOperation, with_read_operation};
+
+        struct FailFirstCheck {
+            cancel: bool,
+            fired: AtomicBool,
+        }
+        impl VixReadOperation for FailFirstCheck {
+            fn is_cancelled(&self) -> bool {
+                self.cancel && !self.fired.swap(true, Ordering::AcqRel)
+            }
+
+            fn check_memory(&self, _owned_bytes: usize) -> crate::Result<()> {
+                if !self.cancel && !self.fired.swap(true, Ordering::AcqRel) {
+                    return Err(crate::VixError::Callback(anyhow::anyhow!(
+                        "admission refused"
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        let (data, index) = build_large_core_file();
+        let index_source = CountingSource::new(index) as Arc<dyn VixRangeSource>;
+        let parse_index = || {
+            crate::container::parse_container_ranged_with_tail(&index_source, PROD_SIDECAR_TAIL)
+                .unwrap()
+        };
+        let open = |index_container: &crate::container::VixContainer,
+                    operation: Option<Arc<FailFirstCheck>>| {
+            let counting = CountingSource::new(data.clone());
+            let source = Arc::clone(&counting) as Arc<dyn VixRangeSource>;
+            let result = match operation {
+                Some(operation) => with_read_operation(operation, || {
+                    VixReader::data_container_from_sidecar(&source, index_container)
+                }),
+                None => VixReader::data_container_from_sidecar(&source, index_container),
+            };
+            (result, counting.fetches())
+        };
+
+        let index_container = parse_index();
+        assert!(
+            index_container
+                .properties
+                .contains_key(crate::container::PROP_DATA_FOOTER)
+        );
+        let (embedded, fetches) = open(&index_container, None);
+        let embedded = embedded.unwrap();
+        assert_eq!(fetches, 0, "the embedded copy needs no data read");
+
+        for cancel in [true, false] {
+            let operation = Arc::new(FailFirstCheck {
+                cancel,
+                fired: AtomicBool::new(false),
+            });
+            let (result, fetches) = open(&index_container, Some(Arc::clone(&operation)));
+            assert!(operation.fired.load(Ordering::Acquire), "cancel={cancel}");
+            match result {
+                Err(crate::VixError::Cancelled) => assert!(cancel, "refusal became a cancellation"),
+                Err(crate::VixError::Callback(_)) => {
+                    assert!(!cancel, "cancellation became a refusal")
+                }
+                other => panic!(
+                    "cancel={cancel}: expected the operation's error, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            assert_eq!(fetches, 0, "cancel={cancel}: no data-tail retry");
+        }
+
+        let mut corrupt = parse_index();
+        corrupt.properties.insert(
+            crate::container::PROP_DATA_FOOTER.to_string(),
+            "{not a footer".to_string(),
+        );
+        let (fallback, fetches) = open(&corrupt, None);
+        let fallback = fallback.expect("a corrupt copy must not fail the file");
+        assert!(fetches >= 1, "a corrupt copy falls back to the data tail");
+        assert_eq!(fallback.properties, embedded.properties);
+    }
+
     /// DESIGN-COLD-MISS §2 S4/S5: the sidecar footer's `bloom_sections_v1`
     /// table yields the same sections as walking the blob's headers, and
     /// every field with a per-field section is flagged `bf` in the `fields`

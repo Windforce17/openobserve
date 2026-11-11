@@ -1081,25 +1081,9 @@ impl VixReader {
             Some(index) if sidecar_first => {
                 // S3: sidecar tail only; the data container comes from the
                 // embedded footer when the sidecar carries one, else from a
-                // second, data-tail round trip (pre-property sidecars). An
-                // embedded footer that fails to parse takes the same second
-                // round trip: the data object is authoritative, a corrupt
-                // copy must not fail the file.
+                // second, data-tail round trip (pre-property sidecars).
                 let index_container = parse_container_ranged_with_tail(index, index_tail_bytes)?;
-                let embedded = index_container
-                    .properties
-                    .get(crate::container::PROP_DATA_FOOTER)
-                    .map(|payload| crate::container::container_from_data_footer(&source, payload));
-                let container = match embedded {
-                    Some(Ok(container)) => container,
-                    Some(Err(e)) => {
-                        log::warn!(
-                            "vix open: embedded data footer unreadable ({e}); reading the data tail"
-                        );
-                        parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?
-                    }
-                    None => parse_container_ranged_with_tail(&source, DEFAULT_TAIL_FETCH_BYTES)?,
-                };
+                let container = Self::data_container_from_sidecar(&source, &index_container)?;
                 (container, Some(index_container))
             }
             Some(index) => {
@@ -1117,6 +1101,37 @@ impl VixReader {
             ),
         };
         Ok(Self::from_containers(container, index_container, false, 0)?)
+    }
+
+    /// The DATA container of a sidecar-first open: synthesized from the
+    /// footer copy the sidecar embeds, else read from the data tail.
+    ///
+    /// The copy only caches the data object's footer, so a corrupt copy falls
+    /// back to the authoritative data tail instead of failing the file. A
+    /// cancellation or a refused memory admission is the read operation's
+    /// outcome rather than a property of the copy: it propagates, because the
+    /// data-tail retry either fails the same way or, when a later admission
+    /// passes, hides the caller's budget decision behind an extra read.
+    pub(crate) fn data_container_from_sidecar(
+        source: &Arc<dyn VixRangeSource>,
+        index_container: &VixContainer,
+    ) -> Result<VixContainer> {
+        let Some(payload) = index_container
+            .properties
+            .get(crate::container::PROP_DATA_FOOTER)
+        else {
+            return parse_container_ranged_with_tail(source, DEFAULT_TAIL_FETCH_BYTES);
+        };
+        match crate::container::container_from_data_footer(source, payload) {
+            Ok(container) => Ok(container),
+            Err(e @ (VixError::Cancelled | VixError::Callback(_))) => Err(e),
+            Err(e) => {
+                log::warn!(
+                    "vix open: embedded data footer unreadable ({e}); reading the data tail"
+                );
+                parse_container_ranged_with_tail(source, DEFAULT_TAIL_FETCH_BYTES)
+            }
+        }
     }
 
     fn from_containers(
