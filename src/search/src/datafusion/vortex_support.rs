@@ -58,12 +58,14 @@ pub struct VortexRuntime {
 
 impl VortexRuntime {
     fn new(threads: usize) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(threads)
-            .thread_name("vortex")
-            .enable_all()
-            .build()
-            .expect("failed to build the vortex runtime");
+        let runtime = config::allocator_reclaim::configure_runtime(
+            tokio::runtime::Builder::new_multi_thread(),
+        )
+        .worker_threads(threads)
+        .thread_name("vortex")
+        .enable_all()
+        .build()
+        .expect("failed to build the vortex runtime");
         Self { runtime }
     }
 

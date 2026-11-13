@@ -15,6 +15,7 @@
 
 #![feature(macro_metavar_expr_concat)]
 
+pub mod allocator_reclaim;
 pub mod axum;
 pub mod cluster;
 pub mod config;

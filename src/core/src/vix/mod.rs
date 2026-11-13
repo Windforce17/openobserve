@@ -29,3 +29,5 @@
 //! stream type builds an inverted index.
 
 pub mod core_writer;
+
+pub use vortex_index::runtime_reclaim::register_park_hook;

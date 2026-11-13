@@ -85,6 +85,7 @@ mod query;
 mod reader;
 mod reader_compact;
 mod repack;
+pub mod runtime_reclaim;
 pub mod sbbf;
 mod source;
 mod spill;

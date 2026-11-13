@@ -183,12 +183,13 @@ fn configured_threads() -> usize {
 
 fn build_runtime() -> Result<SharedCpuRuntime, String> {
     let threads = configured_threads();
-    let io_runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("vix-io")
-        .enable_all()
-        .build()
-        .map_err(|error| format!("shared VIX I/O executor: {error}"))?;
+    let io_runtime =
+        crate::runtime_reclaim::configure_runtime(tokio::runtime::Builder::new_multi_thread())
+            .worker_threads(2)
+            .thread_name("vix-io")
+            .enable_all()
+            .build()
+            .map_err(|error| format!("shared VIX I/O executor: {error}"))?;
     let concrete = Arc::new(SplitExecutor {
         io: io_runtime.handle().clone(),
         cpu: CpuLeafPool::new(threads)?,

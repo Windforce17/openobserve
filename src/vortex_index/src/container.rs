@@ -3123,7 +3123,7 @@ pub(crate) fn scan_blob_streaming(
     // write path's pool. 0/1 keeps the single-thread shape.
     let pool = if decode_threads > 1 {
         Some(
-            tokio::runtime::Builder::new_multi_thread()
+            crate::runtime_reclaim::configure_runtime(tokio::runtime::Builder::new_multi_thread())
                 .worker_threads(decode_threads)
                 .thread_name("vix-decode")
                 .build()
