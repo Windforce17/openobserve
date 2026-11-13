@@ -45,8 +45,8 @@ impl Settings {
     }
     pub fn from_env() -> Result<Self, String> {
         Self::parse(
-            &std::env::var("ZO_VIX_EVAL_COLLECT_MODE").unwrap_or_else(|_| "off".into()),
-            &std::env::var("ZO_VIX_EVAL_COLLECT_INTERVAL_MS").unwrap_or_else(|_| "1000".into()),
+            &crate::allocator_reclaim::startup_env("ZO_VIX_EVAL_COLLECT_MODE", "off")?,
+            &crate::allocator_reclaim::startup_env("ZO_VIX_EVAL_COLLECT_INTERVAL_MS", "1000")?,
         )
     }
 }
@@ -58,8 +58,11 @@ struct Policy {
 static POLICY: OnceLock<Policy> = OnceLock::new();
 thread_local! { static LAST: Cell<Option<Instant>> = const { Cell::new(None) }; }
 
-/// Register once, only from the binary that actually uses this allocator.
-pub fn initialize(settings: Settings, collect: fn(bool)) -> Result<(), &'static str> {
+/// Initialize once after the binary registers its allocator, if any.
+pub fn initialize(settings: Settings) -> Result<(), &'static str> {
+    let Some(collect) = crate::allocator_reclaim::collector() else {
+        return Ok(());
+    };
     POLICY
         .set(Policy { settings, collect })
         .map_err(|_| "VIX reclaim already initialized")
@@ -83,7 +86,7 @@ impl Drop for Guard<'_> {
                 let now = Instant::now();
                 if last
                     .get()
-                    .is_some_and(|t| now.duration_since(t) < policy.settings.interval)
+                    .is_some_and(|t| now.saturating_duration_since(t) < policy.settings.interval)
                 {
                     false
                 } else {

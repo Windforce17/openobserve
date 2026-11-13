@@ -177,15 +177,26 @@ async fn run() -> Result<(), anyhow::Error> {
     let cfg = get_config();
     let memory_ledger_config = config::QueryMemoryLedgerConfig::from_env()?;
 
+    // Validate even without mimalloc; invalid opt-in settings must fail startup.
+    let eval_reclaim = config::eval_reclaim::Settings::from_env().map_err(anyhow::Error::msg)?;
+    let park_reclaim =
+        config::allocator_reclaim::Settings::from_env().map_err(anyhow::Error::msg)?;
     #[cfg(feature = "mimalloc")]
-    start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
-
-    #[cfg(feature = "mimalloc")]
-    config::eval_reclaim::initialize(
-        config::eval_reclaim::Settings::from_env().map_err(anyhow::Error::msg)?,
-        |force| unsafe { libmimalloc_sys::mi_collect(force) },
+    config::allocator_reclaim::register_collector(|force| unsafe {
+        libmimalloc_sys::mi_collect(force)
+    })
+    .map_err(anyhow::Error::msg)?;
+    config::eval_reclaim::initialize(eval_reclaim).map_err(anyhow::Error::msg)?;
+    config::allocator_reclaim::initialize(park_reclaim).map_err(anyhow::Error::msg)?;
+    openobserve_core::vix::register_park_hook(
+        park_reclaim
+            .enabled()
+            .then_some(config::allocator_reclaim::on_thread_park as fn()),
     )
     .map_err(anyhow::Error::msg)?;
+
+    #[cfg(feature = "mimalloc")]
+    start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
 
     #[cfg(feature = "tokio-console")]
     console_subscriber::ConsoleLayer::builder()

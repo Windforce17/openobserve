@@ -84,6 +84,7 @@ pub mod postings;
 mod query;
 mod reader;
 mod repack;
+pub mod runtime_reclaim;
 pub mod sbbf;
 mod source;
 mod spill;
