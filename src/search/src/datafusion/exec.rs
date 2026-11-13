@@ -457,6 +457,7 @@ fn create_runtime_env_with_inner_pool(
     // Merge contexts continue reporting their separate shared merge pool.
     let memory_pool = PeakMemoryPool::new(inner_pool, trace_id.to_string());
     builder = builder.with_memory_pool(Arc::new(memory_pool));
+    builder = super::spill_disk::configure(builder);
     builder.build()
 }
 

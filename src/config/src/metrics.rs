@@ -1504,6 +1504,18 @@ pub static NODE_CGROUP_MEMORY_EVENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(Opts::new("node_cgroup_memory_events", "Own cgroup v2 memory.events counters (high, max, oom, oom_kill) since the cgroup was created; unavailable samples omitted")
         .namespace(NAMESPACE).const_labels(create_const_labels()), &["event"]).expect("Metric created")
 });
+pub static DATAFUSION_SPILL_DISK: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "datafusion_spill_disk",
+            "Process-wide DataFusion spill directory (ZO_DATAFUSION_SPILL_DIR): used_bytes, active_files and limit_bytes; absent when the directory is not configured",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["kind"],
+    )
+    .expect("Metric created")
+});
 pub static FOLLOWER_ADMISSION_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -3061,6 +3073,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(NODE_CGROUP_MEMORY_EVENTS.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(DATAFUSION_SPILL_DISK.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(FOLLOWER_ADMISSION_ACTIVE.clone()))

@@ -3100,6 +3100,18 @@ pub struct Limit {
     )]
     pub datafusion_file_stat_cache_max_size: usize,
     #[env_config(
+        name = "ZO_DATAFUSION_SPILL_DIR",
+        default = "",
+        help = "Dedicated directory for DataFusion spill files, shared by every query of this process under one size limit (ZO_DATAFUSION_SPILL_MAX_SIZE). Must be an absolute path used by this process only; leftover DataFusion spill directories in it are removed at first use. Empty keeps the DataFusion default: a private directory under the OS temp dir per query context, each limited to 100 GiB."
+    )]
+    pub datafusion_spill_dir: String,
+    #[env_config(
+        name = "ZO_DATAFUSION_SPILL_MAX_SIZE",
+        default = 0, // MB, 0 means 102400 (100 GiB)
+        help = "Maximum total size in MB of the DataFusion spill files in ZO_DATAFUSION_SPILL_DIR. 0 means 102400 (100 GiB). Clamped at first use to the free space of the filesystem minus a reserve."
+    )]
+    pub datafusion_spill_max_size: usize,
+    #[env_config(
         name = "ZO_DATAFUSION_STREAMING_AGGS_CACHE_MAX_ENTRIES",
         default = 10000,
         help = "Maximum number of entries in the streaming aggs cache. Higher values increase memory usage but may improve query performance."
@@ -4222,6 +4234,11 @@ pub fn init() -> Config {
         panic!("data path config error: {e}");
     }
 
+    // check datafusion spill config (needs the normalized data paths)
+    if let Err(e) = check_datafusion_spill_config(&mut cfg) {
+        panic!("datafusion spill config error: {e}");
+    }
+
     // check memory cache
     if let Err(e) = check_memory_config(&mut cfg) {
         panic!("memory cache config error: {e}");
@@ -4870,6 +4887,48 @@ fn check_path_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.common.mmdb_data_dir = format!("{}/", cfg.common.mmdb_data_dir);
     }
 
+    Ok(())
+}
+
+/// Validate `ZO_DATAFUSION_SPILL_DIR` and convert `ZO_DATAFUSION_SPILL_MAX_SIZE`
+/// from MB to bytes. The directory must be absolute and dedicated: leftover
+/// DataFusion spill directories in it are removed at first use, so it must not
+/// be the filesystem root or one of the data directories.
+fn check_datafusion_spill_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    let raw = cfg.limit.datafusion_spill_dir.trim();
+    let dir = raw.trim_end_matches('/').to_string();
+    if !raw.is_empty() {
+        let path = Path::new(&dir);
+        // "/" and "//" trim to "": reject them instead of treating them as unset.
+        if dir.is_empty() || !path.is_absolute() || path.parent().is_none() {
+            return Err(anyhow::anyhow!(
+                "ZO_DATAFUSION_SPILL_DIR must be an absolute, dedicated directory, got {:?}",
+                cfg.limit.datafusion_spill_dir
+            ));
+        }
+        let reserved = [
+            &cfg.common.data_dir,
+            &cfg.common.data_wal_dir,
+            &cfg.common.data_stream_dir,
+            &cfg.common.data_db_dir,
+            &cfg.common.data_cache_dir,
+            &cfg.common.data_tmp_dir,
+            &cfg.common.mmdb_data_dir,
+        ];
+        if let Some(clash) = reserved
+            .iter()
+            .find(|other| Path::new(other.trim_end_matches('/')) == path)
+        {
+            return Err(anyhow::anyhow!(
+                "ZO_DATAFUSION_SPILL_DIR must be a dedicated directory, not the data directory {clash:?}"
+            ));
+        }
+    }
+    cfg.limit.datafusion_spill_dir = dir;
+    if cfg.limit.datafusion_spill_max_size == 0 {
+        cfg.limit.datafusion_spill_max_size = 100 * 1024; // 100 GiB, DataFusion's default
+    }
+    cfg.limit.datafusion_spill_max_size *= SIZE_IN_MB as usize;
     Ok(())
 }
 
@@ -5648,6 +5707,41 @@ mod tests {
             err.to_string()
                 .contains("ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE")
         );
+    }
+    /// Empty keeps the DataFusion default; a set directory must be absolute
+    /// and must not be the root or a data directory; the size defaults to
+    /// 100 GiB and is converted from MB to bytes.
+    #[test]
+    fn datafusion_spill_config_validates_directory_and_size() {
+        let mib = 1024 * 1024;
+        let base = |dir: &str, size: usize| {
+            let mut cfg = Config::init().unwrap();
+            check_path_config(&mut cfg).unwrap();
+            cfg.limit.datafusion_spill_dir = dir.to_string();
+            cfg.limit.datafusion_spill_max_size = size;
+            cfg
+        };
+        let mut cfg = base("", 0);
+        check_datafusion_spill_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.datafusion_spill_dir, "");
+        assert_eq!(cfg.limit.datafusion_spill_max_size, 100 * 1024 * mib);
+
+        let mut cfg = base(" /data/df-spill/ ", 196608);
+        check_datafusion_spill_config(&mut cfg).unwrap();
+        assert_eq!(cfg.limit.datafusion_spill_dir, "/data/df-spill");
+        assert_eq!(cfg.limit.datafusion_spill_max_size, 196608 * mib);
+
+        for bad in ["relative/spill", "/", "//"] {
+            let mut cfg = base(bad, 0);
+            let err = check_datafusion_spill_config(&mut cfg).unwrap_err();
+            assert!(err.to_string().contains("absolute"), "{bad}: {err}");
+        }
+        let defaults = base("", 0);
+        for clash in [&defaults.common.data_dir, &defaults.common.data_cache_dir] {
+            let mut cfg = base(clash, 0);
+            let err = check_datafusion_spill_config(&mut cfg).unwrap_err();
+            assert!(err.to_string().contains("dedicated"), "{clash}: {err}");
+        }
     }
 
     /// M11 launch defaults (OWNER 2026-08-18: "cache_latest_files default

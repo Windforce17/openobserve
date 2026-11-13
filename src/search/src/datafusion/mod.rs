@@ -25,6 +25,7 @@ pub mod plan;
 pub mod plan_metrics;
 pub mod planner;
 pub mod source_synthesis;
+mod spill_disk;
 pub mod storage;
 pub mod table_provider;
 pub mod udaf;
