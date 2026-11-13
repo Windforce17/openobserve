@@ -106,10 +106,19 @@ async fn update_node_memory_usage() -> Result<(), anyhow::Error> {
             .with_label_values::<&str>(&[])
             .set(mem_usage as i64);
         let cgroup = config::utils::sysinfo::cgroup_memory::read();
-        for (kind, bytes) in [
+        let stat_value = |key: &str| {
+            cgroup
+                .as_ref()
+                .and_then(|v| v.stat.iter().find(|(k, _)| *k == key).map(|(_, b)| *b))
+        };
+        let base = [
             ("current", cgroup.as_ref().map(|v| v.current)),
             ("working_set", cgroup.as_ref().and_then(|v| v.working_set)),
-        ] {
+        ];
+        let stat = config::utils::sysinfo::cgroup_memory::STAT_KEYS
+            .iter()
+            .map(|&key| (key, stat_value(key)));
+        for (kind, bytes) in base.into_iter().chain(stat) {
             if let Some(bytes) = bytes {
                 config::metrics::NODE_CGROUP_MEMORY_BYTES
                     .with_label_values(&[kind])
@@ -117,6 +126,18 @@ async fn update_node_memory_usage() -> Result<(), anyhow::Error> {
             } else {
                 // Do not expose a stale sample or claim that unreadable means zero.
                 let _ = config::metrics::NODE_CGROUP_MEMORY_BYTES.remove_label_values(&[kind]);
+            }
+        }
+        for &event in config::utils::sysinfo::cgroup_memory::EVENT_KEYS.iter() {
+            let count = cgroup
+                .as_ref()
+                .and_then(|v| v.events.iter().find(|(k, _)| *k == event).map(|(_, n)| *n));
+            if let Some(count) = count {
+                config::metrics::NODE_CGROUP_MEMORY_EVENTS
+                    .with_label_values(&[event])
+                    .set(count.min(i64::MAX as u64) as i64);
+            } else {
+                let _ = config::metrics::NODE_CGROUP_MEMORY_EVENTS.remove_label_values(&[event]);
             }
         }
         tokio::time::sleep(time::Duration::from_secs(1)).await;

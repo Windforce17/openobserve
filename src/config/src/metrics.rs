@@ -1497,8 +1497,12 @@ pub static DATAFUSION_SHARED_REJECTIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
     .expect("Metric created")
 });
 pub static NODE_CGROUP_MEMORY_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
-    IntGaugeVec::new(Opts::new("node_cgroup_memory_bytes", "Current cgroup memory usage and usage minus inactive_file; unavailable samples omitted")
+    IntGaugeVec::new(Opts::new("node_cgroup_memory_bytes", "Own cgroup memory: current, working_set (current minus inactive_file) and the v2 memory.stat fields anon, file, active_file, inactive_file, file_dirty, file_writeback, anon_thp, shmem, slab, sock, kernel; unavailable samples omitted")
         .namespace(NAMESPACE).const_labels(create_const_labels()), &["kind"]).expect("Metric created")
+});
+pub static NODE_CGROUP_MEMORY_EVENTS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(Opts::new("node_cgroup_memory_events", "Own cgroup v2 memory.events counters (high, max, oom, oom_kill) since the cgroup was created; unavailable samples omitted")
+        .namespace(NAMESPACE).const_labels(create_const_labels()), &["event"]).expect("Metric created")
 });
 pub static FOLLOWER_ADMISSION_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
@@ -3054,6 +3058,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(NODE_CGROUP_MEMORY_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(NODE_CGROUP_MEMORY_EVENTS.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(FOLLOWER_ADMISSION_ACTIVE.clone()))

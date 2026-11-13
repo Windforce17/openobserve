@@ -160,6 +160,7 @@ fn main() -> Result<(), anyhow::Error> {
 async fn run() -> Result<(), anyhow::Error> {
     // M27: activate the sampling heap profiler if (and only if)
     // ZO_HEAP_PROFILE_SAMPLE_EVERY_MB is set; no-op otherwise.
+    config::heap_profile::init();
 
     // CLI provides the path to the config file (if any)
     // In case a custom path is provided, the file will be read first

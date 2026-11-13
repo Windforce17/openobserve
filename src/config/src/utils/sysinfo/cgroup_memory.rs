@@ -19,7 +19,31 @@ use std::path::{Path, PathBuf};
 pub struct MemoryUsage {
     pub current: u64,
     pub working_set: Option<u64>,
+    /// cgroup v2 `memory.stat` fields in [`STAT_KEYS`] that are present, in
+    /// that order. Empty on v1 or when memory.stat is unreadable.
+    pub stat: Vec<(&'static str, u64)>,
+    /// cgroup v2 `memory.events` counters in [`EVENT_KEYS`] that are present.
+    pub events: Vec<(&'static str, u64)>,
 }
+
+/// v2 memory.stat fields that split usage into anonymous, file (and how much
+/// of it is dirty or under writeback), huge-page and kernel memory.
+pub const STAT_KEYS: [&str; 11] = [
+    "anon",
+    "file",
+    "active_file",
+    "inactive_file",
+    "file_dirty",
+    "file_writeback",
+    "anon_thp",
+    "shmem",
+    "slab",
+    "sock",
+    "kernel",
+];
+
+/// v2 memory.events counters: reclaim pressure (`high`, `max`) and OOM.
+pub const EVENT_KEYS: [&str; 4] = ["high", "max", "oom", "oom_kill"];
 
 /// Read only the process's own memory cgroup, not a host/root fallback.
 /// v2 working set is memory.current - inactive_file; v1 uses hierarchical
@@ -38,10 +62,38 @@ pub fn read() -> Option<MemoryUsage> {
     .parse::<u64>()
     .ok()?;
     let stat = std::fs::read_to_string(dir.join("memory.stat")).ok();
+    let events = if v2 {
+        std::fs::read_to_string(dir.join("memory.events")).ok()
+    } else {
+        None
+    };
     Some(MemoryUsage {
         current,
         working_set: stat.as_deref().and_then(|s| working_set(current, s, v2)),
+        stat: match (&stat, v2) {
+            (Some(text), true) => pick(text, &STAT_KEYS),
+            _ => Vec::new(),
+        },
+        events: events
+            .as_deref()
+            .map_or_else(Vec::new, |text| pick(text, &EVENT_KEYS)),
     })
+}
+
+/// `key value` lines restricted to `keys`, in `keys` order; unparseable or
+/// absent keys are omitted rather than reported as zero.
+fn pick(text: &str, keys: &[&'static str]) -> Vec<(&'static str, u64)> {
+    keys.iter()
+        .filter_map(|&key| {
+            text.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                if fields.next()? != key {
+                    return None;
+                }
+                Some((key, fields.next()?.parse::<u64>().ok()?))
+            })
+        })
+        .collect()
 }
 
 fn working_set(current: u64, stat: &str, v2: bool) -> Option<u64> {
@@ -173,6 +225,29 @@ mod tests {
         assert_eq!(working_set(100, "inactive_file 150\n", true), Some(0));
         assert_eq!(working_set(100, "anon 20\n", true), None);
         assert_eq!(working_set(100, "inactive_file x\n", true), None);
+    }
+    #[test]
+    fn picks_present_stat_and_event_fields_only() {
+        assert_eq!(
+            pick(
+                "anon 20\nfile 30\nfile_dirty 7\nfile_writeback x\nanon_thp 0\n",
+                &STAT_KEYS
+            ),
+            vec![
+                ("anon", 20),
+                ("file", 30),
+                ("file_dirty", 7),
+                ("anon_thp", 0)
+            ]
+        );
+        assert_eq!(
+            pick(
+                "low 0\nhigh 3\nmax 9\noom 1\noom_kill 1\noom_group_kill 0\n",
+                &EVENT_KEYS
+            ),
+            vec![("high", 3), ("max", 9), ("oom", 1), ("oom_kill", 1)]
+        );
+        assert!(pick("", &STAT_KEYS).is_empty());
     }
     #[test]
     fn mountinfo_escapes_are_resolved() {
