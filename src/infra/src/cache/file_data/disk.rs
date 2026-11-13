@@ -1270,10 +1270,14 @@ async fn load(
             };
             // Only this tier's prefixes: the root may also hold other tiers'
             // directories (the block tier's sparse `blocks/` files).
+            // Segment scans cache WAL segment objects here (`cache_for_key`
+            // routes them to the result tier); skipping them would strand
+            // every previous run's segments on disk, unindexed and unevictable.
             if !key.starts_with("files")
                 && !key.starts_with("results")
                 && !key.starts_with("aggregations")
                 && !key.starts_with("metrics_results")
+                && !key.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX)
             {
                 continue;
             }
@@ -1812,17 +1816,7 @@ mod tests {
         }
 
         async fn quiesce(&self) {
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                loop {
-                    self.data.run_pending_tasks();
-                    if self.pending_deletes.load(Ordering::Relaxed) == 0 {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                }
-            })
-            .await
-            .expect("disk cache eviction deleter did not quiesce");
+            quiesce_deletes(&self.files).await;
         }
 
         fn reconcile(&self) {
@@ -1871,6 +1865,21 @@ mod tests {
             tokio::runtime::Handle::try_current().is_ok(),
             Vec::new(),
         )
+    }
+
+    /// Wait until every eviction `files` queued has been unlinked.
+    async fn quiesce_deletes(files: &FileData) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                files.data.run_pending_tasks();
+                if files.pending_deletes.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("disk cache eviction deleter did not quiesce");
     }
 
     fn unique_disk_range_test_key(name: &str) -> String {
@@ -2987,6 +2996,49 @@ mod tests {
             let (_, _, query_key, _) = parse_result_cache_key(key).unwrap();
             QUERY_RESULT_CACHE.write().await.remove(&query_key);
         }
+    }
+
+    /// Segment scans cache WAL segment objects in the result tier. Segments a
+    /// previous run left on disk must come back under that tier's capacity
+    /// and crash rules, never stay on disk outside every index.
+    #[tokio::test]
+    async fn load_indexes_wal_segments_left_by_the_previous_run() {
+        let data = test_cache(FileType::Data, 64 << 20, "lru");
+        if !keeps_holes(data.root.path()) {
+            return;
+        }
+        // Room for two of the three older segments.
+        let (results, aggregations) = sibling_caches(&data, 2 * 1024);
+        let segment = |seq: u64| {
+            format!(
+                "{}load-node/{seq:020}",
+                crate::wal_segments::SEGMENT_KEY_PREFIX
+            )
+        };
+        let (oldest, older, old, recent) = (segment(1), segment(2), segment(3), segment(4));
+        let oldest_path = write_cache_file(&results, &oldest, &[1; 1024], 90_000);
+        write_cache_file(&results, &older, &[2; 1024], 90_001);
+        write_cache_file(&results, &old, &[3; 1024], 90_002);
+        // Inside the recent window of the previous run's last write.
+        let recent_path = write_cache_file(&results, &recent, &[4; 1024], 99_990);
+        write_cache_file(&data, "files/load/logs/last.parquet", &[5; 4096], 100_000);
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100_500);
+
+        let root = data.root.path().canonicalize().unwrap();
+        load(&root, [&data.files, &results, &aggregations], started)
+            .await
+            .unwrap();
+        quiesce_deletes(&results).await;
+
+        assert!(!results.data.contains_key(&oldest));
+        assert!(!Path::new(&oldest_path).exists());
+        for key in [&older, &old] {
+            assert!(results.data.contains_key(key), "{key}");
+            assert!(Path::new(&results.get_file_path(key)).exists(), "{key}");
+        }
+        assert_eq!(results.size().1, 2 * 1024);
+        assert!(!results.data.contains_key(&recent));
+        assert!(!Path::new(&recent_path).exists());
     }
 
     #[tokio::test]
