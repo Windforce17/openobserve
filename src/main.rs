@@ -176,6 +176,8 @@ async fn run() -> Result<(), anyhow::Error> {
     // never through the legacy panic-based Config initializer or reload path.
     let cfg = get_config();
     let memory_ledger_config = config::QueryMemoryLedgerConfig::from_env()?;
+    config::datafusion_headroom::reserve_percent()?;
+
     openobserve::service::search::vix::initialize_reader_compact()?;
 
     // Validate even without mimalloc; invalid opt-in settings must fail startup.
