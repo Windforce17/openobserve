@@ -20,6 +20,7 @@ pub mod cluster;
 pub mod config;
 pub mod config_path_manager;
 pub mod datafusion;
+pub mod eval_reclaim;
 pub mod heap_profile;
 pub mod ider;
 pub mod memory_ledger;

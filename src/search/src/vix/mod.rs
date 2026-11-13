@@ -1176,13 +1176,18 @@ async fn run_evaluation<T: Send + 'static>(
     let task_operation = Arc::clone(operation);
     let mut task = crate::utils::AbortOnDrop::new(
         tokio::task::spawn_blocking(move || {
-            let mut admitted = admitted;
-            task_operation.run_evaluation(&admitted.permit, || {
-                vortex_index::check_read_cancelled()?;
-                let result = admitted.work.take().expect("evaluation runs once")();
-                vortex_index::check_read_cancelled()?;
-                admitted.permit.check_refusal()?;
-                result
+            // Move all captures into the inner closure: its operation scopes,
+            // inputs and permit must drop before owner-local collection, even
+            // on error/panic. The returned result remains live and is not freed.
+            config::eval_reclaim::run(move || {
+                let mut admitted = admitted;
+                task_operation.run_evaluation(&admitted.permit, || {
+                    vortex_index::check_read_cancelled()?;
+                    let result = admitted.work.take().expect("evaluation runs once")();
+                    vortex_index::check_read_cancelled()?;
+                    admitted.permit.check_refusal()?;
+                    result
+                })
             })
         }),
         trace_id,
