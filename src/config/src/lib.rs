@@ -26,6 +26,7 @@ pub mod memory_ledger;
 pub mod meta;
 pub mod metrics;
 pub mod prebuilt_loader;
+pub mod reader_compact;
 pub mod router;
 pub mod search_admission;
 pub mod stats;

@@ -751,16 +751,83 @@ pub(crate) struct RangedBlob {
 }
 
 struct FooterState {
-    ranges: OnceLock<Vec<(Range<u64>, Bytes)>>,
+    ranges: OnceLock<Vec<(Range<u64>, FooterBytes)>>,
     memory: OnceLock<Arc<crate::reader::ReaderMemory>>,
+}
+
+/// Retain only the compact payload; decoded owners carry operation reservations.
+#[derive(Clone)]
+struct FooterBytes {
+    bytes: Bytes,
+    decoded_len: Option<usize>,
+}
+impl FooterBytes {
+    fn new(bytes: Bytes) -> Self {
+        Self::with_compression(bytes, crate::reader_compact::settings().compact_footer)
+    }
+    fn with_compression(bytes: Bytes, enabled: bool) -> Self {
+        if enabled
+            && bytes.len() >= 4096
+            && let Ok(encoded) = zstd::bulk::compress(&bytes, 1)
+            && encoded.len() < bytes.len() - bytes.len().div_ceil(10)
+        {
+            return Self {
+                bytes: Bytes::copy_from_slice(&encoded),
+                decoded_len: Some(bytes.len()),
+            };
+        }
+        Self {
+            bytes,
+            decoded_len: None,
+        }
+    }
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn decode(
+        &self,
+        memory: &Arc<crate::reader::ReaderMemory>,
+        operation: Option<&dyn VixReadOperation>,
+    ) -> VortexResult<Bytes> {
+        let Some(len) = self.decoded_len else {
+            return Ok(self.bytes.clone());
+        };
+        if operation.is_some_and(|op| op.is_cancelled()) {
+            return Err(vortex_err!(External: VixError::Cancelled));
+        }
+        // Reserve a conservative 1 MiB transient zstd workspace envelope.
+        let pending = memory
+            .reserve_with(len.saturating_add(1024 * 1024), |owned| {
+                check_operation_memory(operation, owned)
+            })
+            .map_err(|e| vortex_err!(External: e))?;
+        let decoded =
+            zstd::bulk::decompress(&self.bytes, len).map_err(|e| vortex_err!(External: e))?;
+        if decoded.len() != len {
+            return Err(vortex_err!("compressed footer length mismatch"));
+        }
+        struct Owned {
+            bytes: Vec<u8>,
+            _pending: crate::reader::PendingMemory,
+        }
+        impl AsRef<[u8]> for Owned {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        Ok(Bytes::from_owner(Owned {
+            bytes: decoded,
+            _pending: pending,
+        }))
+    }
 }
 
 /// A weak identity keeps the allocation address unique without retaining bytes.
 pub(crate) struct FooterIdentity(Weak<FooterState>);
 
 impl FooterState {
-    fn retained_bytes(ranges: &Vec<(Range<u64>, Bytes)>) -> usize {
-        ranges.capacity() * std::mem::size_of::<(Range<u64>, Bytes)>()
+    fn retained_bytes(ranges: &Vec<(Range<u64>, FooterBytes)>) -> usize {
+        ranges.capacity() * std::mem::size_of::<(Range<u64>, FooterBytes)>()
             + ranges
                 .iter()
                 .map(|(_, bytes)| bytes.len() + 4 * std::mem::size_of::<usize>())
@@ -806,6 +873,12 @@ async fn fetch_footer_range(
         .iter()
         .find(|(cached, _)| cached.start <= range.start && range.end <= cached.end)
     {
+        let memory = footer
+            .memory
+            .get()
+            .cloned()
+            .unwrap_or_else(current_reader_memory);
+        let bytes = bytes.decode(&memory, operation)?;
         return Ok(
             bytes.slice((range.start - cached.start) as usize..(range.end - cached.start) as usize)
         );
@@ -830,8 +903,14 @@ async fn fetch_footer_range(
             offset = cached.start;
         }
         let end = cached.end.min(range.end);
+        let memory = footer
+            .memory
+            .get()
+            .cloned()
+            .unwrap_or_else(current_reader_memory);
+        let decoded = data.decode(&memory, operation)?;
         bytes.extend_from_slice(
-            &data[(offset - cached.start) as usize..(end - cached.start) as usize],
+            &decoded[(offset - cached.start) as usize..(end - cached.start) as usize],
         );
         offset = end;
     }
@@ -1147,7 +1226,7 @@ pub(crate) struct OpeningMemory {
     /// Absolute end offset of the blob: the retained footer window is a
     /// suffix `[consumed_start, blob_end)`.
     blob_end: u64,
-    /// Puffin object coordinates start here; postscript offsets are blob-relative.
+    /// Absolute Puffin object offset; postscript offsets are blob-relative.
     blob_start: u64,
     state: parking_lot::Mutex<OpeningState>,
 }
@@ -1215,6 +1294,10 @@ impl OpeningMemory {
                         .map(|(range, bytes)| (range, compact_bytes(bytes)))
                         .collect(),
                 };
+            let retained: Vec<_> = retained
+                .into_iter()
+                .map(|(range, bytes)| (range, FooterBytes::new(bytes)))
+                .collect();
             if self.footer.ranges.set(retained.clone()).is_ok()
                 && let Some(memory) = self.footer.memory.get()
             {
@@ -1265,7 +1348,6 @@ impl OpeningMemory {
         let mut deserializer = Footer::deserializer(ps_eof, VortexSession::empty())
             .with_size(blob_end.checked_sub(blob_start)?);
         let consumed_start = match deserializer.deserialize() {
-            // Vortex segment offsets are relative to this blob, not its Puffin object.
             Ok(DeserializeStep::NeedMoreData { offset, .. }) => offset.checked_add(blob_start)?,
             _ => return None,
         };
@@ -1752,8 +1834,15 @@ mod tests {
         opening.retain(ranges[0].0.clone(), ranges[0].1.clone());
         drop(opening.finish());
         let retained = ranged.footer.ranges.get().unwrap();
-        assert_eq!(retained[0].0, fixed[0].0);
-        assert_eq!(retained[0].1.len(), fixed[0].1.len());
+        let expected = &fixed[0];
+        assert_eq!(retained[0].0, expected.0);
+        assert_eq!(
+            retained[0]
+                .1
+                .decode(&Arc::new(crate::reader::ReaderMemory::new()), None)
+                .unwrap(),
+            expected.1
+        );
 
         // Zero-base remains identical; nonzero-base changes coordinates, not content.
         let zero_end = blob.len() as u64;
@@ -1762,6 +1851,61 @@ mod tests {
         assert_eq!(zero[0].1, fixed[0].1);
         assert_eq!(zero[0].0.start + base, fixed[0].0.start);
         assert!(OpeningMemory::trim_to_consumed_suffix(&ranges, end + 1, end).is_none());
+    }
+
+    #[test]
+    fn compact_footer_roundtrip_and_smaller_retention() {
+        let raw = Bytes::from((0..262144).map(|i| (i % 13) as u8).collect::<Vec<_>>());
+        let original = FooterBytes::with_compression(raw.clone(), false);
+        let compressed = FooterBytes::with_compression(raw.clone(), true);
+        assert!(
+            compressed.decoded_len.is_some(),
+            "compression must actually be exercised"
+        );
+        assert!(compressed.len() < original.len() / 2);
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let decoded = compressed.decode(&memory, None).unwrap();
+        assert_eq!(decoded, raw);
+        assert_eq!(&decoded[17..190003], &raw[17..190003]);
+        drop(decoded);
+        let plain = original.decode(&memory, None).unwrap();
+        assert_eq!(plain, raw);
+    }
+
+    #[test]
+    fn compact_footer_admission_cancel_and_corruption() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let compressed = FooterBytes::with_compression(Bytes::from(vec![3; 65536]), true);
+        let op = io_budget(1024);
+        op.cancelled.store(true, Ordering::SeqCst);
+        assert!(
+            compressed
+                .decode(&memory, Some(op.as_ref()))
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        struct Deny;
+        impl VixReadOperation for Deny {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+            fn check_memory(&self, _: usize) -> Result<()> {
+                Err(VixError::Malformed("compact-budget-denied".into()))
+            }
+        }
+        assert!(
+            compressed
+                .decode(&memory, Some(&Deny))
+                .unwrap_err()
+                .to_string()
+                .contains("compact-budget-denied")
+        );
+        let corrupt = FooterBytes {
+            bytes: Bytes::from_static(b"broken zstd"),
+            decoded_len: Some(1024),
+        };
+        assert!(corrupt.decode(&memory, None).is_err());
     }
 
     #[test]

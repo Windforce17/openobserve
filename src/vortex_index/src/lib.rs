@@ -83,6 +83,7 @@ mod numeric;
 pub mod postings;
 mod query;
 mod reader;
+mod reader_compact;
 mod repack;
 pub mod sbbf;
 mod source;
@@ -124,6 +125,7 @@ pub use reader::{
     DETACHED_DOCS_FOOTER_READ_BYTES, DocsDictBatch, DocsDictChunk, DocsPointReader,
     FieldValueCounts, PlistCursor, ReaderMemoryObserver, TermVisitor, VixReader, ZoneChunk,
 };
+pub use reader_compact::initialize_reader_compact;
 pub use repack::{SidecarRepack, SidecarRepackOptions, repack_sidecar, target_layout_gen};
 pub use source::{
     BytesRangeSource, VixRangeSource, VixReadOperation, check_read_cancelled, check_read_memory,
