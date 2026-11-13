@@ -181,6 +181,13 @@ async fn run() -> Result<(), anyhow::Error> {
     #[cfg(feature = "mimalloc")]
     start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
 
+    #[cfg(feature = "mimalloc")]
+    config::eval_reclaim::initialize(
+        config::eval_reclaim::Settings::from_env().map_err(anyhow::Error::msg)?,
+        |force| unsafe { libmimalloc_sys::mi_collect(force) },
+    )
+    .map_err(anyhow::Error::msg)?;
+
     #[cfg(feature = "tokio-console")]
     console_subscriber::ConsoleLayer::builder()
         .retention(Duration::from_secs(
