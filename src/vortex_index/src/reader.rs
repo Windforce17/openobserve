@@ -812,6 +812,8 @@ pub struct VixReader {
     /// Metadata like `dict_blob` itself — retained through `demote()` —
     /// so every later field/dict index build slices it with zero IO.
     dict_resident: OnceLock<Bytes>,
+    /// Decoded length of an opt-in compressed frame; None keeps the original representation.
+    dict_decoded_len: Option<usize>,
     terms_blob: Option<BlobHandle>,
     docs_blob: BlobHandle,
     /// The per-file value-bloom blob (`None` on files written before the
@@ -1140,6 +1142,8 @@ impl VixReader {
         eager_docs_schema: bool,
         owned_bytes: usize,
     ) -> Result<Self> {
+        crate::reader_compact::initialize_reader_compact()
+            .map_err(|error| VixError::Malformed(error.to_string()))?;
         let _data_pending = container.pending_memory.take();
         let _index_pending = index_container
             .as_mut()
@@ -1333,6 +1337,7 @@ impl VixReader {
         // open adds it to `owned_bytes` (the container bytes do not cover
         // the decode), a ranged open charges it through the `Mem` arm.
         let mut dict_decoded_bytes = 0usize;
+        let mut dict_decoded_len = None;
         let mut _dict_pending = None;
         if let Some(mut index) = index_container {
             if term_count > 0 {
@@ -1359,11 +1364,47 @@ impl VixReader {
                         .dict
                         .as_ref()
                         .ok_or_else(|| VixError::Malformed("missing dict blob".to_string()))?;
-                    let (decoded, pending) =
-                        Self::decode_dict_index(handle, &crate::source::current_reader_memory())?;
-                    dict_decoded_bytes = decoded.len() + RETAINED_BYTES_OVERHEAD;
-                    _dict_pending = Some(pending);
-                    index.dict = Some(BlobHandle::Mem(decoded));
+                    if crate::reader_compact::settings().lazy_dict && !eager_docs_schema {
+                        let compressed_len = usize::try_from(handle.len()).map_err(|_| {
+                            VixError::Malformed("compressed dict length exceeds usize".into())
+                        })?;
+                        let _fetch =
+                            crate::source::current_reader_memory().reserve(compressed_len)?;
+                        let compressed = match handle {
+                            BlobHandle::Mem(bytes) => bytes.clone(),
+                            BlobHandle::Ranged(blob) => crate::source::block_fetch(
+                                blob.source.as_ref(),
+                                blob.range.clone(),
+                            )?,
+                        };
+                        let len = zstd::zstd_safe::get_frame_content_size(&compressed)
+                            .map_err(|e| {
+                                VixError::Malformed(format!("dict index zstd frame header: {e}"))
+                            })?
+                            .ok_or_else(|| {
+                                VixError::Malformed(
+                                    "dict index zstd frame lacks a content size".into(),
+                                )
+                            })?;
+                        if len > DICT_RESIDENT_MAX_BYTES {
+                            return Err(VixError::Malformed(
+                                "compressed dict exceeds maximum".into(),
+                            ));
+                        }
+                        dict_decoded_len = Some(usize::try_from(len).map_err(|_| {
+                            VixError::Malformed("decoded dict length exceeds usize".into())
+                        })?);
+                        _dict_pending = Some(_fetch);
+                        index.dict = Some(BlobHandle::Mem(compact_bytes(compressed)));
+                    } else {
+                        let (decoded, pending) = Self::decode_dict_index(
+                            handle,
+                            &crate::source::current_reader_memory(),
+                        )?;
+                        dict_decoded_bytes = decoded.len() + RETAINED_BYTES_OVERHEAD;
+                        _dict_pending = Some(pending);
+                        index.dict = Some(BlobHandle::Mem(decoded));
+                    }
                 }
                 if let Some(property) = index
                     .properties
@@ -1379,7 +1420,7 @@ impl VixReader {
                         Some(BlobHandle::Ranged(blob)) => blob.len(),
                         None => 0,
                     };
-                    pages.validate(blob_len)?;
+                    pages.validate(dict_decoded_len.map_or(blob_len, |n| n as u64))?;
                     pages.pages.shrink_to_fit();
                     dict_field_pages = Some(pages);
                 }
@@ -1432,6 +1473,7 @@ impl VixReader {
             )),
             dict_blob,
             dict_resident: OnceLock::new(),
+            dict_decoded_len,
             terms_blob,
             docs_blob,
             bloom_blob,
@@ -2045,8 +2087,8 @@ impl VixReader {
         // The encoded directory, its compact typed arrays, and parser scratch.
         // This deliberately excludes the dictionary-blocks/postings objects.
         let _pending = self.memory.reserve(
-            usize::try_from(blob.len())
-                .unwrap_or(usize::MAX)
+            self.dict_decoded_len
+                .unwrap_or_else(|| usize::try_from(blob.len()).unwrap_or(usize::MAX))
                 .saturating_mul(3),
         )?;
         let bytes = match self.dict_bytes_for_index(blob)? {
@@ -2140,6 +2182,7 @@ impl VixReader {
             BlobHandle::Mem(bytes) => bytes.len() as u64,
             BlobHandle::Ranged(blob) => blob.len(),
         };
+        let len = self.dict_decoded_len.map_or(len, |n| n as u64);
         let interval = crate::dict_blocks::INDEX_RESTART_INTERVAL as u64;
         let restart_count = directory.block_count.div_ceil(interval);
         let first = page.first_block / interval * interval;
@@ -2223,6 +2266,22 @@ impl VixReader {
     /// millions of terms — returns the windowed handle, keeping today's
     /// five-probe build.
     fn dict_bytes_for_index<'a>(&'a self, blob: &'a BlobHandle) -> Result<DictBytes<'a>> {
+        if self.dict_decoded_len.is_some() {
+            let (bytes, pending) = Self::decode_dict_index(blob, &self.memory)?;
+            struct Owned {
+                bytes: Bytes,
+                _pending: PendingMemory,
+            }
+            impl AsRef<[u8]> for Owned {
+                fn as_ref(&self) -> &[u8] {
+                    &self.bytes
+                }
+            }
+            return Ok(DictBytes::Resident(Bytes::from_owner(Owned {
+                bytes,
+                _pending: pending,
+            })));
+        }
         if let Some(bytes) = self.dict_resident.get() {
             return Ok(DictBytes::Resident(bytes.clone()));
         }
@@ -3174,7 +3233,7 @@ impl VixReader {
             return Ok(Arc::clone(schema));
         }
         let (schema, _opening) = crate::container::blob_arrow_schema_owned(&self.docs_blob)?;
-        let schema = Arc::new(schema);
+        let schema = Arc::new(crate::reader_compact::schema(schema));
         for required in [TIMESTAMP_COL_NAME, SOURCE_COL_NAME] {
             if schema.field_with_name(required).is_err() {
                 return Err(VixError::Malformed(format!(
@@ -8130,6 +8189,92 @@ mod tests {
                 "count metadata read {read:?} fetched postings"
             );
         }
+    }
+
+    #[test]
+    fn compact_dict_keeps_frame_and_rebuilds_indexes() {
+        use arrow::datatypes::Schema;
+        const ROWS: usize = 4096;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("service", DataType::Utf8, false),
+        ]));
+        let values = (0..ROWS)
+            .map(|i| format!("service-{:04}", i % 512))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(
+                    (0..ROWS).map(|i| i as i64 + 1),
+                )),
+                Arc::new(StringArray::from_iter_values(&values)),
+            ],
+        )
+        .unwrap();
+        let mut writer = crate::VixWriter::new(
+            &schema,
+            crate::VixWriterOptions {
+                sidecar_tail_zstd: true,
+                encode_threads: 1,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(&batch, &StringArray::from(vec!["{}"; ROWS]), None)
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let data = Bytes::from(data);
+        let index = Bytes::from(index.unwrap());
+        let mut original = VixReader::open_with_index(data.clone(), Some(index.clone())).unwrap();
+        let decoded = original.dict_blob.as_ref().unwrap().bytes().unwrap();
+        let frame = Bytes::from(zstd::bulk::compress(&decoded, 1).unwrap());
+        assert!(frame.len() < decoded.len());
+        let data_source = Arc::new(RecordingSource {
+            bytes: data,
+            reads: Mutex::new(Vec::new()),
+        });
+        let index_source = Arc::new(RecordingSource {
+            bytes: index,
+            reads: Mutex::new(Vec::new()),
+        });
+        let ranged =
+            VixReader::open_ranged_with_index_sidecar_first(data_source, Some(index_source), true)
+                .unwrap();
+        assert_eq!(
+            ranged.dict_decoded_len.is_some(),
+            crate::reader_compact::settings().lazy_dict
+        );
+        if crate::reader_compact::settings().lazy_dict {
+            assert!(ranged.dict_blob.as_ref().unwrap().len() < decoded.len() as u64);
+        }
+        // Direct representation test also runs when the opt-in flag is off.
+        original.dict_blob = Some(BlobHandle::Mem(frame.clone()));
+        original.dict_decoded_len = Some(decoded.len());
+        for _ in 0..2 {
+            assert_eq!(
+                original.dict_index().unwrap().block_count(),
+                crate::dict_blocks::DictIndex::parse(&decoded)
+                    .unwrap()
+                    .block_count()
+            );
+            let q = VixQuery::Exact {
+                field: "service".into(),
+                token: b"service-0017".to_vec(),
+            };
+            let expected = ranged.eval(&q).unwrap();
+            assert_eq!(original.eval(&q).unwrap(), expected);
+            assert!(
+                original.dict_resident.get().is_none(),
+                "on-demand decoding must not retain a permanent decoded copy"
+            );
+            original.demote();
+            assert!(original.dict_index.get().is_none());
+            assert_eq!(original.dict_blob.as_ref().unwrap().bytes().unwrap(), frame);
+        }
+        original.dict_blob = Some(BlobHandle::Mem(Bytes::from_static(b"broken zstd")));
+        assert!(original.dict_index().is_err());
     }
 
     #[test]

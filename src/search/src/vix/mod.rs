@@ -1465,7 +1465,10 @@ impl VixDocsInput {
     }
 }
 
-pub use vortex_index::{set_sidecar_first_open, set_tail_fetch_size, set_walk_verify_min_bytes};
+pub use vortex_index::{
+    initialize_reader_compact, set_sidecar_first_open, set_tail_fetch_size,
+    set_walk_verify_min_bytes,
+};
 
 /// A warmup attempt distinguishes retryable contention from terminal skips.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
