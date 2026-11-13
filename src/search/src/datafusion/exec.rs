@@ -67,7 +67,8 @@ use vortex_datafusion::VortexFormat;
 
 use super::{
     peak_memory_pool::PeakMemoryPool, planner::extension_planner::OpenobserveQueryPlanner,
-    storage::file_list, udf::transform_udf::get_all_transform,
+    spillable_reserve_pool::SpillableReservePool, storage::file_list,
+    udf::transform_udf::get_all_transform,
 };
 use crate::{
     datafusion::{
@@ -374,6 +375,12 @@ static SHARED_QUERY_POOL: std::sync::LazyLock<Arc<dyn MemoryPool>> =
                     settings.pool_type
                 )
             });
+        // create_runtime_env_with_pool_mode validates this before forcing the
+        // static, and the server also propagates invalid values at startup.
+        let percent = config::datafusion_headroom::reserve_percent()
+            .expect("query headroom startup configuration was validated");
+        let tracked_pool =
+            SpillableReservePool::wrap("shared-query-global", memory_size, percent, tracked_pool);
         let pool: Arc<dyn MemoryPool> = Arc::new(
             LimitedMemoryPool::new("shared-query-global", memory_size, tracked_pool)
                 .with_shared_metrics(),
@@ -404,6 +411,8 @@ fn create_runtime_env_with_pool_mode(
     mode: RuntimeMemoryPoolMode,
 ) -> Result<RuntimeEnv> {
     let cfg = get_config();
+    let percent = config::datafusion_headroom::reserve_percent()
+        .map_err(|error| DataFusionError::Configuration(error.to_string()))?;
     let inner_pool = match mode {
         RuntimeMemoryPoolMode::SharedMerge => Arc::clone(&SHARED_MERGE_POOL),
         RuntimeMemoryPoolMode::SharedQuery => {
@@ -416,12 +425,22 @@ fn create_runtime_env_with_pool_mode(
             Arc::new(LimitedMemoryPool::new(
                 "shared-query-context",
                 local_limit,
-                Arc::clone(&SHARED_QUERY_POOL),
+                SpillableReservePool::wrap(
+                    "shared-query-context",
+                    local_limit,
+                    percent,
+                    Arc::clone(&SHARED_QUERY_POOL),
+                ),
             )) as Arc<dyn MemoryPool>
         }
         RuntimeMemoryPoolMode::PerContext => {
             let memory_size = std::cmp::max(DATAFUSION_MIN_MEM, memory_limit);
-            build_tracked_pool(memory_size, &cfg.memory_cache.datafusion_memory_pool)?
+            SpillableReservePool::wrap(
+                "query-context",
+                memory_size,
+                percent,
+                build_tracked_pool(memory_size, &cfg.memory_cache.datafusion_memory_pool)?,
+            )
         }
     };
     create_runtime_env_with_inner_pool(trace_id, inner_pool, &cfg)
@@ -1519,6 +1538,96 @@ mod tests {
 
         assert_eq!(pool_a.reserved(), baseline_a);
         assert_eq!(pool_b.reserved(), baseline_b);
+    }
+
+    #[test]
+    fn headroom_runtime_wiring() {
+        const CHILD: &str = "OO_HEADROOM_RUNTIME_TEST_CHILD";
+        if let Ok(value) = std::env::var(CHILD) {
+            let percent = value.parse::<usize>().unwrap();
+            let local_limit = DATAFUSION_MIN_MEM;
+            let local_spill_limit =
+                local_limit / 100 * (100 - percent) + local_limit % 100 * (100 - percent) / 100;
+            for mode in [
+                RuntimeMemoryPoolMode::PerContext,
+                RuntimeMemoryPoolMode::SharedQuery,
+            ] {
+                let runtime =
+                    create_runtime_env_with_pool_mode("headroom-wiring", local_limit, mode)
+                        .unwrap();
+                let a = MemoryConsumer::new("spillable")
+                    .with_can_spill(true)
+                    .register(&runtime.memory_pool);
+                a.try_grow(local_spill_limit).unwrap();
+                let error = a.try_grow(1).unwrap_err().to_string();
+                assert_eq!(error.contains("spillable reserve"), percent > 0, "{error}");
+                let opener = MemoryConsumer::new("opener").register(&runtime.memory_pool);
+                opener.try_grow(local_limit - local_spill_limit).unwrap();
+                assert_eq!(runtime.memory_pool.reserved(), local_limit);
+                drop((a, opener));
+                assert_eq!(runtime.memory_pool.reserved(), 0);
+            }
+            // Two contexts each below their local allowance can still fill the
+            // aggregate allowance; rejection must come from the GLOBAL wrapper.
+            let global_limit = shared_query_global_limit();
+            let a = create_runtime_env_with_pool_mode(
+                "headroom-a",
+                global_limit,
+                RuntimeMemoryPoolMode::SharedQuery,
+            )
+            .unwrap();
+            let b = create_runtime_env_with_pool_mode(
+                "headroom-b",
+                global_limit,
+                RuntimeMemoryPoolMode::SharedQuery,
+            )
+            .unwrap();
+            let ra = MemoryConsumer::new("a")
+                .with_can_spill(true)
+                .register(&a.memory_pool);
+            let rb = MemoryConsumer::new("b")
+                .with_can_spill(true)
+                .register(&b.memory_pool);
+            let global_spill_limit =
+                global_limit / 100 * (100 - percent) + global_limit % 100 * (100 - percent) / 100;
+            ra.try_grow(global_spill_limit / 2).unwrap();
+            rb.try_grow(global_spill_limit - global_spill_limit / 2)
+                .unwrap();
+            let error = rb.try_grow(1).unwrap_err().to_string();
+            assert!(error.contains("shared-query-global"), "{error}");
+            assert_eq!(error.contains("spillable reserve"), percent > 0, "{error}");
+            drop((ra, rb));
+            assert_eq!(SHARED_QUERY_POOL.reserved(), 0);
+            // Merge ignores headroom even when the setting is enabled.
+            let merge = create_runtime_env_with_pool_mode(
+                "headroom-merge",
+                global_limit,
+                RuntimeMemoryPoolMode::SharedMerge,
+            )
+            .unwrap();
+            let r = MemoryConsumer::new("merge")
+                .with_can_spill(true)
+                .register(&merge.memory_pool);
+            r.try_grow(global_limit).unwrap();
+            drop(r);
+            assert_eq!(merge.memory_pool.reserved(), 0);
+            return;
+        }
+        for percent in ["0", "15"] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "datafusion::exec::tests::headroom_runtime_wiring",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, percent)
+                .env("ZO_DATAFUSION_UNSPILLABLE_RESERVE_PERCENT", percent)
+                .env("ZO_MEMORY_CACHE_DATAFUSION_MAX_SIZE", "512")
+                .env("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL", "greedy")
+                .status()
+                .unwrap();
+            assert!(status.success(), "percent={percent}");
+        }
     }
 
     #[test]

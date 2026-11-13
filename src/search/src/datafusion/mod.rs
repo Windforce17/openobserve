@@ -26,6 +26,7 @@ pub mod plan_metrics;
 pub mod planner;
 pub mod source_synthesis;
 mod spill_disk;
+mod spillable_reserve_pool;
 pub mod storage;
 pub mod table_provider;
 pub mod udaf;
@@ -90,5 +91,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod headroom_aggregate_tests;
 #[cfg(test)]
 mod repartition_spill_tests;

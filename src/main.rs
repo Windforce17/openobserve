@@ -176,6 +176,7 @@ async fn run() -> Result<(), anyhow::Error> {
     // never through the legacy panic-based Config initializer or reload path.
     let cfg = get_config();
     let memory_ledger_config = config::QueryMemoryLedgerConfig::from_env()?;
+    config::datafusion_headroom::reserve_percent()?;
 
     #[cfg(feature = "mimalloc")]
     start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
