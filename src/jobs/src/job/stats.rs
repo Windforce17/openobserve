@@ -100,48 +100,98 @@ async fn cache_stream_stats() -> Option<tokio::task::JoinHandle<()>> {
 
 // update node memory usage metrics every second
 async fn update_node_memory_usage() -> Result<(), anyhow::Error> {
+    if let Some(ledger) = config::memory_ledger::global() {
+        return update_observed_memory(ledger).await;
+    }
+    // Off retains the original sampler, metric publication and sleep cadence.
     loop {
         let mem_usage = config::utils::sysinfo::get_memory_usage();
         config::metrics::NODE_MEMORY_USAGE
             .with_label_values::<&str>(&[])
             .set(mem_usage as i64);
         let cgroup = config::utils::sysinfo::cgroup_memory::read();
-        let stat_value = |key: &str| {
-            cgroup
-                .as_ref()
-                .and_then(|v| v.stat.iter().find(|(k, _)| *k == key).map(|(_, b)| *b))
-        };
-        let base = [
-            ("current", cgroup.as_ref().map(|v| v.current)),
-            ("working_set", cgroup.as_ref().and_then(|v| v.working_set)),
-        ];
-        let stat = config::utils::sysinfo::cgroup_memory::STAT_KEYS
-            .iter()
-            .map(|&key| (key, stat_value(key)));
-        for (kind, bytes) in base.into_iter().chain(stat) {
-            if let Some(bytes) = bytes {
-                config::metrics::NODE_CGROUP_MEMORY_BYTES
-                    .with_label_values(&[kind])
-                    .set(bytes.min(i64::MAX as u64) as i64);
-            } else {
-                // Do not expose a stale sample or claim that unreadable means zero.
-                let _ = config::metrics::NODE_CGROUP_MEMORY_BYTES.remove_label_values(&[kind]);
-            }
-        }
-        for &event in config::utils::sysinfo::cgroup_memory::EVENT_KEYS.iter() {
-            let count = cgroup
-                .as_ref()
-                .and_then(|v| v.events.iter().find(|(k, _)| *k == event).map(|(_, n)| *n));
-            if let Some(count) = count {
-                config::metrics::NODE_CGROUP_MEMORY_EVENTS
-                    .with_label_values(&[event])
-                    .set(count.min(i64::MAX as u64) as i64);
-            } else {
-                let _ = config::metrics::NODE_CGROUP_MEMORY_EVENTS.remove_label_values(&[event]);
-            }
-        }
+        publish_cgroup_memory(cgroup.as_ref());
         tokio::time::sleep(time::Duration::from_secs(1)).await;
     }
+}
+
+fn publish_cgroup_memory(cgroup: Option<&config::utils::sysinfo::cgroup_memory::MemoryUsage>) {
+    let stat_value = |key: &str| {
+        cgroup
+            .as_ref()
+            .and_then(|v| v.stat.iter().find(|(k, _)| *k == key).map(|(_, b)| *b))
+    };
+    let base = [
+        ("current", cgroup.as_ref().map(|v| v.current)),
+        ("working_set", cgroup.as_ref().and_then(|v| v.working_set)),
+    ];
+    let stat = config::utils::sysinfo::cgroup_memory::STAT_KEYS
+        .iter()
+        .map(|&key| (key, stat_value(key)));
+    for (kind, bytes) in base.into_iter().chain(stat) {
+        if let Some(bytes) = bytes {
+            config::metrics::NODE_CGROUP_MEMORY_BYTES
+                .with_label_values(&[kind])
+                .set(bytes.min(i64::MAX as u64) as i64);
+        } else {
+            // Do not expose a stale sample or claim that unreadable means zero.
+            let _ = config::metrics::NODE_CGROUP_MEMORY_BYTES.remove_label_values(&[kind]);
+        }
+    }
+    for &event in config::utils::sysinfo::cgroup_memory::EVENT_KEYS.iter() {
+        let count = cgroup
+            .as_ref()
+            .and_then(|v| v.events.iter().find(|(k, _)| *k == event).map(|(_, n)| *n));
+        if let Some(count) = count {
+            config::metrics::NODE_CGROUP_MEMORY_EVENTS
+                .with_label_values(&[event])
+                .set(count.min(i64::MAX as u64) as i64);
+        } else {
+            let _ = config::metrics::NODE_CGROUP_MEMORY_EVENTS.remove_label_values(&[event]);
+        }
+    }
+}
+
+/// One task owns all cgroup reads. Export ticks never perform a second read.
+async fn update_observed_memory(
+    ledger: &config::memory_ledger::NodeMemoryLedger,
+) -> Result<(), anyhow::Error> {
+    let Some(period) = memory_ledger_sample_period(&ledger.config) else {
+        return Ok(());
+    };
+    let mut sampling = time::interval(period);
+    let mut exporting = time::interval(time::Duration::from_secs(1));
+    sampling.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    exporting.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut last = None;
+    loop {
+        tokio::select! {
+            _ = sampling.tick() => {
+                let sample = config::utils::sysinfo::cgroup_memory::read_observed();
+                ledger.update_sample(&sample);
+                last = Some(sample);
+            }
+            _ = exporting.tick() => {
+                config::metrics::NODE_MEMORY_USAGE
+                    .with_label_values::<&str>(&[])
+                    .set(config::utils::sysinfo::get_memory_usage() as i64);
+                publish_cgroup_memory(last.as_ref().and_then(|sample| sample.usage.as_ref()));
+                let metrics = &config::memory_ledger::metrics::METRICS;
+                metrics.publish(ledger, std::time::Instant::now());
+                metrics.publish_legacy();
+                metrics.publish_file_stat(
+                    std::sync::LazyLock::get(
+                        &openobserve_core::search::datafusion::storage::file_statistics_cache::GLOBAL_CACHE,
+                    ).map(|cache| cache.memory_size() as u64),
+                );
+            }
+        }
+    }
+}
+
+fn memory_ledger_sample_period(cfg: &config::QueryMemoryLedgerConfig) -> Option<time::Duration> {
+    (cfg.mode == config::QueryMemoryLedgerMode::Observe)
+        .then(|| time::Duration::from_millis(cfg.sample_interval_ms))
 }
 
 // update node disk usage metrics every 60 seconds
@@ -179,5 +229,26 @@ async fn update_node_disk_usage() -> Result<(), anyhow::Error> {
         }
 
         tokio::time::sleep(time::Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod memory_ledger_tests {
+    use super::*;
+
+    #[test]
+    fn off_has_no_sampling_clock_and_observe_uses_configured_period() {
+        let mut cfg = config::QueryMemoryLedgerConfig::from_lookup(|_| Ok(None)).unwrap();
+        assert_eq!(memory_ledger_sample_period(&cfg), None);
+        cfg.mode = config::QueryMemoryLedgerMode::Observe;
+        assert_eq!(
+            memory_ledger_sample_period(&cfg),
+            Some(time::Duration::from_millis(200))
+        );
+        cfg.sample_interval_ms = 37;
+        assert_eq!(
+            memory_ledger_sample_period(&cfg),
+            Some(time::Duration::from_millis(37))
+        );
     }
 }

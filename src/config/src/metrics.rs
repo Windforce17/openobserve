@@ -3387,6 +3387,15 @@ pub fn gather() -> String {
 
 pub fn init() {
     register_metrics(prometheus::default_registry());
+    register_memory_ledger_metrics(prometheus::default_registry())
+        .expect("Static memory ledger metrics registered once");
+}
+
+pub fn register_memory_ledger_metrics(registry: &Registry) -> Result<(), prometheus::Error> {
+    if crate::memory_ledger::global().is_some() {
+        crate::memory_ledger::metrics::METRICS.register(registry)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -450,6 +450,172 @@ pub static NATS_KV_WATCH_MODULES: Lazy<HashSet<String>> = Lazy::new(|| {
         .collect()
 });
 
+/// Startup-only settings, outside the legacy panic-based EnvConfig loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMemoryLedgerMode {
+    Off,
+    Observe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryMemoryLedgerConfig {
+    pub mode: QueryMemoryLedgerMode,
+    pub anon_target_bytes: u64,
+    pub safety_bytes: u64,
+    pub sample_interval_ms: u64,
+    pub sample_max_age_ms: u64,
+}
+
+impl QueryMemoryLedgerConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(|name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(anyhow::anyhow!("{name}: {error}")),
+        })
+    }
+
+    pub fn from_lookup(
+        mut lookup: impl FnMut(&str) -> anyhow::Result<Option<String>>,
+    ) -> anyhow::Result<Self> {
+        let mode = match lookup("ZO_QUERY_MEMORY_LEDGER_MODE")?
+            .as_deref()
+            .unwrap_or("off")
+        {
+            "off" => QueryMemoryLedgerMode::Off,
+            "observe" => QueryMemoryLedgerMode::Observe,
+            "enforce" => anyhow::bail!(
+                "ZO_QUERY_MEMORY_LEDGER_MODE=enforce is unsupported in stage 0; use observe for telemetry or off for the legacy path"
+            ),
+            _ => anyhow::bail!(
+                "ZO_QUERY_MEMORY_LEDGER_MODE must be off or observe (enforce is not implemented)"
+            ),
+        };
+        let mut number = |name: &str, default: u64| -> anyhow::Result<u64> {
+            match lookup(name)? {
+                None => Ok(default),
+                Some(value) => value
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("{name} must be an unsigned 64-bit integer")),
+            }
+        };
+        let cfg = Self {
+            mode,
+            anon_target_bytes: number("ZO_QUERY_MEMORY_ANON_TARGET_BYTES", 0)?,
+            safety_bytes: number("ZO_QUERY_MEMORY_SAFETY_BYTES", 512 * 1024 * 1024)?,
+            sample_interval_ms: number("ZO_QUERY_MEMORY_SAMPLE_INTERVAL_MS", 200)?,
+            sample_max_age_ms: number("ZO_QUERY_MEMORY_SAMPLE_MAX_AGE_MS", 1000)?,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            (1..=1000).contains(&self.sample_interval_ms),
+            "ZO_QUERY_MEMORY_SAMPLE_INTERVAL_MS must be in 1..=1000"
+        );
+        anyhow::ensure!(
+            (self.sample_interval_ms..=60_000).contains(&self.sample_max_age_ms),
+            "ZO_QUERY_MEMORY_SAMPLE_MAX_AGE_MS must be >= SAMPLE_INTERVAL_MS and <= 60000"
+        );
+        anyhow::ensure!(
+            self.safety_bytes > 0,
+            "ZO_QUERY_MEMORY_SAFETY_BYTES must be positive"
+        );
+        anyhow::ensure!(
+            self.anon_target_bytes == 0 || self.anon_target_bytes > self.safety_bytes,
+            "ZO_QUERY_MEMORY_ANON_TARGET_BYTES must be 0 (derive from cgroup) or greater than SAFETY_BYTES"
+        );
+        Ok(())
+    }
+
+    /// Leave a quarter of the visible budget for non-anonymous use. This is an
+    /// observation starting point, not a calibrated physical guarantee.
+    pub fn target(&self, effective_limit: Option<u64>) -> (Option<u64>, &'static str) {
+        if self.anon_target_bytes != 0 {
+            return (
+                Some(effective_limit.map_or(self.anon_target_bytes, |limit| {
+                    limit.min(self.anon_target_bytes)
+                })),
+                "configured_capped_by_visible_limit",
+            );
+        }
+        (
+            effective_limit.and_then(|limit| limit.checked_sub(limit.div_ceil(4))),
+            "visible_cgroup_75_percent",
+        )
+    }
+}
+
+#[cfg(test)]
+mod memory_ledger_config_tests {
+    use super::*;
+
+    fn parse(values: &[(&str, &str)]) -> anyhow::Result<QueryMemoryLedgerConfig> {
+        QueryMemoryLedgerConfig::from_lookup(|name| {
+            Ok(values
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string()))
+        })
+    }
+
+    #[test]
+    fn defaults_and_observe_parse() {
+        let cfg = parse(&[]).unwrap();
+        assert_eq!(cfg.mode, QueryMemoryLedgerMode::Off);
+        assert_eq!(cfg.sample_interval_ms, 200);
+        assert_eq!(cfg.sample_max_age_ms, 1000);
+        assert_eq!(cfg.safety_bytes, 512 * 1024 * 1024);
+        assert_eq!(
+            parse(&[("ZO_QUERY_MEMORY_LEDGER_MODE", "observe")])
+                .unwrap()
+                .mode,
+            QueryMemoryLedgerMode::Observe
+        );
+    }
+
+    #[test]
+    fn rejects_enforce_and_invalid_values_without_panicking() {
+        let error = parse(&[("ZO_QUERY_MEMORY_LEDGER_MODE", "enforce")])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported") && error.contains("observe"));
+        for (key, value) in [
+            ("ZO_QUERY_MEMORY_LEDGER_MODE", "Observe"),
+            ("ZO_QUERY_MEMORY_SAFETY_BYTES", "-1"),
+            ("ZO_QUERY_MEMORY_SAFETY_BYTES", "18446744073709551616"),
+            ("ZO_QUERY_MEMORY_SAFETY_BYTES", "0"),
+            ("ZO_QUERY_MEMORY_ANON_TARGET_BYTES", "10"),
+            ("ZO_QUERY_MEMORY_SAMPLE_INTERVAL_MS", "0"),
+            ("ZO_QUERY_MEMORY_SAMPLE_INTERVAL_MS", "1001"),
+            ("ZO_QUERY_MEMORY_SAMPLE_MAX_AGE_MS", "199"),
+            ("ZO_QUERY_MEMORY_SAMPLE_MAX_AGE_MS", "60001"),
+        ] {
+            assert!(parse(&[(key, value)]).is_err(), "{key}={value}");
+        }
+    }
+
+    #[test]
+    fn target_derivation_rounds_down_without_overflow() {
+        let mut cfg = parse(&[]).unwrap();
+        assert_eq!(
+            cfg.target(Some(24 * 1024 * 1024 * 1024)).0,
+            Some(18 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(cfg.target(Some(7)).0, Some(5));
+        assert_eq!(
+            cfg.target(Some(u64::MAX)).0,
+            Some(u64::MAX - u64::MAX.div_ceil(4))
+        );
+        assert_eq!(cfg.target(None).0, None);
+        cfg.anon_target_bytes = 100;
+        assert_eq!(cfg.target(None).0, Some(100));
+        assert_eq!(cfg.target(Some(80)).0, Some(80));
+    }
+}
+
 #[derive(Debug)]
 pub struct DatafusionMemoryPoolStartupConfig {
     pub shared_query_pool: bool,

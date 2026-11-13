@@ -22,6 +22,7 @@ pub mod config_path_manager;
 pub mod datafusion;
 pub mod heap_profile;
 pub mod ider;
+pub mod memory_ledger;
 pub mod meta;
 pub mod metrics;
 pub mod prebuilt_loader;

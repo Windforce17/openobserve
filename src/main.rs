@@ -172,6 +172,11 @@ async fn run() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
+    // Load .env/CLI configuration first; ledger errors propagate from run(),
+    // never through the legacy panic-based Config initializer or reload path.
+    let cfg = get_config();
+    let memory_ledger_config = config::QueryMemoryLedgerConfig::from_env()?;
+
     #[cfg(feature = "mimalloc")]
     start_allocator_purge_thread(get_config().common.allocator_purge_interval_secs);
 
@@ -190,8 +195,6 @@ async fn run() -> Result<(), anyhow::Error> {
             .parse::<SocketAddr>()?,
         )
         .init();
-
-    let cfg = get_config();
 
     // setup logs
     #[cfg(feature = "tokio-console")]
@@ -227,6 +230,7 @@ async fn run() -> Result<(), anyhow::Error> {
     };
 
     log::info!("Starting OpenObserve {}", config::VERSION);
+    config::memory_ledger::init(memory_ledger_config)?;
     log::info!(
         "System info: CPU cores {}, MEM total {}, Disk total {}, free {}",
         cfg.limit.real_cpu_num,
