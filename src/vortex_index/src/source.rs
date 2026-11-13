@@ -1108,6 +1108,7 @@ impl RangedBlob {
             memory: self.reader_memory(),
             footer: Arc::clone(&self.footer),
             blob_end: self.range.end,
+            blob_start: self.range.start,
             state: parking_lot::Mutex::new(OpeningState {
                 active: true,
                 pending: None,
@@ -1146,6 +1147,8 @@ pub(crate) struct OpeningMemory {
     /// Absolute end offset of the blob: the retained footer window is a
     /// suffix `[consumed_start, blob_end)`.
     blob_end: u64,
+    /// Puffin object coordinates start here; postscript offsets are blob-relative.
+    blob_start: u64,
     state: parking_lot::Mutex<OpeningState>,
 }
 
@@ -1204,13 +1207,14 @@ impl OpeningMemory {
             // keeps the whole recorded window — today's behaviour, with
             // each kept range COMPACTED so it cannot pin its fetch owner
             // (e.g. a tail-resident slice) beyond the request.
-            let retained = match Self::trim_to_consumed_suffix(&ranges, self.blob_end) {
-                Some(trimmed) => trimmed,
-                None => ranges
-                    .into_iter()
-                    .map(|(range, bytes)| (range, compact_bytes(bytes)))
-                    .collect(),
-            };
+            let retained =
+                match Self::trim_to_consumed_suffix(&ranges, self.blob_start, self.blob_end) {
+                    Some(trimmed) => trimmed,
+                    None => ranges
+                        .into_iter()
+                        .map(|(range, bytes)| (range, compact_bytes(bytes)))
+                        .collect(),
+                };
             if self.footer.ranges.set(retained.clone()).is_ok()
                 && let Some(memory) = self.footer.memory.get()
             {
@@ -1228,6 +1232,7 @@ impl OpeningMemory {
     /// `NeedMoreData` prefixes), so the trim only drops an unused PREFIX.
     fn trim_to_consumed_suffix(
         ranges: &[(Range<u64>, Bytes)],
+        blob_start: u64,
         blob_end: u64,
     ) -> Option<Vec<(Range<u64>, Bytes)>> {
         let (tail_range, tail) = ranges.last()?;
@@ -1257,10 +1262,11 @@ impl OpeningMemory {
         // offsets, no segment parsing). `Done` cannot occur for a
         // well-formed blob (the segments precede the postscript).
         let ps_eof = ByteBuffer::copy_from(&tail[tail.len() - ps_len - eof..]);
-        let mut deserializer =
-            Footer::deserializer(ps_eof, VortexSession::empty()).with_size(blob_end);
+        let mut deserializer = Footer::deserializer(ps_eof, VortexSession::empty())
+            .with_size(blob_end.checked_sub(blob_start)?);
         let consumed_start = match deserializer.deserialize() {
-            Ok(DeserializeStep::NeedMoreData { offset, .. }) => offset,
+            // Vortex segment offsets are relative to this blob, not its Puffin object.
+            Ok(DeserializeStep::NeedMoreData { offset, .. }) => offset.checked_add(blob_start)?,
             _ => return None,
         };
         // Floor at the postscript-sized suffix (vortex hard-floors an
@@ -1691,6 +1697,71 @@ mod tests {
             );
         });
         assert_eq!(op.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn compact_footer_trim_translates_blob_relative_offsets() {
+        use arrow::{
+            array::Int64Array,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+        let schema = Schema::new(vec![Field::new("value", DataType::Int64, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(Int64Array::from_iter_values(0..131072))],
+        )
+        .unwrap();
+        let blob = crate::container::write_vortex_blob(
+            &schema,
+            &[batch],
+            crate::container::addressable_strategy(),
+            1,
+        )
+        .unwrap();
+        assert!(blob.len() > VORTEX_FOOTER_INITIAL_READ_BYTES as usize);
+        let base = 16 * 1024 * 1024u64;
+        let end = base + blob.len() as u64;
+        let length = VORTEX_FOOTER_INITIAL_READ_BYTES as usize;
+        let ranges = vec![(
+            end - length as u64..end,
+            Bytes::copy_from_slice(&blob[blob.len() - length..]),
+        )];
+        let old = OpeningMemory::trim_to_consumed_suffix(&ranges, 0, end).unwrap();
+        let fixed = OpeningMemory::trim_to_consumed_suffix(&ranges, base, end).unwrap();
+        assert_eq!(
+            old[0].1.len(),
+            length,
+            "comparing blob-relative offsets with absolute ranges keeps the whole window"
+        );
+        assert!(
+            fixed[0].1.len() < old[0].1.len(),
+            "translating the blob base must trim the retained window"
+        );
+        assert_eq!(fixed[0].1.as_ref(), &blob[blob.len() - fixed[0].1.len()..]);
+        assert!(fixed[0].1.len() >= VORTEX_FOOTER_READ_BYTES as usize);
+
+        // Also exercise finish's caller translation, not only the helper.
+        let mut object = vec![0; base as usize];
+        object.extend_from_slice(&blob);
+        let ranged = RangedBlob::new(
+            BytesRangeSource::new("footer-base-test", Bytes::from(object)),
+            base..end,
+        );
+        let (_, opening) = ranged.opening_read_at();
+        opening.retain(ranges[0].0.clone(), ranges[0].1.clone());
+        drop(opening.finish());
+        let retained = ranged.footer.ranges.get().unwrap();
+        assert_eq!(retained[0].0, fixed[0].0);
+        assert_eq!(retained[0].1.len(), fixed[0].1.len());
+
+        // Zero-base remains identical; nonzero-base changes coordinates, not content.
+        let zero_end = blob.len() as u64;
+        let zero_ranges = vec![(zero_end - length as u64..zero_end, ranges[0].1.clone())];
+        let zero = OpeningMemory::trim_to_consumed_suffix(&zero_ranges, 0, zero_end).unwrap();
+        assert_eq!(zero[0].1, fixed[0].1);
+        assert_eq!(zero[0].0.start + base, fixed[0].0.start);
+        assert!(OpeningMemory::trim_to_consumed_suffix(&ranges, end + 1, end).is_none());
     }
 
     #[test]
