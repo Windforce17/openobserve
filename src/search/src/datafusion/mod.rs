@@ -24,6 +24,7 @@ pub mod peak_memory_pool;
 pub mod plan;
 pub mod plan_metrics;
 pub mod planner;
+pub mod runtime_cache;
 pub mod source_synthesis;
 mod spill_disk;
 mod spillable_reserve_pool;

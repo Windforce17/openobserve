@@ -463,12 +463,19 @@ fn create_runtime_env_with_inner_pool(
 
     let mut builder =
         RuntimeEnvBuilder::new().with_object_store_registry(Arc::new(object_store_registry));
-    if cfg.limit.datafusion_file_stat_cache_max_size > 0 {
-        let cache_config = CacheManagerConfig::default();
-        let cache_config = cache_config
-            .with_file_statistics_cache(Some(file_statistics_cache::GLOBAL_CACHE.clone()))
-            .with_file_statistics_cache_limit(cfg.limit.datafusion_file_stat_cache_max_size);
-        builder = builder.with_cache_manager(cache_config);
+    let small_runtime_caches = config::datafusion_runtime_cache::enabled()
+        .map_err(|error| DataFusionError::Configuration(error.to_string()))?;
+    if cfg.limit.datafusion_file_stat_cache_max_size > 0 || small_runtime_caches {
+        let mut cache_config = CacheManagerConfig::default();
+        if cfg.limit.datafusion_file_stat_cache_max_size > 0 {
+            cache_config = cache_config
+                .with_file_statistics_cache(Some(file_statistics_cache::GLOBAL_CACHE.clone()))
+                .with_file_statistics_cache_limit(cfg.limit.datafusion_file_stat_cache_max_size);
+        }
+        builder = builder.with_cache_manager(super::runtime_cache::configure(
+            cache_config,
+            small_runtime_caches,
+        ));
     }
 
     // Peak observability stays per-context for shared queries because it wraps
@@ -1293,6 +1300,67 @@ mod tests {
     use super::*;
 
     static SHARED_POOL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn small_runtime_caches_production_wiring() {
+        const CHILD: &str = "OO_RUNTIME_CACHE_WIRING_CHILD";
+        const ENV: &str = "ZO_QUERY_SMALL_RUNTIME_CACHES";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let small = expected.parse::<bool>().unwrap();
+            let mut cfg = config::Config::default();
+            for statistics_limit in [0, 1024 * 1024] {
+                cfg.limit.datafusion_file_stat_cache_max_size = statistics_limit;
+                let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(1024 * 1024));
+                let runtime =
+                    create_runtime_env_with_inner_pool("runtime-cache-test", pool, &cfg).unwrap();
+                assert_eq!(
+                    runtime
+                        .cache_manager
+                        .get_file_metadata_cache()
+                        .cache_limit(),
+                    if small {
+                        4 * 1024 * 1024
+                    } else {
+                        50 * 1024 * 1024
+                    },
+                );
+                assert_eq!(
+                    runtime
+                        .cache_manager
+                        .get_list_files_cache()
+                        .unwrap()
+                        .cache_limit(),
+                    if small { 64 * 1024 } else { 1024 * 1024 },
+                );
+                let statistics = runtime.cache_manager.get_file_statistic_cache().unwrap();
+                if statistics_limit > 0 {
+                    let shared: Arc<FileStatisticsCache> =
+                        file_statistics_cache::GLOBAL_CACHE.clone();
+                    assert!(Arc::ptr_eq(&statistics, &shared));
+                } else {
+                    assert_eq!(statistics.name(), "DefaultFileStatisticsCache");
+                }
+            }
+            return;
+        }
+        for (value, expected) in [
+            (None, "false"),
+            (Some("false"), "false"),
+            (Some("true"), "true"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args([
+                "datafusion::exec::tests::small_runtime_caches_production_wiring",
+                "--exact",
+                "--test-threads=1",
+            ]);
+            child.env(CHILD, expected).env_remove(ENV);
+            if let Some(value) = value {
+                child.env(ENV, value);
+            }
+            assert!(child.status().unwrap().success(), "{value:?}");
+        }
+    }
 
     #[test]
     fn shared_pool_metrics_match_reservations_and_count_refusals_once() {
