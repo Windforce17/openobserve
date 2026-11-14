@@ -15,6 +15,8 @@
 
 use std::{collections::HashMap, sync::LazyLock as Lazy};
 
+pub mod file_list;
+
 use prometheus::{
     CounterVec, Encoder, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
     IntGaugeVec, Opts, Registry, TextEncoder,
@@ -3587,6 +3589,7 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(SEGMENT_SCAN_POOL_WAITS_TOTAL.clone()))
         .expect("Metric registered");
+    file_list::register(registry).expect("File-list metrics registered");
     registry
         .register(Box::new(BLOOM_FOOTER_CACHE_BYTES.clone()))
         .expect("Metric registered");

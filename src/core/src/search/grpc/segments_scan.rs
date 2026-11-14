@@ -800,6 +800,7 @@ pub async fn list_candidates(
         MAX_QUERY_SEGMENTS + 1,
     )
     .await?;
+    let _prune_timer = metrics::file_list::Phase::CandidatePrune.start();
     let stream = format!("{org_id}/{stream_type}/{stream_name}");
     let (candidates, shortfall) = prune_and_cap(candidates, &stream, time_range);
     if let Some(sf) = &shortfall {

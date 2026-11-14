@@ -772,14 +772,32 @@ pub async fn partition_file_by_hash(
     partitions
 }
 
+type FileIdLists = (HashMap<TableReference, Vec<FileId>>, Vec<String>);
+
 #[tracing::instrument(name = "service:search:cluster:flight:get_file_id_lists", skip_all)]
 pub async fn get_file_id_lists(
     trace_id: &str,
     org_id: &str,
     stream_type: StreamType,
     stream_names: &[TableReference],
+    time_range: (i64, i64),
+) -> Result<FileIdLists> {
+    config::metrics::file_list::observe(
+        trace_id,
+        get_file_id_lists_inner(trace_id, org_id, stream_type, stream_names, time_range),
+    )
+    .await
+}
+
+async fn get_file_id_lists_inner(
+    trace_id: &str,
+    org_id: &str,
+    stream_type: StreamType,
+    stream_names: &[TableReference],
     mut time_range: (i64, i64),
-) -> Result<(HashMap<TableReference, Vec<FileId>>, Vec<String>)> {
+) -> Result<FileIdLists> {
+    use config::metrics::file_list::Phase;
+
     let mut file_lists = HashMap::with_capacity(stream_names.len());
     // segment-WAL backlog shortfalls: reported through the standard partial
     // channel instead of failing the query (2026-07-31 outage)
@@ -799,6 +817,7 @@ pub async fn get_file_id_lists(
         // snapshot — a segment observed Built here has its L0 rows visible
         // to the snapshot below (segments_scan dup/gap ordering rules).
         let candidates_started = Instant::now();
+        let candidates_timer = Phase::Candidates.start();
         let (seg_candidates, seg_shortfall) =
             crate::service::search::grpc::segments_scan::list_candidates(
                 org_id,
@@ -808,6 +827,7 @@ pub async fn get_file_id_lists(
             )
             .await?;
         let candidates_ms = candidates_started.elapsed().as_millis();
+        drop(candidates_timer);
         if let Some(sf) = seg_shortfall {
             shortfalls.push(sf.message());
         }
@@ -816,6 +836,7 @@ pub async fn get_file_id_lists(
         // from one causally consistent file-list snapshot instead of issuing
         // a second full file query after the id snapshot.
         let snapshot_started = Instant::now();
+        let snapshot_timer = Phase::Snapshot.start();
         let (mut file_id_list, l0_coverage) = if seg_candidates.is_empty() {
             (
                 crate::service::file_list::query_ids(
@@ -837,17 +858,20 @@ pub async fn get_file_id_lists(
                 time_range,
             )
             .await?;
+            let _split_timer = Phase::SnapshotSplit.start();
             crate::service::search::grpc::segments_scan::split_snapshot_file_ids(
                 snapshot,
                 &seg_candidates,
             )
         };
         let snapshot_ms = snapshot_started.elapsed().as_millis();
+        drop(snapshot_timer);
         let candidate_count = seg_candidates.len();
         let l0_range_count = l0_coverage.range_count();
         let l0_exact_id_count = l0_coverage.exact_id_count();
 
         let append_started = Instant::now();
+        let append_timer = Phase::Append.start();
         crate::service::search::grpc::segments_scan::append_surviving(
             trace_id,
             org_id,
@@ -858,6 +882,7 @@ pub async fn get_file_id_lists(
             &mut file_id_list,
         )?;
         let append_ms = append_started.elapsed().as_millis();
+        drop(append_timer);
         log::info!(
             "[trace_id {trace_id}] file id snapshot: {org_id}/{stream_type}/{name} candidates {}, files {}, L0 ranges {}, exact L0 ids {}, phase_ms candidates/snapshot/append {}/{}/{}",
             candidate_count,
@@ -878,6 +903,118 @@ mod tests {
     use infra::file_list::FileId;
 
     use super::*;
+
+    #[tokio::test]
+    async fn metatime_leader_sqlite_phases_preserve_file_ids() {
+        use std::time::Duration;
+
+        use config::{meta::stream::FileMeta, metrics::file_list::Phase};
+        use infra::wal_segments::{SegmentMeta, SegmentStatus};
+
+        std::fs::create_dir_all(&get_config().common.data_db_dir).unwrap();
+        infra::file_list::create_table().await.unwrap();
+        infra::wal_segments::create_table().await.unwrap();
+        let org = format!("metatime_leader_{}", now_micros());
+        let streams = [
+            TableReference::from("with_segment"),
+            TableReference::from("files_only"),
+        ];
+        let min_ts = 1_609_459_200_000_000;
+        let max_ts = min_ts + 1000;
+        let meta = FileMeta {
+            min_ts,
+            max_ts,
+            records: 7,
+            original_size: 100,
+            ..Default::default()
+        };
+        let mut expected = Vec::new();
+        for stream in &streams {
+            expected.push(
+                infra::file_list::add(
+                    "",
+                    &format!(
+                        "files/{org}/logs/{}/2021/01/01/00/one.parquet",
+                        stream.stream_name()
+                    ),
+                    &meta,
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let segment_id = infra::wal_segments::add(&SegmentMeta {
+            id: 0,
+            node_uuid: org.clone(),
+            seq: 1,
+            object_key: format!("wal_segments/{org}/00000000000000000001"),
+            min_ts,
+            max_ts,
+            size: 200,
+            streams: vec![format!("{org}/logs/with_segment")],
+            stream_ranges: Vec::new(),
+            status: SegmentStatus::Pending,
+            builder_node: String::new(),
+            created_at: 0,
+            updated_at: 0,
+        })
+        .await
+        .unwrap();
+        let (result, timings) = config::metrics::file_list::capture(get_file_id_lists_inner(
+            "metatime-trace",
+            &org,
+            StreamType::Logs,
+            &streams,
+            (min_ts, max_ts),
+        ))
+        .await;
+        let (files, shortfalls) = result.unwrap();
+        assert!(shortfalls.is_empty());
+        for (index, stream) in streams.iter().enumerate() {
+            let mut expected_ids = vec![expected[index]];
+            if index == 0 && get_config().common.ingest_segment_mode {
+                expected_ids.push(-segment_id);
+            }
+            assert_eq!(
+                files[stream].iter().map(|f| f.id).collect::<Vec<_>>(),
+                expected_ids
+            );
+            assert_eq!(files[stream][0].records, 7);
+            assert_eq!(files[stream][0].original_size, 100);
+        }
+        for phase in [
+            Phase::Candidates,
+            Phase::Snapshot,
+            Phase::SnapshotDb,
+            Phase::SnapshotSchedule,
+            Phase::SnapshotAcquire,
+            Phase::SnapshotSql,
+            Phase::SnapshotCollect,
+            Phase::SnapshotDump,
+            Phase::SnapshotMerge,
+            Phase::Append,
+        ] {
+            assert!(timings.duration(phase) > Duration::ZERO, "{phase:?}");
+        }
+        if get_config().common.ingest_segment_mode {
+            for phase in [
+                Phase::CandidateAcquire,
+                Phase::CandidateSql,
+                Phase::CandidateConvert,
+                Phase::CandidatePrune,
+                Phase::SnapshotSplit,
+            ] {
+                assert!(timings.duration(phase) > Duration::ZERO, "{phase:?}");
+            }
+        }
+        assert_eq!(
+            timings.duration(Phase::Total),
+            timings.duration(Phase::Candidates)
+                + timings.duration(Phase::Snapshot)
+                + timings.duration(Phase::Append)
+                + timings.duration(Phase::Other)
+        );
+    }
 
     fn make_file_id(id: i64, size: i64) -> FileId {
         FileId {

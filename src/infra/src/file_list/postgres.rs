@@ -1193,6 +1193,8 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
         stream_name: &str,
         time_range: (i64, i64),
     ) -> Result<Vec<super::FileId>> {
+        use config::metrics::file_list::{Backend, Phase, inherit, record_pool};
+
         let start = std::time::Instant::now();
         let (time_start, time_end) = time_range;
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
@@ -1218,7 +1220,7 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
 
         for (time_start, time_end) in day_partitions {
             let stream_key = stream_key.clone();
-            tasks.push(tokio::task::spawn(async move {
+            tasks.push(tokio::task::spawn(inherit(async move {
                 let pool = CLIENT_RO.clone();
                 DB_QUERY_NUMS
                 .with_label_values(&["query_ids", "file_list"])
@@ -1226,6 +1228,13 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                 let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
                 let (date_from, date_to) = derive_date_range(time_start, time_end);
                 let query = "SELECT id, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+                let mut connection = {
+                    let _acquire_timer = Phase::SnapshotAcquire.start();
+                    pool.acquire().await?
+                };
+                record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+                let _sql_timer = Phase::SnapshotSql.start();
                 sqlx::query_as::<_, super::FileId>(query)
                 .bind(stream_key)
                 .bind(time_start)
@@ -1233,11 +1242,12 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                 .bind(time_end)
                 .bind(date_from)
                 .bind(date_to)
-                .fetch_all(&pool)
+                .fetch_all(&mut *connection)
                 .await
-            }));
+            })));
         }
 
+        let _collect_timer = Phase::SnapshotCollect.start();
         let mut rets = Vec::new();
         for task in tasks {
             match task.await {
@@ -1264,6 +1274,8 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
         stream_name: &str,
         time_range: (i64, i64),
     ) -> Result<Vec<super::FileIdWithFile>> {
+        use config::metrics::file_list::{Backend, Phase, inherit, record_pool};
+
         let start = std::time::Instant::now();
         let (time_start, time_end) = time_range;
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
@@ -1289,7 +1301,7 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
 
         for (time_start, time_end) in day_partitions {
             let stream_key = stream_key.clone();
-            tasks.push(tokio::task::spawn(async move {
+            tasks.push(tokio::task::spawn(inherit(async move {
                 let pool = CLIENT_RO.clone();
                 DB_QUERY_NUMS
                     .with_label_values(&["query_ids_with_file", "file_list"])
@@ -1298,6 +1310,13 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                     super::calculate_max_ts_upper_bound(time_end, stream_type);
                 let (date_from, date_to) = derive_date_range(time_start, time_end);
                 let query = "SELECT id, file, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4 AND date >= $5 AND date < $6;";
+                record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+                let mut connection = {
+                    let _acquire_timer = Phase::SnapshotAcquire.start();
+                    pool.acquire().await?
+                };
+                record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+                let _sql_timer = Phase::SnapshotSql.start();
                 sqlx::query_as::<_, super::FileIdWithFile>(query)
                     .bind(stream_key)
                     .bind(time_start)
@@ -1305,11 +1324,12 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
                     .bind(time_end)
                     .bind(date_from)
                     .bind(date_to)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *connection)
                     .await
-            }));
+            })));
         }
 
+        let _collect_timer = Phase::SnapshotCollect.start();
         let mut rets = Vec::new();
         for task in tasks {
             match task.await {

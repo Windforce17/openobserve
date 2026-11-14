@@ -1022,6 +1022,8 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         stream_name: &str,
         time_range: (i64, i64),
     ) -> Result<Vec<super::FileId>> {
+        use config::metrics::file_list::{Backend, Phase, inherit, record_pool};
+
         let (time_start, time_end) = time_range;
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
@@ -1046,20 +1048,28 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
 
         for (time_start, time_end) in day_partitions {
             let stream_key = stream_key.clone();
-            tasks.push(tokio::task::spawn(async move {
+            tasks.push(tokio::task::spawn(inherit(async move {
                 let pool = CLIENT_RO.clone();
                     let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
                     let query = "SELECT id, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
+                    record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+                    let mut connection = {
+                        let _acquire_timer = Phase::SnapshotAcquire.start();
+                        pool.acquire().await?
+                    };
+                    record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+                    let _sql_timer = Phase::SnapshotSql.start();
                     sqlx::query_as::<_, super::FileId>(query)
                     .bind(stream_key)
                     .bind(time_start)
                     .bind(max_ts_upper_bound)
                     .bind(time_end)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *connection)
                     .await
-            }));
+            })));
         }
 
+        let _collect_timer = Phase::SnapshotCollect.start();
         let mut rets = Vec::new();
         for task in tasks {
             match task.await {
@@ -1082,6 +1092,8 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         stream_name: &str,
         time_range: (i64, i64),
     ) -> Result<Vec<super::FileIdWithFile>> {
+        use config::metrics::file_list::{Backend, Phase, inherit, record_pool};
+
         let (time_start, time_end) = time_range;
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
@@ -1106,21 +1118,29 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
 
         for (time_start, time_end) in day_partitions {
             let stream_key = stream_key.clone();
-            tasks.push(tokio::task::spawn(async move {
+            tasks.push(tokio::task::spawn(inherit(async move {
                 let pool = CLIENT_RO.clone();
                 let max_ts_upper_bound =
                     super::calculate_max_ts_upper_bound(time_end, stream_type);
                 let query = "SELECT id, file, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;";
+                record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+                let mut connection = {
+                    let _acquire_timer = Phase::SnapshotAcquire.start();
+                    pool.acquire().await?
+                };
+                record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+                let _sql_timer = Phase::SnapshotSql.start();
                 sqlx::query_as::<_, super::FileIdWithFile>(query)
                     .bind(stream_key)
                     .bind(time_start)
                     .bind(max_ts_upper_bound)
                     .bind(time_end)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *connection)
                     .await
-            }));
+            })));
         }
 
+        let _collect_timer = Phase::SnapshotCollect.start();
         let mut rets = Vec::new();
         for task in tasks {
             match task.await {
@@ -3882,6 +3902,78 @@ mod tests {
     // other modules sharing the sqlite file are never touched.
 
     static JOBS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn metatime_snapshot_matches_pool_executor_and_records_spawned_tasks() {
+        use std::time::Duration;
+
+        use config::metrics::file_list::{Phase, capture};
+
+        let _guard = jobs_setup().await;
+        let list = SqliteFileList::new();
+        let org = format!("metatime_{}", now_micros());
+        let meta = create_test_file_meta();
+        for file in ["a.parquet", "b.parquet"] {
+            list.add(
+                "",
+                &format!("files/{org}/logs/snapshot/2021/01/01/00/{file}"),
+                &meta,
+            )
+            .await
+            .unwrap();
+        }
+        let range = (meta.min_ts, meta.max_ts);
+        let stream_key = format!("{org}/logs/snapshot");
+        let max_ts = super::super::calculate_max_ts_upper_bound(range.1, StreamType::Logs);
+        let expected = sqlx::query_as::<_, super::super::FileId>(
+            "SELECT id, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;",
+        )
+        .bind(&stream_key)
+        .bind(range.0)
+        .bind(max_ts)
+        .bind(range.1)
+        .fetch_all(&*CLIENT_RO)
+        .await
+        .unwrap();
+        let expected_with_file = sqlx::query_as::<_, super::super::FileIdWithFile>(
+            "SELECT id, file, records, original_size, bloom_ver FROM file_list WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts < $4;",
+        )
+        .bind(&stream_key)
+        .bind(range.0)
+        .bind(max_ts)
+        .bind(range.1)
+        .fetch_all(&*CLIENT_RO)
+        .await
+        .unwrap();
+        assert_eq!(expected.len(), 2);
+        let (actual, ids_timings) =
+            capture(list.query_ids(&org, StreamType::Logs, "snapshot", range)).await;
+        let (actual_with_file, file_timings) =
+            capture(list.query_ids_with_file(&org, StreamType::Logs, "snapshot", range)).await;
+        let fields = |files: Vec<super::super::FileId>| {
+            files
+                .into_iter()
+                .map(|f| (f.id, f.records, f.original_size, f.deleted, f.bloom_ver))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fields(actual.unwrap()), fields(expected));
+        assert_eq!(actual_with_file.unwrap(), expected_with_file);
+        for timings in [ids_timings, file_timings] {
+            for phase in [
+                Phase::SnapshotSchedule,
+                Phase::SnapshotAcquire,
+                Phase::SnapshotSql,
+                Phase::SnapshotCollect,
+            ] {
+                assert!(timings.duration(phase) > Duration::ZERO, "{phase:?}");
+            }
+            assert!(
+                timings.duration(Phase::SnapshotAcquire) + timings.duration(Phase::SnapshotSql)
+                    <= timings.duration(Phase::Total)
+            );
+        }
+    }
+
     const LEGACY_ADD_JOB_SQL: &str = r#"INSERT INTO file_list_jobs
     (org, stream, offsets, status, node, started_at, updated_at)
 VALUES ($1, $2, $3, $4, '', 0, 0)
