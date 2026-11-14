@@ -45,6 +45,7 @@ use crate::storage;
 static FILES: Lazy<Arc<FileData>> = Lazy::new(|| FileData::new(FileType::Data));
 static RESULT_FILES: Lazy<Arc<FileData>> = Lazy::new(|| FileData::new(FileType::Result));
 static AGGREGATION_FILES: Lazy<Arc<FileData>> = Lazy::new(|| FileData::new(FileType::Aggregation));
+static SEGMENT_FILES: Lazy<Arc<FileData>> = Lazy::new(|| FileData::new(FileType::Segment));
 #[cfg(test)]
 static TEST_CACHE_ROOT: Lazy<tempfile::TempDir> =
     Lazy::new(|| tempfile::tempdir().expect("create test cache directory"));
@@ -275,6 +276,7 @@ pub enum FileType {
     Data,
     Result,
     Aggregation,
+    Segment,
 }
 
 impl fmt::Display for FileType {
@@ -283,6 +285,7 @@ impl fmt::Display for FileType {
             FileType::Data => write!(f, "data"),
             FileType::Result => write!(f, "result"),
             FileType::Aggregation => write!(f, "aggregation"),
+            FileType::Segment => write!(f, "segment"),
         }
     }
 }
@@ -293,6 +296,7 @@ impl FileType {
             Self::Data => "data",
             Self::Result => "result",
             Self::Aggregation => "aggregation",
+            Self::Segment => "segment",
         }
     }
 }
@@ -308,6 +312,7 @@ impl FileData {
             FileType::Data => cfg.disk_cache.max_size,
             FileType::Result => cfg.disk_cache.result_max_size,
             FileType::Aggregation => cfg.disk_cache.aggregation_max_size,
+            FileType::Segment => cfg.disk_cache.segment_max_size,
         };
         #[cfg(not(test))]
         let root_dir = format!(
@@ -750,8 +755,13 @@ pub async fn init() -> Result<(), anyhow::Error> {
         log::info!("Loading disk cache start");
         match tokio::fs::canonicalize(&FILES.root_dir).await {
             Ok(root) => {
-                if let Err(error) =
-                    load(&root, [&FILES, &RESULT_FILES, &AGGREGATION_FILES], started).await
+                if let Err(error) = load(
+                    &root,
+                    [&FILES, &RESULT_FILES, &AGGREGATION_FILES],
+                    Some(&SEGMENT_FILES),
+                    started,
+                )
+                .await
                 {
                     log::error!("load disk cache {} failed: {error}", root.display());
                 }
@@ -769,7 +779,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
     });
     if cfg.disk_cache.gc_interval > 0 {
         spawn_pausable_job!("disk_cache_gc", cfg.disk_cache.gc_interval, {
-            for files in [&FILES, &RESULT_FILES, &AGGREGATION_FILES] {
+            for files in [&FILES, &RESULT_FILES, &AGGREGATION_FILES, &SEGMENT_FILES] {
                 files.data.run_pending_tasks();
             }
         });
@@ -777,13 +787,24 @@ pub async fn init() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn cache_for_key(file: &str) -> &'static FileData {
+fn cache_index(file: &str, separate_segments: bool) -> usize {
     if file.starts_with("files") {
-        &FILES
+        0
     } else if file.starts_with("aggregations") {
-        &AGGREGATION_FILES
+        2
+    } else if separate_segments && file.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX) {
+        3
     } else {
-        &RESULT_FILES
+        1
+    }
+}
+
+fn cache_for_key(file: &str) -> &'static FileData {
+    match cache_index(file, SEGMENT_FILES.max_size > 0) {
+        0 => &FILES,
+        2 => &AGGREGATION_FILES,
+        3 => &SEGMENT_FILES,
+        _ => &RESULT_FILES,
     }
 }
 
@@ -1239,8 +1260,17 @@ pub async fn remove(file: &str) -> Result<(), anyhow::Error> {
 async fn load(
     root_dir: &Path,
     caches: [&Arc<FileData>; 3],
+    segment_cache: Option<&Arc<FileData>>,
     started: SystemTime,
 ) -> Result<(), anyhow::Error> {
+    let segment_cache = segment_cache.filter(|files| files.max_size > 0);
+    let cache_at = |index| {
+        if index == 3 {
+            segment_cache.expect("segment index requires an enabled pool")
+        } else {
+            caches[index]
+        }
+    };
     #[cfg(unix)]
     let holes_reported = reports_holes(root_dir, &caches[0].multi_dir);
     #[cfg(not(unix))]
@@ -1300,18 +1330,10 @@ async fn load(
             if !caches[0].multi_dir.is_empty() {
                 key = key.split('/').skip(1).collect::<Vec<_>>().join("/");
             }
-            let index = if key.starts_with("files") {
-                0
-            } else if key.starts_with("aggregations") {
-                2
-            } else {
-                1
-            };
+            let index = cache_index(&key, segment_cache.is_some());
             // Only this tier's prefixes: the root may also hold other tiers'
             // directories (the block tier's sparse `blocks/` files).
-            // Segment scans cache WAL segment objects here (`cache_for_key`
-            // routes them to the result tier); skipping them would strand
-            // every previous run's segments on disk, unindexed and unevictable.
+            // Startup and live access use the same routing without moving files.
             if !key.starts_with("files")
                 && !key.starts_with("results")
                 && !key.starts_with("aggregations")
@@ -1320,7 +1342,7 @@ async fn load(
             {
                 continue;
             }
-            if caches[index].data.contains_key(&key) {
+            if cache_at(index).data.contains_key(&key) {
                 continue;
             }
             let total = LOADING_FROM_DISK_NUM.fetch_add(1, Ordering::Relaxed);
@@ -1330,7 +1352,7 @@ async fn load(
             match startup_damage(&path, holes_reported) {
                 Ok(None) => {}
                 Ok(Some(damage)) => {
-                    removed.remove(caches[index], &key, damage, metadata.len());
+                    removed.remove(cache_at(index), &key, damage, metadata.len());
                     continue;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1395,7 +1417,7 @@ async fn load(
     }
     METRICS_RESULT_CACHE.write().await.extend(metrics_keys);
     for (key, size, modified, index) in loaded {
-        let files = caches[index];
+        let files = cache_at(index);
         if index != 0 && is_recent_result(&modified) {
             removed.remove(files, &key, StartupDamage::RecentResult, size as u64);
             continue;
@@ -1456,11 +1478,11 @@ async fn load(
         drop(queries);
         files.enforce_capacity();
     }
-    for files in caches {
+    for files in caches.into_iter().chain(segment_cache) {
         files.data.run_pending_tasks();
     }
     removed.log(holes_reported);
-    for files in caches {
+    for files in caches.into_iter().chain(segment_cache) {
         files.checked.store(true, Ordering::Release);
     }
     Ok(())
@@ -1598,6 +1620,7 @@ pub async fn stats(file_type: FileType) -> (usize, usize, usize) {
         FileType::Data => &FILES,
         FileType::Result => &RESULT_FILES,
         FileType::Aggregation => &AGGREGATION_FILES,
+        FileType::Segment => &SEGMENT_FILES,
     };
     let (capacity, used) = files.size();
     (capacity, used, files.len())
@@ -1609,6 +1632,7 @@ pub async fn is_empty(file_type: FileType) -> bool {
         FileType::Data => &FILES,
         FileType::Result => &RESULT_FILES,
         FileType::Aggregation => &AGGREGATION_FILES,
+        FileType::Segment => &SEGMENT_FILES,
     };
     files.is_empty()
 }
@@ -2076,7 +2100,14 @@ mod tests {
     fn segment_observation_does_not_change_the_result_pool() {
         let segment = "wal_segments/node/00000000000000000001";
         assert!(std::ptr::eq(cache_for_key(segment), &**RESULT_FILES));
+        assert_eq!(cache_index(segment, false), 1);
+        assert_eq!(cache_index(segment, true), 3);
+        assert_eq!(cache_index("wal_segments_other/key", true), 1);
+        assert_eq!(cache_index("results/org/logs/key", true), 1);
+        assert_eq!(cache_index("files/org/logs/key", true), 0);
+        assert_eq!(cache_index("aggregations/org/logs/key", true), 2);
         assert_eq!(cache_metric_label(segment, FileType::Result), "segment");
+        assert_eq!(cache_metric_label(segment, FileType::Segment), "segment");
         assert_eq!(
             cache_metric_label("results/org/logs/key", FileType::Result),
             "result"
@@ -3081,6 +3112,7 @@ mod tests {
         load(
             &root,
             [&data.files, &results, &aggregations],
+            None,
             SystemTime::now(),
         )
         .await
@@ -3215,7 +3247,7 @@ mod tests {
 
         let root = data.root.path().canonicalize().unwrap();
         assert!(!data.checked.load(Ordering::Acquire));
-        load(&root, [&data.files, &results, &aggregations], started)
+        load(&root, [&data.files, &results, &aggregations], None, started)
             .await
             .unwrap();
         data.quiesce().await;
@@ -3245,6 +3277,107 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn segment_pool_upgrade_and_rollback_adopt_the_same_paths_once() {
+        let data = test_cache(FileType::Data, 64 << 20, "lru");
+        if !keeps_holes(data.root.path()) {
+            return;
+        }
+        let key = "wal_segments/migrate/00000000000000000001";
+        let path = write_cache_file(&data, key, &[7; 1024], 90_000);
+        write_cache_file(&data, "files/migrate/logs/newest", &[9; 4096], 100_000);
+        let root = data.root.path().canonicalize().unwrap();
+        let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100_500);
+        for enabled in [false, true, false, true] {
+            let (results, aggregations) = sibling_caches(&data, 2 * 1024);
+            let segments = FileData::with_capacity(
+                FileType::Segment,
+                if enabled { 2 * 1024 } else { 0 },
+                data.root_dir.clone(),
+                Vec::new(),
+                data.queue.sender.clone(),
+            );
+            load(
+                &root,
+                [&data.files, &results, &aggregations],
+                Some(&segments),
+                started,
+            )
+            .await
+            .unwrap();
+            assert_eq!(segments.data.contains_key(key), enabled);
+            assert_eq!(results.data.contains_key(key), !enabled);
+            assert_eq!(segments.size().1 + results.size().1, 1024);
+            assert_eq!(segments.len() + results.len(), 1);
+            let active = if enabled { &segments } else { &results };
+            assert_eq!(active.get(key, None).await.unwrap().as_ref(), &[7; 1024]);
+            assert_eq!(active.get_file_path(key), path);
+            assert!(active.checked.load(Ordering::Acquire));
+            load(
+                &root,
+                [&data.files, &results, &aggregations],
+                Some(&segments),
+                started,
+            )
+            .await
+            .unwrap();
+            assert_eq!(segments.size().1 + results.size().1, 1024);
+            assert_eq!(segments.len() + results.len(), 1);
+            // A restart recreates every index, including the newest data file
+            // used to establish the previous run's recent-result window.
+            for files in [&data.files, &results, &aggregations, &segments] {
+                files.data.invalidate_all();
+                files.data.run_pending_tasks();
+            }
+            assert!(
+                Path::new(&path).exists(),
+                "migration never moves or deletes the file"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn segment_pool_uses_access_lru_and_does_not_evict_results() {
+        let segments = test_cache(FileType::Segment, 2 * 1024, "lru");
+        let results = FileData::with_capacity(
+            FileType::Result,
+            1024,
+            segments.root_dir.clone(),
+            Vec::new(),
+            segments.queue.sender.clone(),
+        );
+        let result = "results/isolated/logs/kept";
+        let tmp = tempfile::NamedTempFile::new_in(segments.root.path()).unwrap();
+        std::fs::write(tmp.path(), [8; 1024]).unwrap();
+        results
+            .set(result, tmp.path().to_str().unwrap(), 1024)
+            .await
+            .unwrap();
+        let keys = [
+            "wal_segments/lru/a",
+            "wal_segments/lru/b",
+            "wal_segments/lru/c",
+        ];
+        segments.put(keys[0], &[1; 1024]).await;
+        segments.put(keys[1], &[2; 1024]).await;
+        segments.data.run_pending_tasks();
+        assert!(segments.get(keys[0], None).await.is_some());
+        segments.data.run_pending_tasks();
+        segments.put(keys[2], &[3; 1024]).await;
+        segments.quiesce().await;
+        assert!(segments.data.contains_key(keys[0]));
+        assert!(!segments.data.contains_key(keys[1]));
+        assert!(!Path::new(&segments.get_file_path(keys[1])).exists());
+        assert!(segments.data.contains_key(keys[2]));
+        assert_eq!(segments.size().1, 2048);
+        assert_eq!(
+            results.get(result, None).await.unwrap().as_ref(),
+            &[8; 1024]
+        );
+        assert_eq!(results.size().1, 1024);
+        assert_eq!(results.len(), 1);
+    }
+
     /// Segment scans cache WAL segment objects in the result tier. Segments a
     /// previous run left on disk must come back under that tier's capacity
     /// and crash rules, never stay on disk outside every index.
@@ -3272,7 +3405,7 @@ mod tests {
         let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100_500);
 
         let root = data.root.path().canonicalize().unwrap();
-        load(&root, [&data.files, &results, &aggregations], started)
+        load(&root, [&data.files, &results, &aggregations], None, started)
             .await
             .unwrap();
         quiesce_deletes(&results).await;
@@ -3324,6 +3457,7 @@ mod tests {
         load(
             &root,
             [&data.files, &results, &aggregations],
+            None,
             SystemTime::now(),
         )
         .await
