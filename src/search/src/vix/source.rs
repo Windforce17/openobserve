@@ -291,6 +291,17 @@ impl vortex_index::VixReadOperation for ReadOperation {
     fn is_cancelled(&self) -> bool {
         self.is_cancelled()
     }
+    fn try_check_memory(&self, owned_bytes: usize) -> vortex_index::Result<bool> {
+        if self.is_cancelled() {
+            return Err(vortex_index::VixError::Cancelled);
+        }
+        match self.evaluation.as_ref().and_then(Weak::upgrade) {
+            Some(memory) => memory
+                .try_check(owned_bytes)
+                .map_err(vortex_index::VixError::Callback),
+            None => Ok(true),
+        }
+    }
     fn check_memory(&self, owned_bytes: usize) -> vortex_index::Result<()> {
         if self.is_cancelled() {
             return Err(vortex_index::VixError::Cancelled);
@@ -715,6 +726,14 @@ struct EvaluationMemory {
 }
 
 impl EvaluationMemory {
+    fn try_check(&self, owned_bytes: usize) -> anyhow::Result<bool> {
+        let refusal = self.refusal.lock();
+        if let Some(error) = *refusal {
+            return Err(error.into());
+        }
+        Ok(self.bytes.lock().try_resize(owned_bytes).is_ok())
+    }
+
     /// Charge `owned_bytes` of absolute reader ownership, waiting briefly for
     /// pool releases (see [`BytePermit::resize`]). A refusal is sticky: a
     /// reader that swallows the error cannot go on using unaccounted memory.
@@ -1521,6 +1540,48 @@ mod tests {
         assert_eq!(shares[0].share(), MIN_FAIR_SHARE);
         drop(shares);
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn optional_plist_memory_refusal_keeps_the_evaluation_usable() {
+        use vortex_index::VixReadOperation;
+
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(2));
+        let permit = evaluation_fixture(&pool, &count);
+        let other = evaluation_fixture(&pool, &count);
+        let root = ReadOperation::new(Arc::new(FetchStats::default()), None);
+        let operation = root.for_evaluation(&permit);
+        operation.check_memory(8).unwrap();
+        other.reserve_owned(20).unwrap();
+        assert!(!operation.try_check_memory(16).unwrap());
+        assert!(!operation.try_check_memory(33).unwrap());
+        assert_eq!(pool.state.lock().used, 28);
+        assert!(permit.check_refusal().is_ok());
+        operation.check_memory(12).unwrap();
+        assert_eq!(pool.state.lock().used, 32);
+        drop(other);
+        assert!(operation.try_check_memory(24).unwrap());
+        assert_eq!(pool.state.lock().used, 24);
+        root.cancel();
+        assert!(matches!(
+            operation.try_check_memory(24),
+            Err(vortex_index::VixError::Cancelled)
+        ));
+        assert!(permit.check_refusal().is_ok());
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn optional_plist_memory_does_not_hide_an_existing_refusal() {
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        assert!(permit.reserve_owned(33).is_err());
+        assert!(permit.memory.try_check(1).is_err());
+        assert!(permit.check_refusal().is_err());
+        assert_eq!(pool.state.lock().used, 0);
     }
 
     /// A lease starts empty and grows to the reader's measured ownership

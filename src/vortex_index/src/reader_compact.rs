@@ -13,10 +13,31 @@ mod config;
 use config::ReaderCompactConfig;
 
 static SETTINGS: OnceLock<ReaderCompactConfig> = OnceLock::new();
+static PLIST_CURSOR_REUSE: OnceLock<bool> = OnceLock::new();
+
+fn parse_plist_cursor_reuse(value: Result<String, std::env::VarError>) -> std::io::Result<bool> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(true),
+        Ok(value) if matches!(value.as_str(), "1" | "true") => Ok(true),
+        Ok(value) if matches!(value.as_str(), "0" | "false") => Ok(false),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "ZO_VIX_PLIST_CURSOR_REUSE: expected 0, 1, false, or true",
+        )),
+    }
+}
+
+pub(crate) fn plist_cursor_reuse() -> bool {
+    PLIST_CURSOR_REUSE.get().copied().unwrap_or(true)
+}
 
 /// Validate and freeze environment settings before starting any service work.
 /// Standalone engine users also initialize on their first reader open.
 pub fn initialize_reader_compact() -> std::io::Result<()> {
+    if PLIST_CURSOR_REUSE.get().is_none() {
+        let enabled = parse_plist_cursor_reuse(std::env::var("ZO_VIX_PLIST_CURSOR_REUSE"))?;
+        let _ = PLIST_CURSOR_REUSE.set(enabled);
+    }
     if SETTINGS.get().is_none() {
         let settings = ReaderCompactConfig::from_env()?;
         let _ = SETTINGS.set(settings);
@@ -100,6 +121,27 @@ mod tests {
     use arrow_schema::{DataType, Metadata};
 
     use super::*;
+
+    #[test]
+    fn plist_cursor_reuse_defaults_on_and_validates_each_value() {
+        assert!(parse_plist_cursor_reuse(Err(std::env::VarError::NotPresent)).unwrap());
+        for (value, expected) in [("0", false), ("false", false), ("1", true), ("true", true)] {
+            assert_eq!(
+                parse_plist_cursor_reuse(Ok(value.into())).unwrap(),
+                expected
+            );
+        }
+        for value in ["", "TRUE", "yes", "2", " true", "false "] {
+            let error = parse_plist_cursor_reuse(Ok(value.into())).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("ZO_VIX_PLIST_CURSOR_REUSE"));
+        }
+        assert!(
+            parse_plist_cursor_reuse(Err(std::env::VarError::NotUnicode("invalid".into())))
+                .is_err()
+        );
+    }
+
     #[test]
     fn field_intern_preserves_full_semantics() {
         let a = Arc::new(Field::new("compact_test", DataType::Utf8, true));
