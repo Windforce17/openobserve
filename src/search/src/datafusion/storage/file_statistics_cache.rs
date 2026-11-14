@@ -17,7 +17,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, LazyLock as Lazy,
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     time::Instant,
 };
@@ -45,8 +45,10 @@ pub static GLOBAL_CACHE: Lazy<Arc<FileStatisticsCache>> =
 /// Cache is invalided when file size or last modification has changed
 pub struct FileStatisticsCache {
     statistics: DashMap<String, (ObjectMeta, Arc<Statistics>, Arc<SchemaFingerprint>, usize)>,
+    // Serializes every mutation of the map, queue, and memory accounting.
+    // Readers only acquire a DashMap shard; writers acquire this lock first.
     cacher: parking_lot::Mutex<VecDeque<String>>,
-    current_memory: AtomicI64,
+    current_memory: AtomicUsize,
 }
 
 impl FileStatisticsCache {
@@ -54,7 +56,7 @@ impl FileStatisticsCache {
         Self {
             statistics: DashMap::new(),
             cacher: parking_lot::Mutex::new(VecDeque::new()),
-            current_memory: AtomicI64::new(0),
+            current_memory: AtomicUsize::new(0),
         }
     }
 
@@ -66,8 +68,12 @@ impl FileStatisticsCache {
         self.statistics.is_empty()
     }
 
+    pub fn queue_len(&self) -> usize {
+        self.cacher.lock().len()
+    }
+
     pub fn memory_size(&self) -> usize {
-        self.current_memory.load(Ordering::Relaxed).max(0) as usize
+        self.current_memory.load(Ordering::Relaxed)
     }
 
     fn estimate_entry_size(key: &str, meta: &ObjectMeta, stats: &Statistics) -> usize {
@@ -102,30 +108,27 @@ impl FileStatisticsCache {
 
     fn evict(&self, max_bytes: usize) {
         let start = Instant::now();
-        let mut warned = false;
         let mut w = self.cacher.lock();
-        while self.current_memory.load(Ordering::Relaxed) > max_bytes as i64 && !w.is_empty() {
-            if !warned {
-                log::warn!(
-                    "FileStatisticsCache is full ({} bytes > {} bytes), evicting oldest entries",
-                    self.current_memory.load(Ordering::Relaxed),
-                    max_bytes,
-                );
-                warned = true;
-            }
+        let initial_memory = self.memory_size();
+        while self.memory_size() > max_bytes && !w.is_empty() {
             let batch = (w.len() / 20).max(1).min(w.len());
-            let mut removed_total = 0i64;
             for k in w.drain(0..batch) {
                 if let Some((_, (_, _, _, size))) = self.statistics.remove(&k) {
-                    removed_total += size as i64;
+                    self.current_memory.store(
+                        self.memory_size()
+                            .checked_sub(size)
+                            .expect("file statistics memory accounting underflow"),
+                        Ordering::Relaxed,
+                    );
                 }
-            }
-            if removed_total > 0 {
-                self.current_memory
-                    .fetch_sub(removed_total, Ordering::Relaxed);
             }
         }
         drop(w);
+        if initial_memory > max_bytes {
+            log::warn!(
+                "FileStatisticsCache is full ({initial_memory} bytes > {max_bytes} bytes), evicting oldest entries",
+            );
+        }
         metrics::QUERY_PARQUET_METADATA_CACHE_GC_COUNT
             .with_label_values::<&str>(&[])
             .inc();
@@ -187,6 +190,10 @@ impl Cache<TableScopedPath, CachedFileMetadata> for FileStatisticsCache {
             // DFHeapSize includes the Arc allocation and nested column names/types.
             + value.schema_fingerprint.heap_size(&mut DFHeapSizeCtx::default());
 
+        let max_bytes = config::get_config()
+            .limit
+            .datafusion_file_stat_cache_max_size;
+        let mut queue = self.cacher.lock();
         let old = self.statistics.insert(
             k.clone(),
             (
@@ -197,21 +204,20 @@ impl Cache<TableScopedPath, CachedFileMetadata> for FileStatisticsCache {
             ),
         );
         let old_size = old.as_ref().map(|(_, _, _, s)| *s).unwrap_or(0);
-        let delta = entry_size as i64 - old_size as i64;
-        self.current_memory.fetch_add(delta, Ordering::Relaxed);
+        let memory = self
+            .memory_size()
+            .checked_sub(old_size)
+            .and_then(|size| size.checked_add(entry_size))
+            .expect("file statistics memory accounting overflow or underflow");
+        self.current_memory.store(memory, Ordering::Relaxed);
 
-        // Only queue the key for eviction when it's a fresh insertion.
-        // When `old.is_some()` the key is already present in `cacher`
-        // (it hasn't been drained yet, otherwise stats wouldn't hold it),
-        // so pushing again would create a duplicate tombstone.
+        // Replacement preserves FIFO age; removal followed by insertion does not.
         if old.is_none() {
-            self.cacher.lock().push_back(k);
+            queue.push_back(k);
         }
+        drop(queue);
 
-        let max_bytes = config::get_config()
-            .limit
-            .datafusion_file_stat_cache_max_size;
-        if self.current_memory.load(Ordering::Relaxed) > max_bytes as i64 {
+        if memory > max_bytes {
             self.evict(max_bytes);
         }
 
@@ -222,11 +228,17 @@ impl Cache<TableScopedPath, CachedFileMetadata> for FileStatisticsCache {
 
     fn remove(&self, k: &TableScopedPath) -> Option<CachedFileMetadata> {
         let k = self.format_key(&k.path);
+        let mut queue = self.cacher.lock();
         self.statistics
             .remove(&k)
             .map(|(_, (meta, stats, fingerprint, size))| {
-                self.current_memory
-                    .fetch_sub(size as i64, Ordering::Relaxed);
+                queue.retain(|queued| queued != &k);
+                self.current_memory.store(
+                    self.memory_size()
+                        .checked_sub(size)
+                        .expect("file statistics memory accounting underflow"),
+                    Ordering::Relaxed,
+                );
                 CachedFileMetadata::new(meta, fingerprint, stats, None)
             })
     }
@@ -241,8 +253,9 @@ impl Cache<TableScopedPath, CachedFileMetadata> for FileStatisticsCache {
     }
 
     fn clear(&self) {
+        let mut queue = self.cacher.lock();
         self.statistics.clear();
-        self.cacher.lock().clear();
+        queue.clear();
         self.current_memory.store(0, Ordering::Relaxed);
     }
 
@@ -536,6 +549,108 @@ mod tests {
         assert!(cache.contains_key(&key(&second.location)));
         assert_eq!(cache.memory_size(), entry_size);
         cache.remove(&key(&second.location));
+        assert_eq!(cache.memory_size(), 0);
+    }
+
+    fn assert_consistent(cache: &FileStatisticsCache) {
+        let queue = cache.cacher.lock();
+        let unique: std::collections::HashSet<_> = queue.iter().collect();
+        assert_eq!(queue.len(), unique.len(), "duplicate FIFO keys");
+        assert_eq!(queue.len(), cache.statistics.len(), "orphan FIFO keys");
+        let mut actual = 0usize;
+        for entry in &cache.statistics {
+            assert!(unique.contains(entry.key()));
+            actual = actual.checked_add(entry.value().3).unwrap();
+        }
+        assert_eq!(cache.memory_size(), actual);
+    }
+
+    #[test]
+    fn remove_reinsert_keeps_queue_bounded() {
+        let cache = FileStatisticsCache::new();
+        let stats = unknown_stats(vec![Field::new("col", DataType::Utf8, true)]);
+        for _ in 0..100 {
+            for i in 0..32 {
+                let meta = object_meta(&format!("file_{i}"), 512);
+                put(&cache, meta.clone(), Arc::clone(&stats));
+                assert_consistent(&cache);
+                put(&cache, meta.clone(), Arc::clone(&stats));
+                assert_consistent(&cache);
+                assert!(cache.remove(&key(&meta.location)).is_some());
+                assert_consistent(&cache);
+                assert!(cache.remove(&key(&meta.location)).is_none());
+                put(&cache, meta, Arc::clone(&stats));
+            }
+            assert_eq!(cache.queue_len(), 32);
+            assert_consistent(&cache);
+        }
+        cache.clear();
+        assert_eq!(cache.queue_len(), 0);
+        assert_consistent(&cache);
+    }
+
+    #[test]
+    fn reinserted_key_is_not_evicted_by_its_old_queue_slot() {
+        let cache = FileStatisticsCache::new();
+        let stats = unknown_stats(vec![]);
+        let first = object_meta("file_a", 512);
+        let second = object_meta("file_b", 512);
+        put(&cache, first.clone(), Arc::clone(&stats));
+        let entry_size = cache.memory_size();
+        put(&cache, second.clone(), Arc::clone(&stats));
+        cache.remove(&key(&first.location)).unwrap();
+        let mut replacement = first.clone();
+        replacement.size = 1024;
+        put(&cache, replacement, stats);
+        assert_consistent(&cache);
+
+        cache.evict(entry_size);
+        assert!(cache.get(&key(&second.location)).is_none());
+        assert_eq!(cache.get(&key(&first.location)).unwrap().meta.size, 1024);
+        assert_eq!(cache.memory_size(), entry_size);
+        assert_eq!(cache.queue_len(), 1);
+        assert_consistent(&cache);
+        cache.evict(0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.queue_len(), 0);
+        assert_consistent(&cache);
+    }
+
+    #[test]
+    fn concurrent_mutations_keep_queue_and_memory_consistent() {
+        let cache = Arc::new(FileStatisticsCache::new());
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let cache = Arc::clone(&cache);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in 0..1000 {
+                        let meta = object_meta(&format!("file_{}", i % 16), 512);
+                        let stats = unknown_stats(vec![Field::new(
+                            "col".repeat(i % 8 + 1),
+                            DataType::Utf8,
+                            true,
+                        )]);
+                        put(&cache, meta.clone(), stats);
+                        let _ = cache.get(&key(&meta.location));
+                        match (i + worker) % 4 {
+                            0 => {
+                                cache.remove(&key(&meta.location));
+                            }
+                            1 => cache.evict(4096),
+                            2 => cache.clear(),
+                            _ => {}
+                        }
+                        assert_consistent(&cache);
+                    }
+                });
+            }
+        });
+        assert_consistent(&cache);
+        cache.evict(0);
+        assert_eq!(cache.queue_len(), 0);
         assert_eq!(cache.memory_size(), 0);
     }
 }

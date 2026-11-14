@@ -847,6 +847,18 @@ pub static QUERY_PARQUET_METADATA_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::ne
     )
     .expect("Metric created")
 });
+pub static QUERY_PARQUET_METADATA_CACHE_QUEUE_LENGTH: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "query_parquet_metadata_cache_queue_length",
+            "Querier file statistics cache FIFO entries.",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
 pub static QUERY_PARQUET_METADATA_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -3077,6 +3089,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_PARQUET_METADATA_CACHE_USED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_PARQUET_METADATA_CACHE_QUEUE_LENGTH.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_PARQUET_METADATA_CACHE_HITS_TOTAL.clone()))
