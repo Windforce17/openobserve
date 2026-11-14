@@ -3895,6 +3895,9 @@ pub struct DiskCache {
     /// 0 = 25% of it.
     #[env_config(name = "ZO_DISK_CACHE_BLOCK_MAX_SIZE", default = 0)]
     pub block_max_size: usize,
+    /// Percentage of each bucket reclaimed by a capacity eviction, 1..=50.
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT", default = 10)]
+    pub block_release_percent: usize,
     /// MB of fetched blocks allowed to wait for the fill writers. Fills are
     /// write-behind: a read returns once its bytes are in hand and a small
     /// writer pool `pwrite`s the fetched runs later; a fill that would push
@@ -3915,6 +3918,16 @@ impl DiskCache {
         } else {
             &self.block_strategy
         }
+    }
+
+    fn validate_block_release_percent(&self) -> Result<(), anyhow::Error> {
+        if !(1..=50).contains(&self.block_release_percent) {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT must be an integer between 1 and 50, got {}",
+                self.block_release_percent
+            ));
+        }
+        Ok(())
     }
 
     fn validate_block_strategy(&self) -> Result<(), anyhow::Error> {
@@ -5336,6 +5349,7 @@ pub fn deverbatim(path: &Path) -> std::borrow::Cow<'_, str> {
 fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     // Validate even when the block tier (or the entire disk cache) is off.
     cfg.disk_cache.validate_block_strategy()?;
+    cfg.disk_cache.validate_block_release_percent()?;
     std::fs::create_dir_all(&cfg.common.data_cache_dir).expect("create cache dir success");
     let cache_dir_path = Path::new(&cfg.common.data_cache_dir)
         .canonicalize()
@@ -5826,6 +5840,86 @@ mod tests {
             err.to_string()
                 .contains("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL")
         );
+    }
+
+    #[test]
+    fn disk_cache_block_release_percent_validates_even_when_disabled() {
+        for enabled in [false, true] {
+            for value in [0, 51, usize::MAX] {
+                let mut cfg = Config::init().unwrap();
+                cfg.disk_cache.enabled = enabled;
+                cfg.disk_cache.block_enabled = enabled;
+                cfg.disk_cache.block_release_percent = value;
+                let error = check_disk_cache_config(&mut cfg).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disk_cache_block_release_env_probe() {
+        let Ok(expected) = std::env::var("OO_TEST_BLOCK_RELEASE_EXPECTED") else {
+            return;
+        };
+        let cache = DiskCache::init().expect("ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT parse failed");
+        cache.validate_block_release_percent().unwrap();
+        assert_eq!(
+            cache.block_release_percent,
+            expected.parse::<usize>().unwrap()
+        );
+    }
+
+    #[test]
+    fn disk_cache_block_release_env_defaults_and_rejects_invalid_integers() {
+        for (value, expected) in [
+            (None, Some(10)),
+            (Some("1"), Some(1)),
+            (Some("5"), Some(5)),
+            (Some("10"), Some(10)),
+            (Some("50"), Some(50)),
+            (Some("0"), None),
+            (Some("51"), None),
+            (Some("-1"), None),
+            (Some("10.5"), None),
+            (Some("nope"), None),
+            (Some(""), None),
+            (Some(" 10"), None),
+            (Some("999999999999999999999999999999"), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::tests::disk_cache_block_release_env_probe",
+                    "--nocapture",
+                ])
+                .env(
+                    "OO_TEST_BLOCK_RELEASE_EXPECTED",
+                    expected.unwrap_or(10).to_string(),
+                )
+                .env_remove("ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT");
+            if let Some(value) = value {
+                child.env("ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if expected.is_none() {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("ZO_DISK_CACHE_BLOCK_RELEASE_PERCENT")
+                );
+            }
+        }
     }
 
     #[test]
