@@ -751,6 +751,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
     // Files with an mtime from this point on were written by this process,
     // not by the run the startup check judges.
     let started = SystemTime::now();
+    let keep_recent_segments = cfg.disk_cache.segment_keep_recent;
     tokio::spawn(async move {
         log::info!("Loading disk cache start");
         match tokio::fs::canonicalize(&FILES.root_dir).await {
@@ -759,6 +760,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
                     &root,
                     [&FILES, &RESULT_FILES, &AGGREGATION_FILES],
                     Some(&SEGMENT_FILES),
+                    keep_recent_segments,
                     started,
                 )
                 .await
@@ -1261,6 +1263,7 @@ async fn load(
     root_dir: &Path,
     caches: [&Arc<FileData>; 3],
     segment_cache: Option<&Arc<FileData>>,
+    keep_recent_segments: bool,
     started: SystemTime,
 ) -> Result<(), anyhow::Error> {
     let segment_cache = segment_cache.filter(|files| files.max_size > 0);
@@ -1419,8 +1422,28 @@ async fn load(
     for (key, size, modified, index) in loaded {
         let files = cache_at(index);
         if index != 0 && is_recent_result(&modified) {
-            removed.remove(files, &key, StartupDamage::RecentResult, size as u64);
-            continue;
+            let keep = if keep_recent_segments
+                && key.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX)
+            {
+                let path = files.get_file_path(&key);
+                match tokio::task::spawn_blocking(move || {
+                    super::segment_integrity::validate(Path::new(&path))
+                })
+                .await
+                {
+                    Ok(Ok(())) => true,
+                    result => {
+                        log::warn!("reject recent WAL segment cache {key} at startup: {result:?}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !keep {
+                removed.remove(files, &key, StartupDamage::RecentResult, size as u64);
+                continue;
+            }
         }
         // Acquire metadata before the stripe, matching the deleter's lock order.
         // Metadata and index publication cannot race with eviction cleanup, and
@@ -3113,6 +3136,7 @@ mod tests {
             &root,
             [&data.files, &results, &aggregations],
             None,
+            false,
             SystemTime::now(),
         )
         .await
@@ -3247,9 +3271,15 @@ mod tests {
 
         let root = data.root.path().canonicalize().unwrap();
         assert!(!data.checked.load(Ordering::Acquire));
-        load(&root, [&data.files, &results, &aggregations], None, started)
-            .await
-            .unwrap();
+        load(
+            &root,
+            [&data.files, &results, &aggregations],
+            None,
+            false,
+            started,
+        )
+        .await
+        .unwrap();
         data.quiesce().await;
 
         assert!(data.checked.load(Ordering::Acquire));
@@ -3278,6 +3308,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn keep_recent_segments_requires_integrity_in_both_pools() {
+        let v1 = include_bytes!("fixtures/segment-v1.bin").as_slice();
+        let v2 = include_bytes!("fixtures/segment-v2.bin").as_slice();
+        for separate in [false, true] {
+            for keep in [false, true] {
+                let data = test_cache(FileType::Data, 64 << 20, "lru");
+                if !keeps_holes(data.root.path()) {
+                    return;
+                }
+                let (results, aggregations) = sibling_caches(&data, 64 << 20);
+                let segments = FileData::with_capacity(
+                    FileType::Segment,
+                    if separate { 64 << 20 } else { 0 },
+                    data.root_dir.clone(),
+                    Vec::new(),
+                    data.queue.sender.clone(),
+                );
+                let valid = ["wal_segments/recent/v1", "wal_segments/recent/v2"];
+                for (key, bytes) in valid.iter().zip([v1, v2]) {
+                    write_cache_file(&data, key, bytes, 100_000);
+                }
+                let mut corrupt = v2.to_vec();
+                *corrupt.last_mut().unwrap() ^= 1;
+                let invalid = [
+                    ("wal_segments/recent/crc", corrupt.as_slice()),
+                    ("wal_segments/recent/truncated", &v1[..v1.len() - 1]),
+                    ("wal_segments/recent/empty", &[][..]),
+                    ("wal_segments/recent/magic", &[1; 1024][..]),
+                ];
+                for (key, bytes) in invalid {
+                    write_cache_file(&data, key, bytes, 100_000);
+                }
+                let sparse = "wal_segments/recent/hole";
+                let sparse_path = write_cache_file(&data, sparse, v2, 100_000);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&sparse_path)
+                    .unwrap()
+                    .set_len(1 << 20)
+                    .unwrap();
+                set_mtime(&sparse_path, 100_000);
+                let result = "results/keep-recent/logs/stream/query/1_2_0_0.json";
+                write_cache_file(&data, result, &[3; 1024], 100_000);
+                let old = "wal_segments/recent/old";
+                write_cache_file(&data, old, &[4; 1024], 90_000);
+                let root = data.root.path().canonicalize().unwrap();
+                load(
+                    &root,
+                    [&data.files, &results, &aggregations],
+                    Some(&segments),
+                    keep,
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(100_500),
+                )
+                .await
+                .unwrap();
+                let active = if separate { &segments } else { &results };
+                let inactive = if separate { &results } else { &segments };
+                for key in valid {
+                    assert_eq!(active.data.contains_key(key), keep, "{key}");
+                    assert_eq!(Path::new(&active.get_file_path(key)).exists(), keep);
+                    assert!(!inactive.data.contains_key(key));
+                }
+                for key in invalid
+                    .map(|(key, _)| key)
+                    .into_iter()
+                    .chain([sparse, result])
+                {
+                    assert!(!active.data.contains_key(key), "{key}");
+                    assert!(!Path::new(&active.get_file_path(key)).exists(), "{key}");
+                }
+                // The switch only relaxes the recent-file rule; old files retain
+                // the baseline hole/size checks rather than a new full scan.
+                assert!(active.data.contains_key(old));
+                assert_eq!(active.len(), if keep { 3 } else { 1 });
+                assert_eq!(
+                    active.size().1,
+                    1024 + if keep { v1.len() + v2.len() } else { 0 }
+                );
+                assert_eq!(inactive.len(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn segment_pool_upgrade_and_rollback_adopt_the_same_paths_once() {
         let data = test_cache(FileType::Data, 64 << 20, "lru");
         if !keeps_holes(data.root.path()) {
@@ -3301,6 +3415,7 @@ mod tests {
                 &root,
                 [&data.files, &results, &aggregations],
                 Some(&segments),
+                false,
                 started,
             )
             .await
@@ -3317,6 +3432,7 @@ mod tests {
                 &root,
                 [&data.files, &results, &aggregations],
                 Some(&segments),
+                false,
                 started,
             )
             .await
@@ -3405,9 +3521,15 @@ mod tests {
         let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100_500);
 
         let root = data.root.path().canonicalize().unwrap();
-        load(&root, [&data.files, &results, &aggregations], None, started)
-            .await
-            .unwrap();
+        load(
+            &root,
+            [&data.files, &results, &aggregations],
+            None,
+            false,
+            started,
+        )
+        .await
+        .unwrap();
         quiesce_deletes(&results).await;
 
         assert!(!results.data.contains_key(&oldest));
@@ -3458,6 +3580,7 @@ mod tests {
             &root,
             [&data.files, &results, &aggregations],
             None,
+            false,
             SystemTime::now(),
         )
         .await

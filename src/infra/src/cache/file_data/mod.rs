@@ -19,6 +19,7 @@ pub mod disk;
 mod download_io;
 pub use download_io::disk_download_in_flight_bytes;
 pub mod memory;
+mod segment_integrity;
 
 use std::{
     collections::{BTreeMap, VecDeque},

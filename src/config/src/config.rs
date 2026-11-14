@@ -3866,6 +3866,12 @@ pub struct DiskCache {
         help = "MB reserved for WAL segments from the whole-file budget after block allocation. 0 keeps segments in the result pool. Requires restart."
     )]
     pub segment_max_size: usize,
+    #[env_config(
+        name = "ZO_DISK_SEGMENT_CACHE_KEEP_RECENT",
+        default = false,
+        help = "Keep recent WAL segment cache files at startup only after hole, framing and CRC checks. Requires restart."
+    )]
+    pub segment_keep_recent: bool,
     #[env_config(name = "ZO_DISK_AGGREGATION_CACHE_MAX_SIZE", default = 0)]
     pub aggregation_max_size: usize,
     // MB, will skip the cache when a query need cache great than this value, default is 50% of
@@ -6229,6 +6235,50 @@ mod tests {
                 .env_remove("ZO_DISK_SEGMENT_CACHE_MAX_SIZE");
             if let Some(value) = value {
                 child.env("ZO_DISK_SEGMENT_CACHE_MAX_SIZE", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn disk_cache_segment_keep_recent_env_probe() {
+        let Ok(expected) = std::env::var("OO_TEST_SEGMENT_RECENT_EXPECTED") else {
+            return;
+        };
+        let cache = DiskCache::init().expect("ZO_DISK_SEGMENT_CACHE_KEEP_RECENT parse failed");
+        assert_eq!(cache.segment_keep_recent, expected.parse::<bool>().unwrap());
+    }
+
+    #[test]
+    fn disk_cache_segment_keep_recent_env_defaults_and_rejects_invalid_booleans() {
+        for (value, expected) in [
+            (None, Some(false)),
+            (Some("false"), Some(false)),
+            (Some("true"), Some(true)),
+            (Some("1"), None),
+            (Some("yes"), None),
+            (Some(""), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::tests::disk_cache_segment_keep_recent_env_probe",
+                ])
+                .env(
+                    "OO_TEST_SEGMENT_RECENT_EXPECTED",
+                    expected.unwrap_or(false).to_string(),
+                )
+                .env_remove("ZO_DISK_SEGMENT_CACHE_KEEP_RECENT");
+            if let Some(value) = value {
+                child.env("ZO_DISK_SEGMENT_CACHE_KEEP_RECENT", value);
             }
             let output = child.output().unwrap();
             assert_eq!(
