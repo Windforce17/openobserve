@@ -261,11 +261,18 @@ pub async fn query_ids(
     stream_name: &str,
     time_range: (i64, i64),
 ) -> Result<Vec<infra_file_list::FileId>> {
+    use config::metrics::file_list::Phase;
+
+    let db_timer = Phase::SnapshotDb.start();
     let mut files =
         infra_file_list::query_ids(org_id, stream_type, stream_name, time_range).await?;
+    drop(db_timer);
+    let dump_timer = Phase::SnapshotDump.start();
     let dumped_files =
         super::file_list_dump::query_ids(trace_id, org_id, stream_type, stream_name, time_range)
             .await?;
+    drop(dump_timer);
+    let _merge_timer = Phase::SnapshotMerge.start();
     files.extend(dumped_files);
     files.par_sort_unstable_by(|a, b| a.id.cmp(&b.id));
     files.dedup_by(|a, b| a.id == b.id);
@@ -284,11 +291,18 @@ pub async fn query_ids_with_file(
     stream_name: &str,
     time_range: (i64, i64),
 ) -> Result<Vec<infra_file_list::FileIdWithFile>> {
+    use config::metrics::file_list::Phase;
+
+    let db_timer = Phase::SnapshotDb.start();
     let mut files =
         infra_file_list::query_ids_with_file(org_id, stream_type, stream_name, time_range).await?;
+    drop(db_timer);
+    let dump_timer = Phase::SnapshotDump.start();
     let dumped_files =
         file_list_dump::query_ids_with_file(trace_id, org_id, stream_type, stream_name, time_range)
             .await?;
+    drop(dump_timer);
+    let _merge_timer = Phase::SnapshotMerge.start();
     files.extend(dumped_files);
     sort_dedup_file_ids_with_file(&mut files);
     Ok(files)

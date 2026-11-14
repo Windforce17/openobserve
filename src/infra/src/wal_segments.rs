@@ -1483,19 +1483,31 @@ ORDER BY max_ts DESC, id DESC
 LIMIT $5;"#,
             built = SegmentStatus::Built as i16
         );
+        use config::metrics::file_list::{Backend, Phase, record_pool};
+        let map_error = |e| {
+            Error::Message(format!(
+                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+            ))
+        };
+        record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+        let mut connection = {
+            let _acquire_timer = Phase::CandidateAcquire.start();
+            pool.acquire().await.map_err(map_error)?
+        };
+        record_pool(Backend::Postgres, pool.size(), pool.num_idle());
+        let sql_timer = Phase::CandidateSql.start();
         let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
             .bind(start)
             .bind(end)
             .bind(pattern)
             .bind(include_built_after)
             .bind(limit)
-            .fetch_all(&pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-                ))
-            })?;
+            .map_err(map_error)?;
+        drop(sql_timer);
+        drop(connection);
+        let _convert_timer = Phase::CandidateConvert.start();
         rows_into_metas(rows)
     }
 
@@ -2161,6 +2173,19 @@ WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
 ORDER BY max_ts DESC, id DESC
 LIMIT $6;"#
         );
+        use config::metrics::file_list::{Backend, Phase, record_pool};
+        let map_error = |e| {
+            Error::Message(format!(
+                "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
+            ))
+        };
+        record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+        let mut connection = {
+            let _acquire_timer = Phase::CandidateAcquire.start();
+            pool.acquire().await.map_err(map_error)?
+        };
+        record_pool(Backend::Sqlite, pool.size(), pool.num_idle());
+        let sql_timer = Phase::CandidateSql.start();
         let rows: Vec<SegmentRow> = sqlx::query_as(&sql)
             .bind(start)
             .bind(end)
@@ -2168,13 +2193,12 @@ LIMIT $6;"#
             .bind(SegmentStatus::Built as i16)
             .bind(include_built_after)
             .bind(limit)
-            .fetch_all(&pool)
+            .fetch_all(&mut *connection)
             .await
-            .map_err(|e| {
-                Error::Message(format!(
-                    "[WAL_SEGMENTS] query_unbuilt pattern={pattern} range=({start}, {end}): {e}"
-                ))
-            })?;
+            .map_err(map_error)?;
+        drop(sql_timer);
+        drop(connection);
+        let _convert_timer = Phase::CandidateConvert.start();
         rows_into_metas(rows)
     }
 
@@ -2901,6 +2925,73 @@ mod tests {
         }
         assert_eq!(raw_row(id1).await.0, 2);
         assert_eq!(raw_row(id2).await.0, 2);
+    }
+
+    #[tokio::test]
+    async fn metatime_candidates_match_pool_executor_and_record_phases() {
+        use std::time::Duration;
+
+        use config::metrics::file_list::{Phase, capture};
+
+        let _guard = setup().await;
+        for (seq, stream, max_ts) in [
+            (1, "org1/logs/app1", T0 + 2000),
+            (2, "org1/logs/app1", T0 + 2000),
+            (3, "org1/logs/app10", T0 + 3000),
+            (4, "org1/logs/app1", T0 + 6000),
+        ] {
+            add(&seg("metatime", seq, T0 + 1000, max_ts, &[stream]))
+                .await
+                .unwrap();
+        }
+        let pattern = stream_like_pattern("org1", "logs", "app1").unwrap();
+        let sql = format!(
+            r#"SELECT {COLUMNS} FROM wal_segments
+WHERE max_ts >= $1 AND min_ts <= $2 AND streams LIKE $3 ESCAPE '\'
+  AND (status != $4 OR (status = $4 AND updated_at >= $5))
+ORDER BY max_ts DESC, id DESC
+LIMIT $6;"#
+        );
+        for (start, end, limit) in [
+            (T0, T0 + 3000, 10),
+            (T0 + 2000, T0 + 3000, 2),
+            (T0 + 6001, T0 + 7000, 10),
+        ] {
+            let rows = sqlx::query_as::<_, SegmentRow>(&sql)
+                .bind(start)
+                .bind(end)
+                .bind(&pattern)
+                .bind(SegmentStatus::Built as i16)
+                .bind(i64::MAX)
+                .bind(limit as i64)
+                .fetch_all(&*crate::db::sqlite::CLIENT_RO)
+                .await
+                .unwrap();
+            let expected = rows_into_metas(rows).unwrap();
+            let (actual, timings) = capture(async {
+                let _candidates = Phase::Candidates.start();
+                query_unbuilt("org1", "logs", "app1", (start, end), i64::MAX, limit).await
+            })
+            .await;
+            assert_eq!(
+                serde_json::to_vec(&actual.unwrap()).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            let mut sum = Duration::ZERO;
+            for phase in [
+                Phase::CandidateAcquire,
+                Phase::CandidateSql,
+                Phase::CandidateConvert,
+            ] {
+                assert!(timings.duration(phase) > Duration::ZERO, "{phase:?}");
+                sum += timings.duration(phase);
+            }
+            assert!(sum <= timings.duration(Phase::Candidates));
+            assert_eq!(
+                timings.duration(Phase::Total),
+                timings.duration(Phase::Candidates) + timings.duration(Phase::Other)
+            );
+        }
     }
 
     #[tokio::test]
