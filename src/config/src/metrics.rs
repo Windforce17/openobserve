@@ -472,6 +472,80 @@ pub static QUERY_DISK_CACHE_FILES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("Metric created")
 });
 
+pub static DISK_CACHE_SEGMENT_USED_BYTES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "disk_cache_segment_used_bytes",
+            "Indexed WAL segment bytes in the whole-file result pool",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_SEGMENT_FILES: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "disk_cache_segment_files",
+            "Indexed WAL segment files in the whole-file result pool",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_WRITTEN_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "disk_cache_written_bytes_total",
+            "Bytes newly published to the whole-file cache, excluding startup adoption",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type"],
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_READS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "disk_cache_reads_total",
+            "Completed whole-file cache read API calls by outcome, including size lookups",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type", "outcome"],
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "disk_cache_segment_startup_recent_files_total",
+            "WAL segment files deleted by the startup recent-file rule",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static DISK_CACHE_SEGMENT_STARTUP_RECENT_BYTES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "disk_cache_segment_startup_recent_bytes_total",
+            "WAL segment bytes deleted by the startup recent-file rule",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
 pub static DISK_CACHE_EVICTED_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -2821,6 +2895,28 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(QUERY_DISK_CACHE_FILES.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(DISK_CACHE_SEGMENT_USED_BYTES.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DISK_CACHE_SEGMENT_FILES.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DISK_CACHE_WRITTEN_BYTES_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(DISK_CACHE_READS_TOTAL.clone()))
+        .unwrap();
+    registry
+        .register(Box::new(
+            DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.clone(),
+        ))
+        .unwrap();
+    registry
+        .register(Box::new(
+            DISK_CACHE_SEGMENT_STARTUP_RECENT_BYTES_TOTAL.clone(),
+        ))
+        .unwrap();
     registry
         .register(Box::new(DISK_CACHE_EVICTED_BYTES_TOTAL.clone()))
         .expect("Metric registered");
