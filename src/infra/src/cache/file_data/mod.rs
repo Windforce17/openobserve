@@ -248,6 +248,20 @@ impl CacheStrategy {
         }
     }
 
+    /// Promote an existing key only. Time-LRU never moves it between data
+    /// hours; the ordered hour map, membership and byte accounting stay intact.
+    fn touch(&mut self, key: &str) -> bool {
+        match self {
+            Self::Lru(cache) => cache.get(key).is_some(),
+            Self::TimeLru(map, cache, _) => {
+                let time = get_file_time(key).unwrap_or(0);
+                map.get(&time)
+                    .is_some_and(|idx| cache[*idx].get(key).is_some())
+            }
+            Self::Fifo(..) => false,
+        }
+    }
+
     fn remove(&mut self) -> Option<(String, usize)> {
         match self {
             CacheStrategy::Lru(cache) => cache.remove_lru(),
@@ -1239,6 +1253,32 @@ mod tests {
         assert!(!is_file_list_tracked_data_file(
             "files/default/logs/b/2025/04/08/06/1.json"
         ));
+    }
+
+    #[test]
+    fn strategy_touch_never_inserts_missing_keys_or_changes_sizes() {
+        let a = "files/default/logs/b/2025/04/08/06/a.vix";
+        let b = "files/default/logs/b/2025/04/08/06/b.vix";
+        let missing = "files/default/logs/b/2025/04/08/07/missing.vix";
+        for strategy in ["lru", "time_lru", "fifo"] {
+            let mut order = CacheStrategy::new(strategy);
+            assert!(!order.touch(missing));
+            assert_eq!(order.len(), 0);
+            order.insert(a.to_string(), 11);
+            order.insert(b.to_string(), 22);
+            assert_eq!(order.touch(a), strategy != "fifo");
+            assert!(!order.touch(missing));
+            assert_eq!(order.len(), 2);
+            let expected = if strategy == "fifo" {
+                [(a, 11), (b, 22)]
+            } else {
+                [(b, 22), (a, 11)]
+            };
+            for (key, size) in expected {
+                assert_eq!(order.remove(), Some((key.to_string(), size)));
+            }
+            assert!(order.remove().is_none());
+        }
     }
 
     #[test]

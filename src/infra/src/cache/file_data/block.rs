@@ -126,6 +126,10 @@ const FILL_CONCURRENCY: usize = 10;
 /// deeper inside the kernel on the same device.
 const FILL_WRITERS: usize = 4;
 
+/// A hit can promote an entry at most once per minute, including concurrent hits.
+const TOUCH_INTERVAL_NANOS: u64 = 60_000_000_000;
+const UNKNOWN_DATA_HOUR: i64 = i64::MIN;
+
 static GLOBAL: OnceLock<Arc<BlockCache>> = OnceLock::new();
 
 /// The process-wide tier, present when `ZO_DISK_CACHE_BLOCK_ENABLED` and the
@@ -163,7 +167,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
         block_size,
         per_bucket,
         (per_bucket / 10).max(block_size),
-        &cfg.disk_cache.cache_strategy,
+        cfg.disk_cache.effective_block_strategy(),
         cfg.disk_cache.bucket_num,
         cfg.disk_cache.block_fill_queue_size as u64,
     );
@@ -764,6 +768,7 @@ fn fill_writer(queue: Arc<FillQueue>, cache: Weak<BlockCache>) {
 pub struct BlockCache {
     root: PathBuf,
     block_size: u64,
+    touch_enabled: bool,
     buckets: Vec<Bucket>,
     fills: Arc<FillQueue>,
 }
@@ -782,6 +787,8 @@ struct Bucket {
     cur_size: AtomicU64,
     evicting: AtomicBool,
     index: RwLock<Index>,
+    #[cfg(test)]
+    touch_write_locks: AtomicU64,
     /// Keys whose cache file a deferred unlink ([`unlink_later`]) has yet to
     /// remove, with the number of such unlinks. The unlink removes the file
     /// by path, and every entry of a key uses the same path, so no entry is
@@ -850,6 +857,10 @@ pub struct Entry {
     path: PathBuf,
     object_size: u64,
     block_size: u64,
+    /// Monotonic nanoseconds, with zero reserved for an entry never promoted.
+    last_touch: AtomicU64,
+    /// Parsed once, not on the hit path; invalid dates use UNKNOWN_DATA_HOUR.
+    data_hour: i64,
     state: Mutex<State>,
 }
 
@@ -874,10 +885,12 @@ impl Entry {
     fn new(key: Arc<str>, path: PathBuf, object_size: u64, block_size: u64) -> Self {
         let blocks = block_count(object_size, block_size);
         Self {
+            data_hour: data_hour(&key),
             key,
             path,
             object_size,
             block_size,
+            last_touch: AtomicU64::new(0),
             state: Mutex::new(State {
                 bits: vec![0u64; blocks.div_ceil(64) as usize],
                 present_bytes: 0,
@@ -940,6 +953,54 @@ impl Entry {
         }
         state.present_bytes += added;
         added
+    }
+}
+
+/// Monotonic rather than wall time: clock corrections cannot postpone refreshes.
+fn touch_clock() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+    // Saturate after centuries of uptime, never wrap to the zero sentinel.
+    u64::try_from(elapsed.as_nanos())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+}
+
+/// Convert the existing strategy's YYYYMMDDHH key into a validated UTC hour.
+fn data_hour(key: &str) -> i64 {
+    super::get_file_time(key)
+        .and_then(|hour| {
+            chrono::NaiveDate::from_ymd_opt(
+                i32::try_from(hour / 1_000_000).ok()?,
+                ((hour / 10_000) % 100) as u32,
+                ((hour / 100) % 100) as u32,
+            )?
+            .and_hms_opt((hour % 100) as u32, 0, 0)
+            .map(|date| date.and_utc().timestamp())
+        })
+        .unwrap_or(UNKNOWN_DATA_HOUR)
+}
+
+/// Constant work per event. Future data hours count as age zero.
+fn age_label(data_hour: i64, now: i64) -> &'static str {
+    if data_hour == UNKNOWN_DATA_HOUR {
+        return "unknown";
+    }
+    match now.saturating_sub(data_hour).max(0) {
+        0..3600 => "lt1h",
+        3600..21600 => "1h_6h",
+        21600..86400 => "6h_24h",
+        86400..259200 => "1d_3d",
+        259200..604800 => "3d_7d",
+        _ => "gt7d",
+    }
+}
+
+fn record_age_bytes(event: &'static str, data_hour: i64, now: i64, bytes: u64) {
+    if bytes > 0 {
+        metrics::QUERY_DISK_BLOCK_CACHE_AGE_BYTES_TOTAL
+            .with_label_values(&[event, age_label(data_hour, now)])
+            .inc_by(bytes);
     }
 }
 
@@ -1015,6 +1076,8 @@ impl BlockCache {
                 release_size: release_size.max(block_size),
                 cur_size: AtomicU64::new(0),
                 evicting: AtomicBool::new(false),
+                #[cfg(test)]
+                touch_write_locks: AtomicU64::new(0),
                 index: RwLock::new(Index {
                     entries: HashMap::new(),
                     order: CacheStrategy::new(strategy),
@@ -1026,6 +1089,7 @@ impl BlockCache {
         let cache = Arc::new(Self {
             root,
             block_size,
+            touch_enabled: !strategy.eq_ignore_ascii_case("fifo"),
             buckets,
             fills: Arc::clone(&fills),
         });
@@ -1074,6 +1138,39 @@ impl BlockCache {
 
     fn get_entry(&self, key: &str) -> Option<Arc<Entry>> {
         self.bucket(key).index.read().entries.get(key).cloned()
+    }
+
+    /// The timestamp CAS is a reservation: only its winner takes the write
+    /// lock. A throttled hit performs no index lookup or write-lock acquisition.
+    /// `now` is injectable for deterministic interval and contention tests.
+    fn touch_entry_at(&self, entry: &Arc<Entry>, now: u64) -> bool {
+        if !self.touch_enabled {
+            return false;
+        }
+        let now = now.max(1);
+        let last = entry.last_touch.load(Ordering::Relaxed);
+        if (last != 0 && now.saturating_sub(last) < TOUCH_INTERVAL_NANOS)
+            || entry
+                .last_touch
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return false;
+        }
+        let bucket = self.bucket(&entry.key);
+        #[cfg(test)]
+        bucket.touch_write_locks.fetch_add(1, Ordering::Relaxed);
+        let mut index = bucket.index.write();
+        // An old Arc may outlive eviction and even a replacement for this key.
+        // Never reinsert it, promote its successor or change byte accounting.
+        if !index
+            .entries
+            .get(&*entry.key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return false;
+        }
+        index.order.touch(&entry.key)
     }
 
     /// Insert an empty entry for a cold object, or adopt the one a concurrent
@@ -1254,6 +1351,12 @@ impl BlockCache {
                 wanted.iter().map(move |w| overlap(&run_bytes, w))
             })
             .sum();
+        let hit_bytes = wanted_bytes.saturating_sub(miss_logical);
+        // Promote before handing fills to writers: a partial read's own fill
+        // may exceed capacity and trigger eviction of the entry being read.
+        if hit_bytes > 0 && self.touch_enabled {
+            self.touch_entry_at(&entry, touch_clock());
+        }
         // Every range is assembled from what is in hand - the fetched runs
         // and the file's present blocks - never from a fill read back out of
         // the file: the fills are written behind this read (if at all), so
@@ -1320,12 +1423,15 @@ impl BlockCache {
                 })
                 .collect()
         };
+        let now = chrono::Utc::now().timestamp();
+        record_age_bytes("hit", entry.data_hour, now, hit_bytes);
+        record_age_bytes("fill", entry.data_hour, now, remote_bytes);
         metrics::QUERY_DISK_BLOCK_CACHE_REQUESTS_TOTAL
             .with_label_values(&[outcome.as_str()])
             .inc();
         metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
             .with_label_values(&["block"])
-            .inc_by(wanted_bytes.saturating_sub(miss_logical));
+            .inc_by(hit_bytes);
         metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
             .with_label_values(&["remote"])
             .inc_by(remote_bytes);
@@ -1423,6 +1529,7 @@ impl BlockCache {
         let start = std::time::Instant::now();
         let mut victims = Vec::new();
         let mut released = 0u64;
+        let now = chrono::Utc::now().timestamp();
         {
             let mut index = bucket.index.write();
             while released < need {
@@ -1430,7 +1537,9 @@ impl BlockCache {
                     break;
                 };
                 if let Some(entry) = index.entries.remove(key.as_str()) {
-                    released += self.retire(&entry);
+                    let bytes = self.retire(&entry);
+                    record_age_bytes("evict", entry.data_hour, now, bytes);
+                    released += bytes;
                     victims.push(entry);
                 }
             }
@@ -1561,6 +1670,8 @@ impl BlockCache {
             path,
             object_size,
             block_size: self.block_size,
+            last_touch: AtomicU64::new(0),
+            data_hour: data_hour(&key),
             state: Mutex::new(State {
                 bits,
                 present_bytes,
@@ -1734,6 +1845,12 @@ async fn serve_remote(
     metrics::QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL
         .with_label_values(&["remote"])
         .inc_by(remote_bytes);
+    record_age_bytes(
+        "fill",
+        data_hour(key),
+        chrono::Utc::now().timestamp(),
+        remote_bytes,
+    );
     Ok(BlockReads {
         bytes,
         object_size,
@@ -2006,6 +2123,393 @@ mod tests {
     }
 
     const KEY: &str = "files/org/logs/stream/2026/10/08/11/a.vix";
+
+    fn cache_with_strategy(dir: &Path, max_size: u64, strategy: &str) -> Arc<BlockCache> {
+        BlockCache::new(
+            dir.to_path_buf(),
+            BS,
+            max_size,
+            BS,
+            strategy,
+            1,
+            FILL_BUDGET,
+        )
+    }
+
+    /// Exercise actual reads, queued writes and capacity eviction, not just
+    /// the ordering container. Insertion alone must not throttle the first hit.
+    async fn check_hit_eviction(strategy: &str, old_hour: bool, keep_a: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_strategy(dir.path(), 2 * BS, strategy);
+        let remote = Remote::new(BS as usize);
+        let fetch = remote.fetcher();
+        let a = if old_hour {
+            "files/org/logs/stream/2026/10/08/10/a.vix"
+        } else {
+            KEY
+        };
+        let b = "files/org/logs/stream/2026/10/08/11/b.vix";
+        let c = "files/org/logs/stream/2026/10/08/11/c.vix";
+        for key in [a, b] {
+            cache.read_through(key, 0..BS, None, &fetch).await.unwrap();
+            settle(&cache).await;
+        }
+        let hit = cache.read_through(a, 0..BS, None, &fetch).await.unwrap();
+        assert_eq!(hit.outcome, Outcome::Hit);
+        assert_eq!(hit.bytes, remote.data);
+        assert_eq!(remote.calls(), 2);
+        cache.read_through(c, 0..BS, None, &fetch).await.unwrap();
+        settle(&cache).await;
+        assert_eq!(cache.stats(), (2 * BS, 2 * BS, 2));
+        assert_eq!(cache.get_entry(a).is_some(), keep_a, "{strategy}: A");
+        assert_eq!(cache.get_entry(b).is_some(), !keep_a, "{strategy}: B");
+        assert!(cache.get_entry(c).is_some());
+        if strategy == "fifo" {
+            assert_eq!(cache.bucket(a).touch_write_locks.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn lru_hit_promotes_before_capacity_eviction() {
+        check_hit_eviction("lru", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn time_lru_same_hour_hit_promotes_before_capacity_eviction() {
+        check_hit_eviction("time_lru", false, true).await;
+    }
+
+    #[tokio::test]
+    async fn time_lru_old_hour_hit_does_not_cross_hours() {
+        check_hit_eviction("time_lru", true, false).await;
+    }
+
+    #[tokio::test]
+    async fn fifo_hit_keeps_insertion_order_without_touch_locks() {
+        check_hit_eviction("fifo", false, false).await;
+    }
+
+    #[tokio::test]
+    async fn lru_partial_hit_promotes_before_capacity_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_strategy(dir.path(), 4 * BS, "lru");
+        let remote = Remote::new((2 * BS) as usize);
+        let fetch = remote.fetcher();
+        let b = "files/org/logs/stream/2026/10/08/11/b.vix";
+        let c = "files/org/logs/stream/2026/10/08/11/c.vix";
+        cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+        settle(&cache).await;
+        cache
+            .read_through(b, 0..2 * BS, None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+        let read = cache
+            .read_through(KEY, 0..2 * BS, None, &fetch)
+            .await
+            .unwrap();
+        assert_eq!(read.outcome, Outcome::Partial);
+        assert_eq!(read.bytes, remote.data);
+        settle(&cache).await;
+        cache
+            .read_through(c, 0..2 * BS, None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+        assert!(cache.get_entry(KEY).is_some());
+        assert!(cache.get_entry(b).is_none());
+        assert!(cache.get_entry(c).is_some());
+        assert_eq!(cache.stats(), (4 * BS, 4 * BS, 2));
+    }
+
+    #[tokio::test]
+    async fn touch_interval_concurrent_hits_take_one_write_lock() {
+        for strategy in ["lru", "time_lru"] {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = cache_with_strategy(dir.path(), 2 * BS, strategy);
+            let entry = cache.insert_or_get(KEY, BS).unwrap();
+            let barrier = std::sync::Barrier::new(8);
+            let now = 100_000_000_000;
+            let start = std::time::Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    let cache = &cache;
+                    let barrier = &barrier;
+                    scope.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..10_000 {
+                            let entry = cache.get_entry(KEY).unwrap();
+                            cache.touch_entry_at(&entry, now);
+                        }
+                    });
+                }
+            });
+            let elapsed = start.elapsed();
+            let bucket = cache.bucket(KEY);
+            assert_eq!(bucket.touch_write_locks.load(Ordering::Relaxed), 1);
+            assert_eq!(entry.last_touch.load(Ordering::Relaxed), now);
+            // With a read guard held, these calls cannot take a write lock.
+            {
+                let _read_guard = bucket.index.read();
+                assert!(!cache.touch_entry_at(&entry, now + TOUCH_INTERVAL_NANOS - 1));
+                assert!(!cache.touch_entry_at(&entry, now - 1));
+            }
+            assert_eq!(bucket.touch_write_locks.load(Ordering::Relaxed), 1);
+            assert!(cache.touch_entry_at(&entry, now + TOUCH_INTERVAL_NANOS));
+            assert_eq!(bucket.touch_write_locks.load(Ordering::Relaxed), 2);
+            eprintln!(
+                "touch contention: strategy={strategy}, threads=8, lookups=80000, write_locks_in_interval=1, elapsed_ns={}",
+                elapsed.as_nanos()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_real_hits_do_not_take_more_touch_write_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_strategy(dir.path(), 2 * BS, "lru");
+        let remote = Remote::new(BS as usize);
+        let fetch = remote.fetcher();
+        cache.read_through(KEY, 0..100, None, &fetch).await.unwrap();
+        settle(&cache).await;
+        for _ in 0..100 {
+            let read = cache.read_through(KEY, 0..100, None, &fetch).await.unwrap();
+            assert_eq!(read.outcome, Outcome::Hit);
+        }
+        assert_eq!(
+            cache.bucket(KEY).touch_write_locks.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(remote.calls(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn touch_racing_eviction_never_revives_or_accounts_an_old_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_strategy(dir.path(), 2 * BS, "lru");
+        let remote = Remote::new(BS as usize);
+        let fetch = remote.fetcher();
+        for _ in 0..32 {
+            cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            settle(&cache).await;
+            let entry = cache.get_entry(KEY).unwrap();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let toucher = {
+                let cache = Arc::clone(&cache);
+                let entry = Arc::clone(&entry);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for now in [1, 61, 121, 181] {
+                        cache.touch_entry_at(&entry, now * 1_000_000_000);
+                    }
+                })
+            };
+            barrier.wait();
+            cache.evict(cache.bucket(KEY), BS);
+            toucher.join().unwrap();
+            assert!(!cache.touch_entry_at(&entry, 241_000_000_000));
+            assert_eq!(cache.stats(), (2 * BS, 0, 0));
+            assert_eq!(cache.bucket(KEY).index.read().order.len(), 0);
+            wait_unlinked(&cache, &entry.path, KEY).await;
+
+            // A stale Arc must not promote a replacement, either. A second
+            // object makes an accidental successor promotion observable.
+            cache.read_through(KEY, 0..BS, None, &fetch).await.unwrap();
+            settle(&cache).await;
+            let successor = cache.get_entry(KEY).unwrap();
+            assert!(!Arc::ptr_eq(&entry, &successor));
+            let other = "files/org/logs/stream/2026/10/08/11/other.vix";
+            cache
+                .read_through(other, 0..BS, None, &fetch)
+                .await
+                .unwrap();
+            settle(&cache).await;
+            assert!(!cache.touch_entry_at(&entry, 301_000_000_000));
+            assert_eq!(cache.stats(), (2 * BS, 2 * BS, 2));
+            cache.evict(cache.bucket(KEY), BS);
+            assert!(cache.get_entry(KEY).is_none());
+            assert!(cache.get_entry(other).is_some());
+            cache.evict(cache.bucket(KEY), BS);
+            assert_eq!(cache.stats(), (2 * BS, 0, 0));
+            assert_eq!(cache.bucket(KEY).index.read().order.len(), 0);
+            wait_unlinked(&cache, &successor.path, KEY).await;
+            wait_unlinked(&cache, &cache.path_for(other), other).await;
+        }
+    }
+
+    #[test]
+    fn age_buckets_validate_dates_boundaries_and_future_hours() {
+        let hour = data_hour(KEY);
+        assert_eq!(
+            hour,
+            chrono::DateTime::parse_from_rfc3339("2026-10-08T11:00:00Z")
+                .unwrap()
+                .timestamp()
+        );
+        for (seconds, label) in [
+            (-1, "lt1h"),
+            (0, "lt1h"),
+            (3599, "lt1h"),
+            (3600, "1h_6h"),
+            (21599, "1h_6h"),
+            (21600, "6h_24h"),
+            (86399, "6h_24h"),
+            (86400, "1d_3d"),
+            (259199, "1d_3d"),
+            (259200, "3d_7d"),
+            (604799, "3d_7d"),
+            (604800, "gt7d"),
+        ] {
+            assert_eq!(age_label(hour, hour + seconds), label);
+        }
+        for key in [
+            "invalid",
+            "files/org/logs/stream/2026/02/30/11/a.vix",
+            "files/org/logs/stream/2026/10/08/24/a.vix",
+        ] {
+            assert_eq!(data_hour(key), UNKNOWN_DATA_HOUR);
+            assert_eq!(age_label(data_hour(key), hour), "unknown");
+        }
+        assert_eq!(age_label(hour, i64::MAX), "gt7d");
+        assert_eq!(age_label(hour, i64::MIN), "lt1h");
+    }
+
+    /// A child runs this test alone: global Prometheus counters must not be
+    /// reset, or compared against deltas polluted by parallel cache tests.
+    #[test]
+    fn age_metrics_count_hit_fill_and_evicted_present_bytes() {
+        const CHILD: &str = "ZO_BLOCK_AGE_METRIC_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cache::file_data::block::tests::age_metrics_count_hit_fill_and_evicted_present_bytes",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = cache_with_strategy(dir.path(), 4 * BS, "lru");
+            let remote = Remote::new((2 * BS) as usize);
+            let fetch = remote.fetcher();
+            let now = chrono::Utc::now();
+            for (hours, age) in [
+                (-2, "lt1h"),
+                (2, "1h_6h"),
+                (12, "6h_24h"),
+                (48, "1d_3d"),
+                (96, "3d_7d"),
+                (192, "gt7d"),
+                (-1, "unknown"),
+            ] {
+                // A future hour makes lt1h independent of the test crossing
+                // a wall-clock hour boundary; exact boundaries are tested above.
+                let key = if hours == -1 {
+                    "unknown-age.vix".to_string()
+                } else {
+                    format!(
+                        "files/org/logs/stream/{}/age.vix",
+                        (now - chrono::Duration::hours(hours)).format("%Y/%m/%d/%H")
+                    )
+                };
+                let counter = |event| {
+                    metrics::QUERY_DISK_BLOCK_CACHE_AGE_BYTES_TOTAL
+                        .with_label_values(&[event, age])
+                        .get()
+                };
+                let before = [counter("hit"), counter("fill"), counter("evict")];
+                cache.read_through(&key, 0..BS, None, &fetch).await.unwrap();
+                settle(&cache).await;
+                let hit = cache
+                    .read_through(&key, 0..123, None, &fetch)
+                    .await
+                    .unwrap();
+                assert_eq!(hit.outcome, Outcome::Hit);
+                let partial = cache
+                    .read_through(&key, 0..2 * BS, None, &fetch)
+                    .await
+                    .unwrap();
+                assert_eq!(partial.outcome, Outcome::Partial);
+                settle(&cache).await;
+                cache.evict(cache.bucket(&key), 1);
+                assert_eq!(counter("hit") - before[0], 123 + BS, "{age} hit");
+                assert_eq!(counter("fill") - before[1], 2 * BS, "{age} fill");
+                assert_eq!(counter("evict") - before[2], 2 * BS, "{age} evict");
+                assert_eq!(cache.stats(), (4 * BS, 0, 0));
+            }
+
+            let counter = |event| {
+                metrics::QUERY_DISK_BLOCK_CACHE_AGE_BYTES_TOTAL
+                    .with_label_values(&[event, "unknown"])
+                    .get()
+            };
+            let before = [counter("hit"), counter("fill"), counter("evict")];
+            let key = "fallback-age.vix";
+            cache.read_through(key, 0..BS, None, &fetch).await.unwrap();
+            settle(&cache).await;
+            std::fs::remove_file(cache.path_for(key)).unwrap();
+            let fallback = cache.read_through(key, 0..123, None, &fetch).await.unwrap();
+            assert_eq!(fallback.outcome, Outcome::Miss);
+            assert_eq!(counter("hit"), before[0], "failed local IO is not a hit");
+            assert_eq!(counter("fill") - before[1], BS + 123);
+            assert_eq!(
+                counter("evict"),
+                before[2],
+                "IO invalidation is not capacity eviction"
+            );
+
+            let drop_dir = tempfile::tempdir().unwrap();
+            let dropping =
+                BlockCache::new(drop_dir.path().to_path_buf(), BS, 4 * BS, BS, "lru", 1, 1);
+            let before = counter("fill");
+            dropping
+                .read_through("dropped-age.vix", 0..BS, None, &fetch)
+                .await
+                .unwrap();
+            assert_eq!(dropping.stats().1, 0);
+            assert_eq!(
+                counter("fill") - before,
+                BS,
+                "remote bytes count even when the queue drops a fill"
+            );
+        });
+    }
+
+    #[test]
+    fn entry_metadata_memory_increment() {
+        // Mirror the previous fields solely to measure Rust's actual layout,
+        // including padding, on the test target rather than summing field sizes.
+        #[allow(dead_code)]
+        struct Before {
+            key: Arc<str>,
+            path: PathBuf,
+            object_size: u64,
+            block_size: u64,
+            state: Mutex<State>,
+        }
+        let before = std::mem::size_of::<Before>();
+        let after = std::mem::size_of::<Entry>();
+        assert_eq!(after - before, 2 * std::mem::size_of::<u64>());
+        eprintln!(
+            "Entry layout: before={before}, after={after}, added={} bytes",
+            after - before
+        );
+    }
 
     /// The server keeps the tier in [`GLOBAL`], so it outlives the runtime
     /// that owns its fill writers: that runtime can only shut down after

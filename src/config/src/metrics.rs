@@ -567,6 +567,20 @@ pub static QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|
     )
     .expect("Metric created")
 });
+/// Fixed labels: event = hit/fill/evict; age = lt1h/1h_6h/6h_24h/
+/// 1d_3d/3d_7d/gt7d/unknown. No object, organization or stream labels.
+pub static QUERY_DISK_BLOCK_CACHE_AGE_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_disk_block_cache_age_bytes_total",
+            "Block cache bytes by data age: local logical hits, remote fetches, capacity evictions",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["event", "age"],
+    )
+    .expect("Metric created")
+});
 /// Fetched bytes waiting for the block cache's fill writers (write-behind
 /// queue); bounded by `ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE`.
 pub static QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES: Lazy<IntGauge> = Lazy::new(|| {
@@ -2827,6 +2841,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_BLOCK_CACHE_BYTES_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_DISK_BLOCK_CACHE_AGE_BYTES_TOTAL.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_BLOCK_CACHE_FILL_QUEUE_BYTES.clone()))

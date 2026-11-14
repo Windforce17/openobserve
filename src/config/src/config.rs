@@ -3880,6 +3880,10 @@ pub struct DiskCache {
     /// a data file, an index evaluation ~2% of a sidecar).
     #[env_config(name = "ZO_DISK_CACHE_BLOCK_ENABLED", default = false)]
     pub block_enabled: bool,
+    /// Empty inherits the whole-file setting; an override affects only the
+    /// block tier. Valid overrides are lru, time_lru and fifo.
+    #[env_config(name = "ZO_DISK_CACHE_BLOCK_STRATEGY", default = "")]
+    pub block_strategy: String,
     /// Bytes; power of two in 4 KiB..=64 MiB. Smaller blocks fetch less
     /// around a read at the price of a larger per-entry bitmap. Replayed on
     /// prod files (cold open + index eval + narrow projection), bytes moved
@@ -3902,6 +3906,25 @@ pub struct DiskCache {
     /// fills took 105-120 ms.
     #[env_config(name = "ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE", default = 256)]
     pub block_fill_queue_size: usize,
+}
+
+impl DiskCache {
+    pub fn effective_block_strategy(&self) -> &str {
+        if self.block_strategy.is_empty() {
+            &self.cache_strategy
+        } else {
+            &self.block_strategy
+        }
+    }
+
+    fn validate_block_strategy(&self) -> Result<(), anyhow::Error> {
+        match self.block_strategy.as_str() {
+            "" | "lru" | "time_lru" | "fifo" => Ok(()),
+            value => Err(anyhow::anyhow!(
+                "ZO_DISK_CACHE_BLOCK_STRATEGY must be empty, lru, time_lru or fifo, got {value:?}"
+            )),
+        }
+    }
 }
 
 #[derive(Serialize, EnvConfig, Default)]
@@ -5311,6 +5334,8 @@ pub fn deverbatim(path: &Path) -> std::borrow::Cow<'_, str> {
 }
 
 fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    // Validate even when the block tier (or the entire disk cache) is off.
+    cfg.disk_cache.validate_block_strategy()?;
     std::fs::create_dir_all(&cfg.common.data_cache_dir).expect("create cache dir success");
     let cache_dir_path = Path::new(&cfg.common.data_cache_dir)
         .canonicalize()
@@ -5801,6 +5826,50 @@ mod tests {
             err.to_string()
                 .contains("ZO_MEMORY_CACHE_DATAFUSION_MEMORY_POOL")
         );
+    }
+
+    #[test]
+    fn disk_cache_block_strategy_defaults_to_inheritance() {
+        let cfg = Config::init().unwrap();
+        assert!(cfg.disk_cache.block_strategy.is_empty());
+        cfg.disk_cache.validate_block_strategy().unwrap();
+        assert_eq!(
+            cfg.disk_cache.effective_block_strategy(),
+            cfg.disk_cache.cache_strategy
+        );
+    }
+
+    #[test]
+    fn disk_cache_block_strategy_validates_and_only_overrides_blocks() {
+        for inherited in ["lru", "time_lru", "fifo"] {
+            for value in ["", "lru", "time_lru", "fifo"] {
+                let cache = DiskCache {
+                    cache_strategy: inherited.to_string(),
+                    block_strategy: value.to_string(),
+                    ..Default::default()
+                };
+                cache.validate_block_strategy().unwrap();
+                assert_eq!(
+                    cache.effective_block_strategy(),
+                    if value.is_empty() { inherited } else { value }
+                );
+                assert_eq!(cache.cache_strategy, inherited);
+            }
+        }
+    }
+
+    #[test]
+    fn disk_cache_block_strategy_rejects_invalid_values_even_when_disabled() {
+        for enabled in [false, true] {
+            for value in ["invalid", "LRU", " lru", "fifo ", " "] {
+                let mut cfg = Config::init().unwrap();
+                cfg.disk_cache.enabled = enabled;
+                cfg.disk_cache.block_enabled = enabled;
+                cfg.disk_cache.block_strategy = value.to_string();
+                let err = check_disk_cache_config(&mut cfg).unwrap_err();
+                assert!(err.to_string().contains("ZO_DISK_CACHE_BLOCK_STRATEGY"));
+            }
+        }
     }
 
     /// The block tier's budget is carved out of the disk cache BEFORE the
