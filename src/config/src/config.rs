@@ -3379,6 +3379,12 @@ pub struct Limit {
     )]
     pub vix_topn_null_group_enabled: bool,
     #[env_config(
+        name = "ZO_VIX_TOPN_EMPTY_FILTER_FIRST_ENABLED",
+        default = true,
+        help = "Evaluate exact indexed TopN filters before checking grouping columns. Proven empty files contribute no groups without opening data metadata. False restores the schema-first path. Partial, skipped and full-text filters retain the schema-first path."
+    )]
+    pub vix_topn_empty_filter_first_enabled: bool,
+    #[env_config(
         name = "ZO_VIX_AGG_SELECTED_DICTIONARY_BUDGET_ENABLED",
         default = true,
         help = "Apply aggregate dictionary group and owned-key byte budgets after bitmap selection, not to unused dictionary entries. Decoded chunk bytes remain bounded by the existing read budget. False restores the pre-selection dictionary check."
@@ -7718,6 +7724,56 @@ mod parallel_segment_setup_tests {
             assert!(
                 stdout.contains("1 passed"),
                 "child test did not run: {stdout}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod empty_topn_config_tests {
+    use super::Config;
+
+    #[test]
+    fn empty_topn_switch_is_strict_and_defaults_on() {
+        const KEY: &str = "ZO_VIX_TOPN_EMPTY_FILTER_FIRST_ENABLED";
+        const CHILD: &str = "OO_EMPTY_TOPN_CONFIG_EXPECTED";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(
+                Config::init()
+                    .unwrap()
+                    .limit
+                    .vix_topn_empty_filter_first_enabled,
+                expected == "true"
+            );
+            return;
+        }
+        for (value, expected) in [
+            (None, Some(true)),
+            (Some("true"), Some(true)),
+            (Some("false"), Some(false)),
+            (Some("1"), None),
+            (Some("yes"), None),
+            (Some("TRUE"), Some(true)),
+            (Some(""), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::empty_topn_config_tests::empty_topn_switch_is_strict_and_defaults_on",
+                ])
+                .env(CHILD, expected.unwrap_or(true).to_string())
+                .env_remove(KEY);
+            if let Some(value) = value {
+                child.env(KEY, value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
             );
         }
     }

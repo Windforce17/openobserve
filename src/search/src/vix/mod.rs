@@ -63,6 +63,8 @@ mod collect;
 #[cfg(test)]
 mod dispatch_bench;
 #[cfg(test)]
+mod empty_topn_tests;
+#[cfg(test)]
 mod query_regressions;
 #[cfg(test)]
 mod rc4_regressions;
@@ -2307,6 +2309,7 @@ async fn search_vix_docs_optimized(
 /// optimize mode). Pure and synchronous over the reader — the reader decides
 /// whether reads are in-memory or ranged, which is exactly what the
 /// cached/ranged parity tests pivot on.
+#[allow(clippy::too_many_arguments)]
 fn evaluate_vix_index(
     trace_id: &str,
     reader: &VixReader,
@@ -2317,6 +2320,33 @@ fn evaluate_vix_index(
     file_range: Option<(i64, i64)>,
     bitmap_cache_key: Option<String>,
     full_text_fields: Option<&[String]>,
+) -> anyhow::Result<RawVixResult> {
+    evaluate_vix_index_with_empty_topn(
+        trace_id,
+        reader,
+        condition,
+        idx_optimize_rule,
+        time_range,
+        file_in_range,
+        file_range,
+        bitmap_cache_key,
+        full_text_fields,
+        get_config().limit.vix_topn_empty_filter_first_enabled,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_vix_index_with_empty_topn(
+    trace_id: &str,
+    reader: &VixReader,
+    condition: &IndexCondition,
+    idx_optimize_rule: Option<IndexOptimizeMode>,
+    time_range: (i64, i64),
+    file_in_range: bool,
+    file_range: Option<(i64, i64)>,
+    bitmap_cache_key: Option<String>,
+    full_text_fields: Option<&[String]>,
+    empty_filter_first: bool,
 ) -> anyhow::Result<RawVixResult> {
     vortex_index::check_read_cancelled()?;
     let (start_time, end_time) = time_range;
@@ -2557,25 +2587,6 @@ fn evaluate_vix_index(
         .clone()
         .filter(|_| condition.is_condition_all() && file_in_range);
 
-    // every non-`_timestamp` docs column a fast path reads must exist in
-    // this file; files predating the setting fall back to a scan — EXCEPT a
-    // single-field TopN/Distinct group field, which the arms below can serve
-    // from the term dictionary (filtered via postings when a condition
-    // applies), so its absence as a docs column is not disqualifying, and
-    // the M16 count/min-max arms, which prove exact empty contributions for
-    // absent columns on columns-complete files themselves
-    if let Some(rule) = idx_optimize_rule.as_ref()
-        && index_only_field.is_none()
-        && !matches!(
-            rule,
-            IndexOptimizeMode::SimpleCountField(..) | IndexOptimizeMode::SimpleMinMax(..)
-        )
-        && let Some(field) = collect::missing_docs_column(reader, rule)?
-        && single_group_field.as_deref() != Some(field.as_str())
-    {
-        return Ok(RawVixResult::MissingColumn { field });
-    }
-
     let row_group_size = u32::try_from(reader.row_group_size())
         .ok()
         .filter(|v| *v > 0);
@@ -2664,6 +2675,50 @@ fn evaluate_vix_index(
         Ok(bitmap)
     };
 
+    // A group-by over zero exact input rows contributes no groups, even when
+    // a grouping column is absent. Inexact predicates keep the schema-first
+    // fallback; an evaluation/admission error is never an emptiness proof.
+    let early_bitmap = if empty_filter_first
+        && matches!(idx_optimize_rule.as_ref(), Some(IndexOptimizeMode::SimpleTopN(fields, ..))
+            if !fields.is_empty() && fields.len() <= config::meta::inverted_index::MAX_SIMPLE_TOPN_FIELDS)
+        && reader.has_index()
+        && !condition.is_condition_all()
+        && !condition.uses_full_text()
+        && !has_skipped
+        && condition.get_schema_fields(&[]).iter().all(|field| {
+            !reader.partial_fields().contains(field) && !reader.fts_fields().contains(field)
+        }) {
+        let bitmap = superset_bitmap(reader)?;
+        if bitmap.count_set_bits() == 0 {
+            return Ok(RawVixResult::TopN {
+                groups: Vec::new(),
+                has_skipped: false,
+            });
+        }
+        Some(reader.retain_query_bitmap(bitmap)?)
+    } else {
+        None
+    };
+
+    // every non-`_timestamp` docs column a fast path reads must exist in
+    // this file; files predating the setting fall back to a scan — EXCEPT a
+    // single-field TopN/Distinct group field, which the arms below can serve
+    // from the term dictionary (filtered via postings when a condition
+    // applies), so its absence as a docs column is not disqualifying, and
+    // the M16 count/min-max arms, which prove exact empty contributions for
+    // absent columns on columns-complete files themselves
+    if let Some(rule) = idx_optimize_rule.as_ref()
+        && index_only_field.is_none()
+        && !matches!(
+            rule,
+            IndexOptimizeMode::SimpleCountField(..) | IndexOptimizeMode::SimpleMinMax(..)
+        )
+        && let Some(field) = collect::missing_docs_column(reader, rule)?
+        && single_group_field.as_deref() != Some(field.as_str())
+    {
+        return Ok(RawVixResult::MissingColumn { field });
+    }
+
     // Residual filtering in the index phase: an aggregate over a superset
     // bitmap point-reads the candidates' predicate columns and evaluates
     // the whole condition on them (the scan branch's own physical
@@ -2727,9 +2782,10 @@ fn evaluate_vix_index(
     // every arm below reads the match set through this: the refined exact
     // bitmap when there is one, else the (exact, memoised) index bitmap
     let eval_bitmap = |reader: &VixReader| -> anyhow::Result<BooleanBuffer> {
-        match &residual {
-            Some(exact) => Ok(exact.clone()),
-            None => superset_bitmap(reader),
+        match (&early_bitmap, &residual) {
+            (Some(bitmap), _) => Ok(bitmap.as_ref().clone()),
+            (_, Some(exact)) => Ok(exact.clone()),
+            (None, None) => superset_bitmap(reader),
         }
     };
     // the query-side shortcuts (`reader.count(&query)`, single-term plist
