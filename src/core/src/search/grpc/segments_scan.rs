@@ -1870,9 +1870,15 @@ fn scan_segment_histogram(
     let decoded_frames = std::cell::Cell::new(0usize);
 
     let timestamp_only = |name: &str| name == TIMESTAMP_COL_NAME;
-    segment_wal::format::decode_segment_projected(
+    segment_wal::format::decode_segment_projected_regions(
         bytes,
         Some(&timestamp_only),
+        Some(&mut |region| {
+            Ok(region.org == org_id
+                && region.stream_type == stream_type
+                && region.stream == stream_name
+                && frame_time_overlaps_half_open(region.min_ts, region.max_ts, time_range))
+        }),
         |info| {
             if selector_error.borrow().is_some()
                 || info.org != org_id
@@ -2064,6 +2070,8 @@ fn scan_segment_object_planned(
     let mut stream_frames = 0i64;
     let mut time_frames = 0u64;
     let mut top_n_skipped_frames = 0u64;
+    let mut skipped_frames = 0u64;
+    let mut skipped_stream_frames = 0i64;
     // Decode only the columns the plans read. The predicate touches only
     // condition fields, which are a subset of `needed`, so a plan compiled
     // on the projected schema selects the same rows as one compiled on the
@@ -2074,9 +2082,29 @@ fn scan_segment_object_planned(
     } else {
         Some(&keep_column)
     };
-    segment_wal::format::decode_segment_projected(
+    segment_wal::format::decode_segment_projected_regions(
         bytes,
         columns,
+        Some(&mut |region| {
+            let identity = region.org == org_id
+                && region.stream_type == stream_type
+                && region.stream == stream_name;
+            let keep =
+                identity && frame_time_overlaps_half_open(region.min_ts, region.max_ts, time_range);
+            if !keep {
+                skipped_frames = skipped_frames
+                    .checked_add(u64::from(region.frames))
+                    .ok_or_else(|| anyhow::anyhow!("segment scan frame count overflow"))?;
+                if identity {
+                    skipped_stream_frames = skipped_stream_frames
+                        .checked_add(i64::from(region.frames))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("segment scan stream frame count overflow")
+                        })?;
+                }
+            }
+            Ok(keep)
+        }),
         |info| {
             frames_seen += 1;
             let identity =
@@ -2144,8 +2172,12 @@ fn scan_segment_object_planned(
             Ok(())
         },
     )?;
-    out.frames_seen = frames_seen;
-    out.stream_frames = stream_frames;
+    out.frames_seen = frames_seen
+        .checked_add(skipped_frames)
+        .ok_or_else(|| anyhow::anyhow!("segment scan frame count overflow"))?;
+    out.stream_frames = stream_frames
+        .checked_add(skipped_stream_frames)
+        .ok_or_else(|| anyhow::anyhow!("segment scan stream frame count overflow"))?;
     out.time_frames = time_frames;
     out.top_n_skipped_frames = top_n_skipped_frames;
     Ok(out)
@@ -4718,6 +4750,7 @@ mod tests {
 
         let mut scans = Vec::new();
         let mut histograms = Vec::new();
+        let mut boundary_scans = Vec::new();
         for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
             let encoded = encode_segment_version(&header, &frames, version).unwrap();
             let scanned = scan_segment_object(
@@ -4773,11 +4806,52 @@ mod tests {
             )
             .unwrap();
             histograms.push((histogram.histogram, histogram.rows_examined));
+            let mut boundaries = Vec::new();
+            for window in [(0, 100), (141, 150), (140, 141), (100, 100)] {
+                let scanned = scan_segment_object(
+                    &encoded,
+                    "org1",
+                    StreamType::Logs,
+                    "app1",
+                    window,
+                    Some(&condition),
+                    &plan_schema,
+                    &[],
+                    &needed,
+                    None,
+                )
+                .unwrap();
+                let histogram = scan_segment_histogram(
+                    &encoded,
+                    "org1",
+                    StreamType::Logs,
+                    "app1",
+                    window,
+                    100,
+                    10,
+                    5,
+                    0,
+                )
+                .unwrap();
+                assert_eq!(scanned.frames_seen, 3);
+                assert_eq!(scanned.stream_frames, 2);
+                boundaries.push((
+                    scanned.rows_examined,
+                    scanned.time_frames,
+                    scanned.ipc_frames,
+                    scanned.exact_rows_after_condition,
+                    histogram.histogram,
+                    histogram.rows_examined,
+                    histogram.decoded_frames,
+                ));
+            }
+            boundary_scans.push(boundaries);
         }
         assert_eq!(scans[0], scans[1]);
         assert_eq!(scans[0].0, vec![100, 120, 140]);
         assert_eq!(histograms[0], histograms[1]);
         assert_eq!(histograms[0].1, 5);
+        assert_eq!(boundary_scans[0], boundary_scans[1]);
     }
 
     #[test]

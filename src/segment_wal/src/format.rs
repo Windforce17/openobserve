@@ -87,6 +87,11 @@ pub const SEGMENT_VERSION_V2: u16 = 2;
 const FRAME_TYPE_END: u8 = 0;
 const FRAME_TYPE_DATA: u8 = 1;
 
+#[cfg(test)]
+thread_local! {
+    static RAW_FRAME_HEADER_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SegmentHeader {
     pub node_uuid: String,
@@ -380,6 +385,25 @@ pub fn decode_segment_filtered(
 pub fn decode_segment_projected(
     bytes: &[u8],
     columns: ColumnFilter<'_>,
+    want: impl FnMut(&FrameInfo) -> bool,
+    on_frame: impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
+) -> Result<SegmentHeader, anyhow::Error> {
+    decode_segment_projected_regions(bytes, columns, None, want, on_frame)
+}
+
+/// Optional conservative directory predicate. Return false only if no frame
+/// in the region is relevant, including any frame-filter side effects.
+pub type RegionFilter<'a> = Option<&'a mut dyn FnMut(&RegionInfo) -> Result<bool, anyhow::Error>>;
+
+/// Projected query decode with an independent version-2 directory predicate.
+/// The directory CRC and all region extents are always checked. Rejected
+/// regions are not read: frame headers, counts, identities, bounds and CRCs
+/// are not validated there. Use [`decode_segment`] for full validation.
+/// Version 1 never calls `regions` and retains its original validation.
+pub fn decode_segment_projected_regions(
+    bytes: &[u8],
+    columns: ColumnFilter<'_>,
+    regions: RegionFilter<'_>,
     mut want: impl FnMut(&FrameInfo) -> bool,
     mut on_frame: impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
 ) -> Result<SegmentHeader, anyhow::Error> {
@@ -389,7 +413,9 @@ pub fn decode_segment_projected(
     let payload = &bytes[r.pos..];
     match version {
         SEGMENT_VERSION_V1 => decode_payload_v1(payload, &seg, columns, &mut want, &mut on_frame)?,
-        SEGMENT_VERSION_V2 => decode_payload_v2(payload, &seg, columns, &mut want, &mut on_frame)?,
+        SEGMENT_VERSION_V2 => {
+            decode_payload_v2(payload, &seg, columns, regions, &mut want, &mut on_frame)?
+        }
         other => unreachable!("decode_header admitted unsupported version {other}"),
     }
     Ok(header)
@@ -533,14 +559,15 @@ fn decode_data_frame_streamed(
 }
 
 /// One version-2 directory entry, bounds-checked against the region area.
-struct RegionInfo {
-    org: String,
-    stream_type: StreamType,
-    stream: String,
-    min_ts: i64,
-    max_ts: i64,
-    rows: u64,
-    frames: u32,
+#[derive(Debug)]
+pub struct RegionInfo {
+    pub org: String,
+    pub stream_type: StreamType,
+    pub stream: String,
+    pub min_ts: i64,
+    pub max_ts: i64,
+    pub rows: u64,
+    pub frames: u32,
     offset: usize,
     len: usize,
 }
@@ -549,6 +576,7 @@ fn decode_payload_v2(
     payload: &[u8],
     seg: &str,
     columns: ColumnFilter<'_>,
+    mut region_filter: RegionFilter<'_>,
     want: &mut impl FnMut(&FrameInfo) -> bool,
     on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
 ) -> Result<(), anyhow::Error> {
@@ -580,6 +608,18 @@ fn decode_payload_v2(
                 region.org, region.stream_type, region.stream
             )
         };
+        if let Some(keep) = region_filter.as_mut() {
+            config::metrics::SEGMENT_SCAN_REGIONS_TOTAL.inc();
+            if !keep(region)
+                .with_context(|| format!("segment {seg}: {}: region filter failed", identity()))?
+            {
+                config::metrics::SEGMENT_SCAN_REGIONS_SKIPPED_TOTAL.inc();
+                idx = idx
+                    .checked_add(region.frames as usize)
+                    .ok_or_else(|| anyhow!("segment {seg}: frame index overflow"))?;
+                continue;
+            }
+        }
         let mut fr = Reader::new(&area[region.offset..region.offset + region.len]);
         let mut frames = 0u32;
         let mut rows = 0u64;
@@ -679,6 +719,8 @@ fn decode_data_frame_raw(
     want: &mut impl FnMut(&FrameInfo) -> bool,
     on_frame: &mut impl FnMut(SegmentFrame) -> Result<(), anyhow::Error>,
 ) -> Result<u32, anyhow::Error> {
+    #[cfg(test)]
+    RAW_FRAME_HEADER_READS.set(RAW_FRAME_HEADER_READS.get() + 1);
     let start = r.pos;
     let frame_type = r.read_u8("frame type")?;
     if frame_type != FRAME_TYPE_DATA {
@@ -2037,6 +2079,306 @@ mod tests {
         );
         let err = decode_segment(&encoded).unwrap_err();
         assert!(format!("{err:#}").contains("outside the region bounds"));
+    }
+
+    #[test]
+    fn v2_region_filter_matches_frame_filter_without_reading_skipped_headers() {
+        let h = header();
+        let frames = vec![
+            frame(
+                "o",
+                StreamType::Logs,
+                "other",
+                -10,
+                10,
+                batch_i64("v", &[1]),
+            ),
+            frame("o", StreamType::Logs, "s", 10, 20, batch_i64("v", &[2, 3])),
+            frame("x", StreamType::Logs, "s", 10, 20, batch_i64("v", &[4])),
+            frame("o", StreamType::Traces, "s", 10, 20, batch_i64("v", &[5])),
+            frame(
+                "o",
+                StreamType::Logs,
+                "s",
+                30,
+                40,
+                batch_utf8("v", &["中", "\\\""]),
+            ),
+        ];
+        let encoded = encode_segment_version(&h, &frames, SEGMENT_VERSION_V2).unwrap();
+        let wanted = |info: &FrameInfo| {
+            info.org == "o" && info.stream_type == StreamType::Logs && info.stream == "s"
+        };
+        let mut baseline = Vec::new();
+        RAW_FRAME_HEADER_READS.set(0);
+        decode_segment_projected(&encoded, None, wanted, |f| {
+            baseline.push(f);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(RAW_FRAME_HEADER_READS.get(), 5);
+
+        let mut actual = Vec::new();
+        let mut considered = 0;
+        let mut skipped = 0;
+        RAW_FRAME_HEADER_READS.set(0);
+        let decoded_header = decode_segment_projected_regions(
+            &encoded,
+            None,
+            Some(&mut |region| {
+                considered += 1;
+                let keep = region.org == "o"
+                    && region.stream_type == StreamType::Logs
+                    && region.stream == "s";
+                skipped += usize::from(!keep);
+                Ok(keep)
+            }),
+            wanted,
+            |f| {
+                actual.push(f);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_header, h);
+        assert_eq!((considered, skipped), (4, 3));
+        assert_eq!(RAW_FRAME_HEADER_READS.get(), 2);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(
+            encode_segment_version(&h, &actual, SEGMENT_VERSION_V2).unwrap(),
+            encode_segment_version(&h, &baseline, SEGMENT_VERSION_V2).unwrap()
+        );
+    }
+
+    #[test]
+    fn region_filter_half_open_boundaries_match_frame_filter() {
+        let h = header();
+        let bounds = [(i64::MIN, -1), (0, 9), (10, 10), (11, 19), (20, i64::MAX)];
+        let frames = bounds
+            .iter()
+            .enumerate()
+            .map(|(i, &(min, max))| {
+                frame(
+                    "o",
+                    StreamType::Logs,
+                    &format!("s{i}"),
+                    min,
+                    max,
+                    batch_i64("v", &[min]),
+                )
+            })
+            .collect::<Vec<_>>();
+        for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
+            let encoded = encode_segment_version(&h, &frames, version).unwrap();
+            for window in [
+                (0, 0),
+                (10, 20),
+                (10, 10),
+                (20, 10),
+                (i64::MIN, 0),
+                (20, i64::MAX),
+            ] {
+                let overlaps = |min, max| {
+                    window == (0, 0) || (window.0 < window.1 && max >= window.0 && min < window.1)
+                };
+                for projected in [false, true] {
+                    let keep_column = |_: &str| false;
+                    let columns: ColumnFilter<'_> = projected.then_some(&keep_column);
+                    let mut old = Vec::new();
+                    decode_segment_projected(
+                        &encoded,
+                        columns,
+                        |f| overlaps(f.min_ts, f.max_ts),
+                        |f| {
+                            old.push(f);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    let mut new = Vec::new();
+                    decode_segment_projected_regions(
+                        &encoded,
+                        columns,
+                        Some(&mut |r| Ok(overlaps(r.min_ts, r.max_ts))),
+                        |f| overlaps(f.min_ts, f.max_ts),
+                        |f| {
+                            new.push(f);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        encode_segment_version(&h, &old, version).unwrap(),
+                        encode_segment_version(&h, &new, version).unwrap(),
+                        "version {version}, window {window:?}, projected {projected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v1_never_calls_region_filter() {
+        let h = header();
+        let encoded = encode_segment(
+            &h,
+            &[frame(
+                "o",
+                StreamType::Logs,
+                "s",
+                1,
+                1,
+                batch_i64("v", &[1]),
+            )],
+        )
+        .unwrap();
+        let mut rows = 0;
+        decode_segment_projected_regions(
+            &encoded,
+            None,
+            Some(&mut |_| panic!("version 1 must not consult the directory predicate")),
+            |info| {
+                rows += info.rows;
+                false
+            },
+            |_| panic!("frame filter rejected this frame"),
+        )
+        .unwrap();
+        assert_eq!(rows, 1);
+        let (hdr, mut payload) = split(&encoded, &h);
+        let last = payload.len() - 2;
+        payload[last] ^= 0xff;
+        assert!(
+            decode_segment_projected_regions(
+                &reassemble(&hdr, &payload),
+                None,
+                Some(&mut |_| Ok(false)),
+                |_| false,
+                |_| Ok(())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn v2_region_filter_preserves_full_validation_entry_points() {
+        let h = header();
+        let batch = batch_i64("v", &[1, 2]);
+        for (org, max, rows, frames, expected) in [
+            ("x", 2, 2, 1, "does not match its region"),
+            ("o", 1, 2, 1, "outside the region bounds"),
+            ("o", 2, 3, 1, "directory declares"),
+            ("o", 2, 2, 3, "directory declares"),
+        ] {
+            let area = raw_data_frame("o", "logs", "s", 1, 2, 2, &ipc_bytes(&batch));
+            let encoded = raw_v2(
+                &h,
+                &[(org, "logs", "s", 1, max, rows, frames, 0, area.len() as u64)],
+                &area,
+            );
+            decode_segment_projected_regions(
+                &encoded,
+                None,
+                Some(&mut |_| Ok(false)),
+                |_| panic!("skipped region"),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let err = decode_segment(&encoded).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            let err = decode_segment_filtered(&encoded, |_| false, |_| Ok(())).unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+        let (mut encoded, area_start) = v2_two_stream_object(&h);
+        encoded[area_start] = 7;
+        decode_segment_projected_regions(
+            &encoded,
+            None,
+            Some(&mut |_| Ok(false)),
+            |_| panic!("skipped region"),
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            format!("{:#}", decode_segment(&encoded).unwrap_err()).contains("unknown frame type 7")
+        );
+    }
+
+    #[test]
+    fn v2_region_filter_still_checks_directory_and_selected_crc() {
+        let h = header();
+        let (encoded, _) = v2_two_stream_object(&h);
+        let reject_all = |bytes: &[u8]| {
+            decode_segment_projected_regions(
+                bytes,
+                None,
+                Some(&mut |_| Ok(false)),
+                |_| false,
+                |_| Ok(()),
+            )
+        };
+        let mut bad_directory = encoded.clone();
+        bad_directory[header_len(&h) + 8] ^= 1;
+        assert!(
+            format!("{:#}", reject_all(&bad_directory).unwrap_err())
+                .contains("directory crc32 mismatch")
+        );
+        assert!(
+            format!(
+                "{:#}",
+                reject_all(&encoded[..encoded.len() - 1]).unwrap_err()
+            )
+            .contains("truncated region")
+        );
+        let mut bad_crc = encoded;
+        let last = bad_crc.len() - 1;
+        bad_crc[last] ^= 1;
+        reject_all(&bad_crc).unwrap();
+        let err = decode_segment_projected_regions(
+            &bad_crc,
+            None,
+            Some(&mut |r| Ok(r.stream == "second")),
+            |_| true,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("crc32 mismatch") && msg.contains("frame 1"),
+            "{msg}"
+        );
+        assert!(format!("{:#}", decode_segment(&bad_crc).unwrap_err()).contains("crc32 mismatch"));
+    }
+
+    #[test]
+    fn region_filter_error_and_empty_segments() {
+        let h = header();
+        for version in [SEGMENT_VERSION_V1, SEGMENT_VERSION_V2] {
+            let encoded = encode_segment_version(&h, &[], version).unwrap();
+            let got = decode_segment_projected_regions(
+                &encoded,
+                None,
+                Some(&mut |_| panic!("empty segment")),
+                |_| panic!("empty segment"),
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(got, h);
+        }
+        let (encoded, _) = v2_two_stream_object(&h);
+        let err = decode_segment_projected_regions(
+            &encoded,
+            None,
+            Some(&mut |_| bail!("selector failed")),
+            |_| true,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("region 0") && msg.contains("selector failed"),
+            "{msg}"
+        );
     }
 
     #[test]
