@@ -37,7 +37,10 @@ use proto::cluster_rpc::SearchQuery;
 use vector_enrichment::TableRegistry;
 
 use crate::service::search::{
-    SearchResult, cluster::flight, datafusion::source_synthesis::expand_star_source_hits, sql::Sql,
+    SearchResult,
+    cluster::flight,
+    datafusion::source_synthesis::{expand_star_source_hits, record_batches_to_star_hits},
+    sql::Sql,
     utils::is_default_query_limit_exceeded,
 };
 
@@ -88,31 +91,35 @@ pub async fn search(
     if !merge_batches.is_empty() {
         let schema = merge_batches[0].schema();
         let batches_query_ref: Vec<&RecordBatch> = merge_batches.iter().collect();
-        let mut json_rows = record_batches_to_json_rows(&batches_query_ref)
-            .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?;
-        drop(batches_query_ref);
-        drop(merge_batches);
-
-        // Check if query limit exceeded, if so truncate and do not truncate if query is a limit
-        // query
-        let default_query_limit = config::get_config().limit.query_default_limit as usize;
-        if is_default_query_limit_exceeded(json_rows.len(), &sql) {
-            json_rows.truncate(default_query_limit);
-        }
-
-        // Row-store-driven star (DESIGN §5): a `SELECT *` plan projects the
-        // record's `_source` instead of enumerating registry fields —
-        // materialize each hit from its own record here (physical columns
-        // win on overlap), BEFORE any VRL function sees the rows. Rows
-        // without a `_source` key pass through untouched.
-        // Only a row-store star plan carries the synthetic `_source` field
-        // in its used schema (`generate_row_store_star_fields`); explicit
-        // field lists are bound from the registry, which has no `_source`.
         let star_query = sql
             .schemas
             .values()
             .any(|schema| schema.contains_field(vortex_index::SOURCE_COL_NAME));
-        let star_stats = expand_star_source_hits(&mut json_rows, star_query);
+        let cfg = config::get_config();
+        let default_query_limit = cfg.limit.query_default_limit as usize;
+        let (json_rows, star_stats) = if star_query && cfg.limit.query_star_direct_hits {
+            let num_rows = merge_batches.iter().try_fold(0usize, |total, batch| {
+                total.checked_add(batch.num_rows()).ok_or_else(|| {
+                    Error::ErrorCode(ErrorCodes::ServerInternalError(
+                        "Search result row count overflow".to_string(),
+                    ))
+                })
+            })?;
+            let max_rows =
+                is_default_query_limit_exceeded(num_rows, &sql).then_some(default_query_limit);
+            record_batches_to_star_hits(&batches_query_ref, max_rows)
+                .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?
+        } else {
+            let mut json_rows = record_batches_to_json_rows(&batches_query_ref)
+                .map_err(|e| Error::ErrorCode(ErrorCodes::ServerInternalError(e.to_string())))?;
+            if is_default_query_limit_exceeded(json_rows.len(), &sql) {
+                json_rows.truncate(default_query_limit);
+            }
+            let stats = expand_star_source_hits(&mut json_rows, star_query);
+            (json_rows, stats)
+        };
+        drop(batches_query_ref);
+        drop(merge_batches);
         if star_stats.degraded() > 0 {
             log::warn!(
                 "[trace_id {trace_id}] http->search: {} of {} star hits could not be materialized from _source (missing {}, non-string {}, unparsable {}, first parse error: {}); returned their physical columns only",

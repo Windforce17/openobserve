@@ -69,6 +69,10 @@ use datafusion::{
 };
 use vortex_index::SOURCE_COL_NAME;
 
+#[path = "star_hits.rs"]
+mod star_hits;
+pub use star_hits::record_batches_to_star_hits;
+
 /// Columns excluded from `_source` (see the module docs).
 const EXCLUDED_COLS: [&str; 3] = [ID_COL_NAME, ORIGINAL_DATA_COL_NAME, SOURCE_COL_NAME];
 
@@ -179,25 +183,32 @@ pub fn expand_star_source_hits(
             stats.non_string_source += 1;
             continue;
         };
-        match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&source) {
-            Ok(parsed) => {
-                let mut hit: serde_json::Map<String, serde_json::Value> =
-                    parsed.into_iter().filter(|(_, v)| !v.is_null()).collect();
-                // physical columns win on overlap
-                for (key, value) in std::mem::take(row) {
-                    hit.insert(key, value);
-                }
-                *row = hit;
+        expand_star_source(&source, row, &mut stats);
+    }
+    stats
+}
+
+fn expand_star_source(
+    source: &str,
+    row: &mut serde_json::Map<String, serde_json::Value>,
+    stats: &mut StarExpandStats,
+) {
+    match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(source) {
+        Ok(parsed) => {
+            let mut hit: serde_json::Map<String, serde_json::Value> =
+                parsed.into_iter().filter(|(_, v)| !v.is_null()).collect();
+            for (key, value) in std::mem::take(row) {
+                hit.insert(key, value);
             }
-            Err(e) => {
-                stats.unparsable_source += 1;
-                if stats.first_parse_error.is_none() {
-                    stats.first_parse_error = Some(e.to_string());
-                }
+            *row = hit;
+        }
+        Err(e) => {
+            stats.unparsable_source += 1;
+            if stats.first_parse_error.is_none() {
+                stats.first_parse_error = Some(e.to_string());
             }
         }
     }
-    stats
 }
 
 /// A [`PhysicalExpr`] producing the per-row `_source` JSON image of a file
