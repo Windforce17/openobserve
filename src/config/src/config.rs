@@ -2964,6 +2964,12 @@ pub struct Limit {
     )]
     pub query_skip_idle_enrich_node: bool,
     #[env_config(
+        name = "ZO_QUERY_SKIP_REDUNDANT_REPARTITION",
+        default = false,
+        help = "Skip the extra round-robin above remote scans feeding unordered hash repartition or coalesce. LIMIT, ordering-sensitive consumers, unsupported aggregates and grouping-set partial reduce retain the existing plan."
+    )]
+    pub query_skip_redundant_repartition: bool,
+    #[env_config(
         name = "ZO_QUERY_REDISPATCH_ENABLED",
         default = true,
         help = "Let the leader send a querier partition ONE more time to another querier when \
@@ -5826,6 +5832,65 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redundant_repartition_config_child() {
+        let Ok(expected) = std::env::var("OO_TEST_REDUNDANT_REPARTITION_EXPECTED") else {
+            return;
+        };
+        let cfg = Config::init().unwrap();
+        assert_eq!(
+            cfg.limit.query_skip_redundant_repartition,
+            expected == "true"
+        );
+    }
+
+    #[test]
+    fn redundant_repartition_config_default_valid_and_invalid_values() {
+        for value in [
+            None,
+            Some("false"),
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some(""),
+            Some("invalid"),
+        ] {
+            let valid = matches!(value, None | Some("false" | "true" | "TRUE"));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::tests::redundant_repartition_config_child",
+                    "--nocapture",
+                ])
+                .env(
+                    "OO_TEST_REDUNDANT_REPARTITION_EXPECTED",
+                    if matches!(value, Some("true" | "TRUE")) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .env_remove("ZO_QUERY_SKIP_REDUNDANT_REPARTITION");
+            if let Some(value) = value {
+                child.env("ZO_QUERY_SKIP_REDUNDANT_REPARTITION", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "value={value:?}, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !valid {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("ZO_QUERY_SKIP_REDUNDANT_REPARTITION")
+                );
+            }
+        }
+    }
 
     #[test]
     fn star_direct_hits_config_child() {

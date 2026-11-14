@@ -208,6 +208,8 @@ pub struct RemoteScanRewriter {
     pub remote_scan_nodes: Arc<RemoteScanNodes>,
     pub is_changed: bool,
     pub partial_reduce_enabled: bool,
+    pub skip_redundant_repartition: bool,
+    order_sensitive_ancestors: Vec<bool>,
 }
 
 impl RemoteScanRewriter {
@@ -217,6 +219,8 @@ impl RemoteScanRewriter {
             remote_scan_nodes,
             is_changed: false,
             partial_reduce_enabled: cfg.common.feature_partial_reduce_enabled,
+            skip_redundant_repartition: cfg.limit.query_skip_redundant_repartition,
+            order_sensitive_ancestors: Vec::new(),
         }
     }
 }
@@ -224,13 +228,31 @@ impl RemoteScanRewriter {
 impl TreeNodeRewriter for RemoteScanRewriter {
     type Node = Arc<dyn ExecutionPlan>;
 
+    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
+        if self.skip_redundant_repartition {
+            self.order_sensitive_ancestors.push(
+                self.order_sensitive_ancestors
+                    .last()
+                    .copied()
+                    .unwrap_or(false)
+                    || requires_legacy_arrival_order(&node),
+            );
+        }
+        Ok(Transformed::no(node))
+    }
+
     fn f_up(&mut self, node: Arc<dyn ExecutionPlan>) -> Result<Transformed<Self::Node>> {
+        let preserve_arrival_order = self.order_sensitive_ancestors.pop().unwrap_or(false);
         if node.name() == "RepartitionExec" || node.name() == "CoalescePartitionsExec" {
             let mut visitor = TableNameVisitor::new();
             node.visit(&mut visitor)?;
             if !visitor.has_remote_scan {
                 let table_name = visitor.table_name.clone().unwrap();
                 let input = node.children()[0];
+                let unsupported_grouping_reduce = self.partial_reduce_enabled
+                    && input
+                        .downcast_ref::<AggregateExec>()
+                        .is_some_and(|agg| !agg.group_expr().is_single());
                 let remote_scan_input =
                     wrap_partial_reduce(self.partial_reduce_enabled, input.clone())?;
                 let remote_scan_or_partial_reduce: Arc<dyn ExecutionPlan> =
@@ -238,12 +260,25 @@ impl TreeNodeRewriter for RemoteScanRewriter {
                         remote_scan_input,
                         self.remote_scan_nodes.get_remote_node(&table_name),
                     )?);
-                let output_partitioning =
-                    Partitioning::RoundRobinBatch(input.output_partitioning().partition_count());
-                let repartition = Arc::new(RepartitionExec::try_new(
-                    remote_scan_or_partial_reduce,
-                    output_partitioning,
-                )?);
+                let repartition = if self.skip_redundant_repartition
+                    && !preserve_arrival_order
+                    && !unsupported_grouping_reduce
+                    && remote_scan_or_partial_reduce
+                        .output_partitioning()
+                        .partition_count()
+                        > 0
+                    && accepts_remote_partitioning(&node)
+                {
+                    remote_scan_or_partial_reduce
+                } else {
+                    let output_partitioning = Partitioning::RoundRobinBatch(
+                        input.output_partitioning().partition_count(),
+                    );
+                    Arc::new(RepartitionExec::try_new(
+                        remote_scan_or_partial_reduce,
+                        output_partitioning,
+                    )?)
+                };
                 let new_node = node.replace_children(vec![repartition], datafusion::physical_plan::execution_plan::ReplaceChildrenOptions::new(datafusion::physical_plan::execution_plan::ChildrenPropertiesMode::Recompute))?;
                 self.is_changed = true;
                 return Ok(Transformed::yes(new_node));
@@ -348,6 +383,39 @@ impl TreeNodeRewriter for RemoteScanRewriter {
         }
         Ok(Transformed::no(node))
     }
+}
+
+fn requires_legacy_arrival_order(node: &Arc<dyn ExecutionPlan>) -> bool {
+    if node.fetch().is_some()
+        || matches!(
+            node.name(),
+            "GlobalLimitExec" | "LocalLimitExec" | "WindowAggExec" | "BoundedWindowAggExec"
+        )
+        || node.required_input_ordering().iter().any(Option::is_some)
+    {
+        return true;
+    }
+    // A row multiset proof is not enough for floating-point sums, ordered aggregates,
+    // or unknown UDAFs. Only allow the exact, order-independent aggregate subset.
+    node.downcast_ref::<AggregateExec>().is_some_and(|agg| {
+        agg.aggr_expr().iter().any(|expr| {
+            !matches!(expr.fun().name(), "count" | "sum" | "min" | "max")
+                || !expr.fun().order_sensitivity().is_insensitive()
+                || expr.field().data_type().is_floating()
+                || (expr.fun().name() == "sum" && !expr.field().data_type().is_integer())
+        })
+    })
+}
+
+fn accepts_remote_partitioning(parent: &Arc<dyn ExecutionPlan>) -> bool {
+    if parent.fetch().is_some() {
+        return false;
+    }
+    if let Some(repartition) = parent.downcast_ref::<RepartitionExec>() {
+        return !repartition.preserve_order()
+            && matches!(repartition.partitioning(), Partitioning::Hash(_, _));
+    }
+    parent.is::<CoalescePartitionsExec>()
 }
 
 // If partial reduce is enabled and the input is a partial aggregate, wrap it
