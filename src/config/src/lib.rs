@@ -22,6 +22,7 @@ pub mod config;
 pub mod config_path_manager;
 pub mod datafusion;
 pub mod datafusion_headroom;
+pub mod datafusion_runtime_cache;
 pub mod eval_reclaim;
 pub mod heap_profile;
 pub mod ider;
@@ -39,6 +40,7 @@ pub mod utils;
 pub use config::*;
 
 pub async fn init() -> Result<(), anyhow::Error> {
+    datafusion_runtime_cache::enabled()?;
     // init ider
     ider::init();
     // init metrics

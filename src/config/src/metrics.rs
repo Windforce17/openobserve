@@ -859,6 +859,30 @@ pub static QUERY_PARQUET_METADATA_CACHE_QUEUE_LENGTH: Lazy<IntGaugeVec> = Lazy::
     )
     .expect("Metric created")
 });
+pub static QUERY_RUNTIME_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "query_runtime_cache_used_bytes",
+            "Live opt-in RuntimeEnv cache entry bytes (keys and values).",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type"],
+    )
+    .expect("Metric created")
+});
+pub static QUERY_RUNTIME_CACHE_REQUESTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_runtime_cache_requests_total",
+            "Opt-in RuntimeEnv cache lookups.",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["cache_type", "result"],
+    )
+    .expect("Metric created")
+});
 pub static QUERY_PARQUET_METADATA_CACHE_HITS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
     IntCounterVec::new(
         Opts::new(
@@ -3092,6 +3116,12 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_PARQUET_METADATA_CACHE_QUEUE_LENGTH.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_RUNTIME_CACHE_USED_BYTES.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_RUNTIME_CACHE_REQUESTS_TOTAL.clone()))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_PARQUET_METADATA_CACHE_HITS_TOTAL.clone()))

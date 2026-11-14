@@ -282,5 +282,6 @@ async fn update_parquet_metadata_cache_metrics() -> Result<(), anyhow::Error> {
     metrics::QUERY_PARQUET_METADATA_CACHE_QUEUE_LENGTH
         .with_label_values::<&str>(&[])
         .set(i64::try_from(queue_len)?);
+    crate::service::search::datafusion::runtime_cache::update_metrics()?;
     Ok(())
 }
