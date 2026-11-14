@@ -1837,6 +1837,28 @@ impl VixReader {
         Ok(result)
     }
 
+    /// Keep one evaluated bitmap charged while subsequent reader operations run.
+    /// Dropping the owner releases both the bitmap and its query-local admission.
+    pub fn retain_query_bitmap(
+        &self,
+        bitmap: BooleanBuffer,
+    ) -> anyhow::Result<impl AsRef<BooleanBuffer>> {
+        struct RetainedBitmap {
+            bitmap: BooleanBuffer,
+            _pending: PendingMemory,
+        }
+        impl AsRef<BooleanBuffer> for RetainedBitmap {
+            fn as_ref(&self) -> &BooleanBuffer {
+                &self.bitmap
+            }
+        }
+        let pending = self.memory.reserve(bitmap.inner().capacity())?;
+        Ok(RetainedBitmap {
+            bitmap,
+            _pending: pending,
+        })
+    }
+
     /// Count matching documents. Single terms use `doc_count` metadata;
     /// writer-proven disjoint same-field value terms (including flat Exact
     /// ORs) are summed. Other matches retain exact postings unions.
