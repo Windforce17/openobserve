@@ -59,6 +59,12 @@ pub trait VixReadOperation: Send + Sync {
         Ok(())
     }
 
+    /// Nonblocking admission for optional retention. A refusal must not poison
+    /// subsequent required reads. Unknown operation owners decline by default.
+    fn try_check_memory(&self, _owned_bytes: usize) -> bool {
+        false
+    }
+
     /// Own a newly allocated IO payload until its last buffer reference drops.
     /// Shared resident bytes and opening metadata do not use this hook.
     fn reserve_io(&self, _bytes: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
@@ -156,6 +162,124 @@ pub(crate) struct PrefetchedWindows {
     /// column fetch serves the next conjunct's). Bounded by the caller's
     /// read plan; never reader state.
     records: bool,
+    memo: Option<BoundedReadMemo>,
+}
+
+/// Compact copies avoid retaining an arbitrarily large source allocation through
+/// a small Bytes slice. Reservations follow the copies through cache-hit slices.
+struct BoundedReadMemo {
+    state: parking_lot::Mutex<ReadMemoState>,
+    memory: Arc<crate::reader::ReaderMemory>,
+    max_bytes: usize,
+    max_entries: usize,
+    _metadata: crate::reader::PendingMemory,
+}
+
+struct ReadMemoState {
+    windows: Vec<(Range<u64>, Bytes)>,
+    bytes: usize,
+    entries: usize,
+}
+
+impl BoundedReadMemo {
+    // Bytes' shared allocation and the PendingMemory owner are separately owned
+    // from the range vector. Include both headers in each payload reservation.
+    const PAYLOAD_OVERHEAD: usize = std::mem::size_of::<Bytes>()
+        + std::mem::size_of::<crate::reader::PendingMemory>()
+        + 8 * std::mem::size_of::<usize>();
+
+    fn new(
+        memory: Arc<crate::reader::ReaderMemory>,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Option<Self> {
+        let metadata = max_entries
+            .checked_mul(std::mem::size_of::<(Range<u64>, Bytes)>())?
+            .checked_add(std::mem::size_of::<PrefetchedWindows>())?
+            .checked_add(2 * std::mem::size_of::<usize>())?;
+        if metadata > max_bytes {
+            return None;
+        }
+        let pending = Self::reserve(&memory, metadata, current_read_operation().as_deref())?;
+        Some(Self {
+            state: parking_lot::Mutex::new(ReadMemoState {
+                windows: Vec::with_capacity(max_entries),
+                bytes: metadata,
+                entries: 0,
+            }),
+            memory,
+            max_bytes,
+            max_entries,
+            _metadata: pending,
+        })
+    }
+
+    fn reserve(
+        memory: &Arc<crate::reader::ReaderMemory>,
+        bytes: usize,
+        operation: Option<&dyn VixReadOperation>,
+    ) -> Option<crate::reader::PendingMemory> {
+        memory
+            .reserve_with(bytes, |owned| {
+                if operation.is_none_or(|op| !op.is_cancelled() && op.try_check_memory(owned)) {
+                    Ok(())
+                } else {
+                    Err(VixError::InvalidQuery(
+                        "optional read memory refused".into(),
+                    ))
+                }
+            })
+            .ok()
+    }
+
+    fn covering(&self, range: &Range<u64>) -> Option<Bytes> {
+        self.state
+            .lock()
+            .windows
+            .iter()
+            .find(|(window, _)| window.start <= range.start && range.end <= window.end)
+            .map(|(window, bytes)| {
+                bytes.slice(
+                    (range.start - window.start) as usize..(range.end - window.start) as usize,
+                )
+            })
+    }
+
+    fn record(&self, range: Range<u64>, bytes: &Bytes, operation: Option<&dyn VixReadOperation>) {
+        if range.is_empty() {
+            return;
+        }
+        let Some(charge) = bytes.len().checked_add(Self::PAYLOAD_OVERHEAD) else {
+            return;
+        };
+        {
+            let mut state = self.state.lock();
+            if state.entries >= self.max_entries
+                || charge > self.max_bytes.saturating_sub(state.bytes)
+                || state
+                    .windows
+                    .iter()
+                    .any(|(window, _)| window.start <= range.start && range.end <= window.end)
+            {
+                return;
+            }
+            // Include in-flight copies in the bound without holding the mutex
+            // during operation admission, allocation, or any underlying IO.
+            state.entries += 1;
+            state.bytes += charge;
+        }
+        match Self::reserve(&self.memory, charge, operation) {
+            Some(pending) => {
+                let copy = pending.own(Bytes::copy_from_slice(bytes));
+                self.state.lock().windows.push((range, copy));
+            }
+            None => {
+                let mut state = self.state.lock();
+                state.entries -= 1;
+                state.bytes -= charge;
+            }
+        }
+    }
 }
 
 impl PrefetchedWindows {
@@ -163,6 +287,7 @@ impl PrefetchedWindows {
         Arc::new(Self {
             windows: parking_lot::RwLock::new(Vec::new()),
             records: false,
+            memo: None,
         })
     }
 
@@ -171,7 +296,21 @@ impl PrefetchedWindows {
         Arc::new(Self {
             windows: parking_lot::RwLock::new(Vec::new()),
             records: true,
+            memo: None,
         })
+    }
+
+    pub(crate) fn bounded_recording(
+        memory: Arc<crate::reader::ReaderMemory>,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Option<Arc<Self>> {
+        let memo = BoundedReadMemo::new(memory, max_bytes, max_entries)?;
+        Some(Arc::new(Self {
+            windows: parking_lot::RwLock::new(Vec::new()),
+            records: true,
+            memo: Some(memo),
+        }))
     }
 
     pub(crate) fn records(&self) -> bool {
@@ -193,6 +332,10 @@ impl PrefetchedWindows {
         operation: Option<&dyn VixReadOperation>,
     ) -> Result<()> {
         debug_assert_eq!(bytes.len() as u64, range.end - range.start);
+        if let Some(memo) = &self.memo {
+            memo.record(range, &bytes, operation);
+            return Ok(());
+        }
         if range.is_empty() {
             return Ok(());
         }
@@ -235,6 +378,9 @@ impl PrefetchedWindows {
 
     /// The bytes of `range` when a single window covers all of it.
     pub(crate) fn covering(&self, range: &Range<u64>) -> Option<Bytes> {
+        if let Some(memo) = &self.memo {
+            return memo.covering(range);
+        }
         let windows = self.windows.read();
         let index = windows
             .partition_point(|(window, _)| window.start <= range.start)
@@ -1502,7 +1648,10 @@ impl VortexReadAt for BlobReadAt {
                     .await?;
                     // a recording window set keeps what this scan fetched for
                     // the scans that follow it on the same handle
-                    if let Some(windows) = prefetched.as_ref().filter(|w| w.records()) {
+                    if let Some(windows) = prefetched
+                        .as_ref()
+                        .filter(|w| w.records() && (!opening || w.memo.is_none()))
+                    {
                         // Opening reads are admitted by OpeningMemory, so a
                         // merged copy of them does not take a second IO charge.
                         let charge_to = if opening { None } else { operation.as_deref() };
@@ -1571,6 +1720,307 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    struct MemoSource {
+        reads: parking_lot::Mutex<Vec<Range<u64>>>,
+        value: u8,
+    }
+
+    impl VixRangeSource for MemoSource {
+        fn len(&self) -> u64 {
+            1024
+        }
+        fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+            self.reads.lock().push(range.clone());
+            futures::future::ready(Ok(Bytes::from(vec![
+                self.value;
+                (range.end - range.start) as usize
+            ])))
+            .boxed()
+        }
+    }
+
+    fn memo_read(blob: &RangedBlob, offset: u64) {
+        let bytes =
+            futures::executor::block_on(blob.read_at().read_at(offset, 32, Alignment::none()))
+                .unwrap()
+                .unwrap_host();
+        assert_eq!(bytes.len(), 32);
+    }
+
+    fn memo_accounted(memory: &Arc<crate::reader::ReaderMemory>) -> usize {
+        let mut total = 0;
+        let _pending = memory
+            .reserve_with(0, |owned| {
+                total = owned;
+                Ok(())
+            })
+            .unwrap();
+        total
+    }
+
+    #[test]
+    fn bounded_memo_reads_each_range_once_and_restores_nested_scopes() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let source = Arc::new(MemoSource {
+            reads: parking_lot::Mutex::new(Vec::new()),
+            value: 7,
+        });
+        let blob = RangedBlob::new(source.clone(), 0..1024);
+        let other = RangedBlob::new(source.clone(), 0..1024);
+        let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+        {
+            let _scope = blob.prefetch_scope(windows.clone());
+            for offset in [0, 32, 0, 32] {
+                memo_read(&blob, offset);
+            }
+            assert_eq!(*source.reads.lock(), vec![0..32, 32..64]);
+            assert_eq!(windows.covering(&(8..16)).unwrap().as_ref(), &[7; 8]);
+            let nested = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+            {
+                let _nested = other.prefetch_scope(nested);
+                memo_read(&other, 0);
+                memo_read(&other, 0);
+            }
+            memo_read(&blob, 0);
+            assert_eq!(source.reads.lock().len(), 3);
+        }
+        assert!(memo_accounted(&memory) > baseline);
+        drop(windows);
+        assert_eq!(memo_accounted(&memory), baseline);
+        memo_read(&blob, 0);
+        assert_eq!(source.reads.lock().len(), 4, "no cross-evaluation reuse");
+    }
+
+    #[test]
+    fn bounded_memo_byte_and_entry_limits_reread_without_error() {
+        for entry_limit in [true, false] {
+            let memory = Arc::new(crate::reader::ReaderMemory::new());
+            let entries = if entry_limit { 1 } else { 8 };
+            let metadata = PrefetchedWindows::bounded_recording(memory.clone(), 4096, entries)
+                .unwrap()
+                .memo
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .bytes;
+            let max_bytes = if entry_limit {
+                4096
+            } else {
+                metadata + 32 + BoundedReadMemo::PAYLOAD_OVERHEAD
+            };
+            let source = Arc::new(MemoSource {
+                reads: parking_lot::Mutex::new(Vec::new()),
+                value: 7,
+            });
+            let blob = RangedBlob::new(source.clone(), 0..1024);
+            let windows = PrefetchedWindows::bounded_recording(memory, max_bytes, entries).unwrap();
+            let _scope = blob.prefetch_scope(windows.clone());
+            for offset in [0, 32, 0, 32] {
+                memo_read(&blob, offset);
+            }
+            assert_eq!(*source.reads.lock(), vec![0..32, 32..64, 32..64]);
+            assert_eq!(windows.covering(&(0..32)).unwrap().as_ref(), &[7; 32]);
+            assert!(windows.covering(&(32..64)).is_none());
+            assert!(windows.memo.as_ref().unwrap().state.lock().bytes <= max_bytes);
+        }
+    }
+
+    struct MemoBudget(AtomicUsize);
+
+    impl VixReadOperation for MemoBudget {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+        fn try_check_memory(&self, bytes: usize) -> bool {
+            bytes <= self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn bounded_memo_budget_refusal_is_optional_and_releases_reservations() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let operation = Arc::new(MemoBudget(AtomicUsize::new(0)));
+        with_read_operation(operation.clone(), || {
+            assert!(PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).is_none());
+            assert_eq!(memo_accounted(&memory), baseline);
+            operation.0.store(usize::MAX, Ordering::SeqCst);
+            let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+            let metadata = memo_accounted(&memory);
+            operation.0.store(metadata, Ordering::SeqCst);
+            let source = Arc::new(MemoSource {
+                reads: parking_lot::Mutex::new(Vec::new()),
+                value: 7,
+            });
+            let blob = RangedBlob::new(source.clone(), 0..1024);
+            {
+                let _scope = blob.prefetch_scope(windows.clone());
+                memo_read(&blob, 0);
+                memo_read(&blob, 0);
+            }
+            assert_eq!(source.reads.lock().len(), 2);
+            assert!(windows.covering(&(0..32)).is_none());
+            assert_eq!(memo_accounted(&memory), metadata);
+            assert_eq!(windows.memo.as_ref().unwrap().state.lock().entries, 0);
+            drop(windows);
+            assert_eq!(memo_accounted(&memory), baseline);
+        });
+    }
+
+    #[test]
+    fn bounded_memo_compact_copy_and_slice_keep_their_memory_owner() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+        let source = Bytes::from(vec![9; 1024 * 1024]);
+        let original = source.slice(123..155);
+        windows.add(0..32, original.clone()).unwrap();
+        let hit = windows.covering(&(8..16)).unwrap();
+        assert_eq!(hit.as_ref(), &[9; 8]);
+        assert_ne!(hit.as_ptr(), original.slice(8..16).as_ptr());
+        drop(windows);
+        assert_eq!(
+            memo_accounted(&memory),
+            baseline + 32 + BoundedReadMemo::PAYLOAD_OVERHEAD
+        );
+        drop(hit);
+        assert_eq!(memo_accounted(&memory), baseline);
+    }
+
+    #[test]
+    fn bounded_memo_error_and_unwind_drop_scope_without_cross_evaluation_reuse() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let source = Arc::new(MemoSource {
+            reads: parking_lot::Mutex::new(Vec::new()),
+            value: 7,
+        });
+        let blob = RangedBlob::new(source.clone(), 0..1024);
+        for panic in [false, true] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let windows =
+                    PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+                let _scope = blob.prefetch_scope(windows);
+                memo_read(&blob, 0);
+                memo_read(&blob, 0);
+                assert!(!panic, "injected visitor panic");
+                Err::<(), _>(anyhow::anyhow!("injected visitor error"))
+            }));
+            if panic {
+                assert!(outcome.is_err());
+            } else {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert_eq!(memo_accounted(&memory), baseline);
+            source.reads.lock().clear();
+            memo_read(&blob, 0);
+            memo_read(&blob, 0);
+            assert_eq!(source.reads.lock().len(), 2);
+        }
+    }
+
+    #[test]
+    fn bounded_memo_failed_and_dropped_io_release_all_owners() {
+        struct FaultSource(bool);
+        impl VixRangeSource for FaultSource {
+            fn len(&self) -> u64 {
+                1024
+            }
+            fn fetch(&self, _range: Range<u64>) -> BoxFuture<'static, anyhow::Result<Bytes>> {
+                if self.0 {
+                    futures::future::pending().boxed()
+                } else {
+                    futures::future::ready(Err(anyhow::anyhow!("injected IO error"))).boxed()
+                }
+            }
+        }
+
+        for pending in [false, true] {
+            let memory = Arc::new(crate::reader::ReaderMemory::new());
+            let baseline = memo_accounted(&memory);
+            let blob = RangedBlob::new(Arc::new(FaultSource(pending)), 0..1024);
+            let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+            let scope = blob.prefetch_scope(windows);
+            let mut read = blob.read_at().read_at(0, 32, Alignment::none());
+            if pending {
+                assert!(read.as_mut().now_or_never().is_none());
+            } else {
+                assert!(read.as_mut().now_or_never().unwrap().is_err());
+            }
+            drop(scope);
+            if pending {
+                assert!(memo_accounted(&memory) > baseline);
+            }
+            drop(read);
+            assert_eq!(memo_accounted(&memory), baseline);
+        }
+    }
+
+    #[test]
+    fn bounded_memo_cancelled_hits_do_not_read_or_leak() {
+        struct Cancelled(std::sync::atomic::AtomicBool);
+        impl VixReadOperation for Cancelled {
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+            fn try_check_memory(&self, _bytes: usize) -> bool {
+                !self.is_cancelled()
+            }
+        }
+
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let source = Arc::new(MemoSource {
+            reads: parking_lot::Mutex::new(Vec::new()),
+            value: 7,
+        });
+        let blob = RangedBlob::new(source.clone(), 0..1024);
+        let operation = Arc::new(Cancelled(std::sync::atomic::AtomicBool::new(false)));
+        with_read_operation(operation.clone(), || {
+            let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 8).unwrap();
+            let _scope = blob.prefetch_scope(windows);
+            memo_read(&blob, 0);
+            operation.0.store(true, Ordering::SeqCst);
+            assert!(
+                futures::executor::block_on(blob.read_at().read_at(0, 32, Alignment::none()))
+                    .is_err()
+            );
+            assert_eq!(source.reads.lock().len(), 1);
+        });
+        assert_eq!(memo_accounted(&memory), baseline);
+    }
+
+    #[test]
+    fn bounded_memo_concurrent_recording_stays_within_both_limits() {
+        let memory = Arc::new(crate::reader::ReaderMemory::new());
+        let baseline = memo_accounted(&memory);
+        let windows = PrefetchedWindows::bounded_recording(memory.clone(), 4096, 4).unwrap();
+        std::thread::scope(|threads| {
+            for i in 0..16u8 {
+                let windows = &windows;
+                threads.spawn(move || {
+                    let offset = u64::from(i) * 32;
+                    windows
+                        .add(offset..offset + 32, Bytes::from(vec![i; 32]))
+                        .unwrap();
+                });
+            }
+        });
+        {
+            let state = windows.memo.as_ref().unwrap().state.lock();
+            assert_eq!(state.entries, 4);
+            assert_eq!(state.windows.len(), 4);
+            assert!(state.bytes <= 4096);
+            for (range, bytes) in &state.windows {
+                assert_eq!(bytes.as_ref(), &[(range.start / 32) as u8; 32]);
+            }
+        }
+        drop(windows);
+        assert_eq!(memo_accounted(&memory), baseline);
+    }
 
     struct IoBudget {
         live: Arc<AtomicUsize>,

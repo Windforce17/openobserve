@@ -3373,6 +3373,12 @@ pub struct Limit {
     )]
     pub inverted_index_topn_max_group_num: usize,
     #[env_config(
+        name = "ZO_VIX_GROUP_READ_MEMO_ENABLED",
+        default = true,
+        help = "Reuse already-read docs ranges within one dictionary group evaluation. Retention is limited to 8 MiB including metadata and charged to the read memory budget; refused retention rereads normally. False restores independent reads for each logical segment."
+    )]
+    pub vix_group_read_memo_enabled: bool,
+    #[env_config(
         name = "ZO_VIX_TOPN_NULL_GROUP_ENABLED",
         default = true,
         help = "Preserve a separate SQL NULL group in exact TopN partial results. NULL counts require complete raw-string index coverage or selected stored values. False restores NULL-triggered scan fallback. Empty strings remain distinct from NULL; missing stored columns still require a scan."
@@ -7674,11 +7680,57 @@ mod tests {
     fn rc4_exact_aggregation_defaults_keep_group_budget_conservative() {
         let cfg = Config::init().unwrap();
         assert_eq!(cfg.limit.inverted_index_topn_max_group_num, 1000);
+        assert!(cfg.limit.vix_group_read_memo_enabled);
         assert!(cfg.limit.vix_topn_null_group_enabled);
         assert!(cfg.limit.vix_agg_selected_dictionary_budget_enabled);
         assert!(cfg.limit.vix_agg_early_cardinality_check_enabled);
         assert_eq!(cfg.limit.vix_agg_reject_cache_entries, 4096);
         assert!(cfg.limit.vix_agg_staged_probe_enabled);
+    }
+
+    #[test]
+    fn group_read_memo_env_probe() {
+        let Ok(expected) = std::env::var("OO_TEST_GROUP_READ_MEMO_EXPECTED") else {
+            return;
+        };
+        let limit = Limit::init().expect("ZO_VIX_GROUP_READ_MEMO_ENABLED parse failed");
+        assert_eq!(
+            limit.vix_group_read_memo_enabled,
+            expected.parse::<bool>().unwrap()
+        );
+    }
+
+    #[test]
+    fn group_read_memo_env_defaults_on_and_rejects_invalid_values() {
+        for (value, expected) in [
+            (None, Some(true)),
+            (Some("true"), Some(true)),
+            (Some("false"), Some(false)),
+            (Some("1"), None),
+            (Some("yes"), None),
+            (Some("TRUE"), None),
+            (Some(""), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "config::tests::group_read_memo_env_probe"])
+                .env(
+                    "OO_TEST_GROUP_READ_MEMO_EXPECTED",
+                    expected.unwrap_or(false).to_string(),
+                )
+                .env_remove("ZO_VIX_GROUP_READ_MEMO_ENABLED");
+            if let Some(value) = value {
+                child.env("ZO_VIX_GROUP_READ_MEMO_ENABLED", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }
 

@@ -269,7 +269,7 @@ impl PendingMemory {
         self
     }
 
-    fn own(self, bytes: Bytes) -> Bytes {
+    pub(crate) fn own(self, bytes: Bytes) -> Bytes {
         struct Owner {
             bytes: Bytes,
             _pending: PendingMemory,
@@ -4337,6 +4337,26 @@ impl VixReader {
             )));
         }
         Ok(chunks)
+    }
+
+    /// Reuse already-read docs ranges only during this synchronous evaluation.
+    /// Admission failure disables retention, never the underlying read. The
+    /// 8 MiB bound includes compact payloads, owners and the 256-entry vector.
+    pub fn with_docs_read_memo<T>(&self, enabled: bool, work: impl FnOnce() -> T) -> T {
+        let _scope = if enabled {
+            match &self.docs_blob {
+                BlobHandle::Ranged(blob) => crate::source::PrefetchedWindows::bounded_recording(
+                    Arc::clone(&self.memory),
+                    8 * 1024 * 1024,
+                    256,
+                )
+                .map(|windows| blob.prefetch_scope(windows)),
+                BlobHandle::Mem(_) => None,
+            }
+        } else {
+            None
+        };
+        work()
     }
 
     /// Stream aligned dictionary codes and optional timestamps over exactly

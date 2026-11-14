@@ -302,6 +302,14 @@ impl vortex_index::VixReadOperation for ReadOperation {
         }
         Ok(())
     }
+    fn try_check_memory(&self, owned_bytes: usize) -> bool {
+        !self.is_cancelled()
+            && self
+                .evaluation
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|memory| memory.try_check(owned_bytes))
+    }
 }
 
 pub(crate) struct ReadOperationGuard(Arc<ReadOperation>);
@@ -731,6 +739,17 @@ impl EvaluationMemory {
             *refusal = error.downcast_ref::<EvaluationMemoryExhausted>().copied();
         }
         result
+    }
+
+    fn try_check(&self, owned_bytes: usize) -> bool {
+        let Some(refusal) = self.refusal.try_lock() else {
+            return false;
+        };
+        refusal.is_none()
+            && self
+                .bytes
+                .try_lock()
+                .is_some_and(|mut bytes| bytes.try_resize(owned_bytes).is_ok())
     }
 }
 
@@ -1588,6 +1607,91 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(third.check_refusal().is_err(), "refusal stays sticky");
         drop(third);
+        drop(first);
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_optional_budget_refusal_does_not_poison_required_reads() {
+        use vortex_index::VixReadOperation;
+
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation =
+            ReadOperation::new(Arc::new(FetchStats::default()), None).for_evaluation(&permit);
+        assert!(operation.try_check_memory(16));
+        assert_eq!(pool.state.lock().used, 16);
+        assert!(!operation.try_check_memory(33));
+        assert_eq!(pool.state.lock().used, 16);
+        permit.check_refusal().unwrap();
+        operation.check_memory(24).unwrap();
+        assert_eq!(pool.state.lock().used, 24);
+        operation.cancel();
+        assert!(!operation.try_check_memory(25));
+        assert_eq!(pool.state.lock().used, 24);
+        drop(operation);
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_declines_without_live_evaluation_or_during_required_growth() {
+        use vortex_index::VixReadOperation;
+
+        let root = ReadOperation::new(Arc::new(FetchStats::default()), None);
+        assert!(!root.try_check_memory(16));
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation = root.for_evaluation(&permit);
+        assert!(operation.try_check_memory(16));
+        {
+            let _required_growth = permit.memory.refusal.lock();
+            assert!(!operation.try_check_memory(24));
+        }
+        {
+            let _required_growth = permit.memory.bytes.lock();
+            assert!(!operation.try_check_memory(24));
+        }
+        assert_eq!(pool.state.lock().used, 16);
+        assert!(operation.try_check_memory(24));
+        assert!(operation.try_check_memory(8));
+        assert_eq!(pool.state.lock().used, 24, "optional checks cannot shrink");
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+        assert!(
+            !operation.try_check_memory(16),
+            "expired owners cannot admit"
+        );
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_shared_pool_and_sticky_required_refusal_stay_exact() {
+        use vortex_index::VixReadOperation;
+
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(2));
+        let first = evaluation_fixture(&pool, &count);
+        let second = evaluation_fixture(&pool, &count);
+        let operation =
+            ReadOperation::new(Arc::new(FetchStats::default()), None).for_evaluation(&first);
+        second.reserve_owned(16).unwrap();
+        assert!(operation.try_check_memory(8));
+        assert!(!operation.try_check_memory(17));
+        assert_eq!(pool.state.lock().used, 24);
+        first.check_refusal().unwrap();
+        operation.check_memory(16).unwrap();
+        assert_eq!(pool.state.lock().used, 32);
+        drop(second);
+        assert!(operation.try_check_memory(24));
+        assert!(operation.check_memory(33).is_err());
+        assert!(
+            !operation.try_check_memory(8),
+            "required refusal stays sticky"
+        );
+        assert_eq!(pool.state.lock().used, 24);
         drop(first);
         assert_eq!(pool.state.lock().used, 0);
     }
