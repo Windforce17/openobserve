@@ -178,6 +178,14 @@ impl ReaderMemory {
     }
 
     fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<Option<PendingMemory>> {
+        self.try_reserve_with(bytes, crate::source::try_check_read_memory)
+    }
+
+    pub(crate) fn try_reserve_with(
+        self: &Arc<Self>,
+        bytes: usize,
+        check: impl FnOnce(usize) -> Result<bool>,
+    ) -> Result<Option<PendingMemory>> {
         let previous = self
             .total
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
@@ -188,7 +196,7 @@ impl ReaderMemory {
             memory: Arc::clone(self),
             bytes,
         };
-        if !crate::source::try_check_read_memory(previous + bytes)? {
+        if !check(previous + bytes)? {
             return Ok(None);
         }
         self.peak.fetch_max(previous + bytes, Ordering::AcqRel);
@@ -287,7 +295,7 @@ impl PendingMemory {
         self
     }
 
-    fn own(self, bytes: Bytes) -> Bytes {
+    pub(crate) fn own(self, bytes: Bytes) -> Bytes {
         struct Owner {
             bytes: Bytes,
             _pending: PendingMemory,
@@ -4470,6 +4478,30 @@ impl VixReader {
             )));
         }
         Ok(chunks)
+    }
+
+    /// Reuse already-read docs ranges only during this synchronous evaluation.
+    /// Optional refusal disables retention; cancellation and admission errors
+    /// propagate. The 8 MiB bound includes payloads, owners and the range vector.
+    pub fn with_docs_read_memo<T>(
+        &self,
+        enabled: bool,
+        work: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let _scope = if enabled {
+            match &self.docs_blob {
+                BlobHandle::Ranged(blob) => crate::source::PrefetchedWindows::bounded_recording(
+                    Arc::clone(&self.memory),
+                    8 * 1024 * 1024,
+                    256,
+                )?
+                .map(|windows| blob.prefetch_scope(windows)),
+                BlobHandle::Mem(_) => None,
+            }
+        } else {
+            None
+        };
+        work()
     }
 
     /// Stream aligned dictionary codes and optional timestamps over exactly

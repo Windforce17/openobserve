@@ -295,12 +295,16 @@ impl vortex_index::VixReadOperation for ReadOperation {
         if self.is_cancelled() {
             return Err(vortex_index::VixError::Cancelled);
         }
-        match self.evaluation.as_ref().and_then(Weak::upgrade) {
+        let result = match self.evaluation.as_ref().and_then(Weak::upgrade) {
             Some(memory) => memory
                 .try_check(owned_bytes)
                 .map_err(vortex_index::VixError::Callback),
-            None => Ok(true),
+            None => Ok(false),
+        };
+        if self.is_cancelled() {
+            return Err(vortex_index::VixError::Cancelled);
         }
+        result
     }
     fn check_memory(&self, owned_bytes: usize) -> vortex_index::Result<()> {
         if self.is_cancelled() {
@@ -727,11 +731,16 @@ struct EvaluationMemory {
 
 impl EvaluationMemory {
     fn try_check(&self, owned_bytes: usize) -> anyhow::Result<bool> {
-        let refusal = self.refusal.lock();
+        let Some(refusal) = self.refusal.try_lock() else {
+            return Ok(false);
+        };
         if let Some(error) = *refusal {
             return Err(error.into());
         }
-        Ok(self.bytes.lock().try_resize(owned_bytes).is_ok())
+        let Some(mut bytes) = self.bytes.try_lock() else {
+            return Ok(false);
+        };
+        Ok(bytes.try_resize(owned_bytes).is_ok())
     }
 
     /// Charge `owned_bytes` of absolute reader ownership, waiting briefly for
@@ -1543,6 +1552,185 @@ mod tests {
     }
 
     #[test]
+    fn topn_memo_and_retained_postings_share_one_evaluation_budget() {
+        use std::sync::atomic::AtomicUsize;
+
+        use arrow::{
+            array::{Int64Array, RecordBatch, StringArray},
+            buffer::BooleanBuffer,
+            datatypes::{DataType, Field, Schema},
+        };
+        use vortex_index::{VixQuery, VixReadOperation, VixReader, VixWriter, VixWriterOptions};
+
+        struct ObservedOperation {
+            operation: Arc<ReadOperation>,
+            last: AtomicUsize,
+            optional: Mutex<Vec<usize>>,
+        }
+        impl VixReadOperation for ObservedOperation {
+            fn is_cancelled(&self) -> bool {
+                self.operation.is_cancelled()
+            }
+            fn check_memory(&self, owned: usize) -> vortex_index::Result<()> {
+                self.operation.check_memory(owned)?;
+                self.last.store(owned, Ordering::SeqCst);
+                Ok(())
+            }
+            fn try_check_memory(&self, owned: usize) -> vortex_index::Result<bool> {
+                let admitted = self.operation.try_check_memory(owned)?;
+                if admitted {
+                    self.optional.lock().push(owned);
+                }
+                Ok(admitted)
+            }
+        }
+        // An empty bitmap issues an exact zero-growth ReaderMemory snapshot.
+        fn owned(reader: &VixReader, operation: &ObservedOperation) -> usize {
+            drop(
+                reader
+                    .retain_query_bitmap(BooleanBuffer::new_unset(0))
+                    .unwrap(),
+            );
+            operation.last.load(Ordering::SeqCst)
+        }
+        const ROWS: usize = 600_003;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("filter", DataType::Utf8, false),
+            Field::new("group", DataType::Utf8, false),
+        ]));
+        let chosen =
+            |row: usize| (row.wrapping_mul(1_664_525).wrapping_add(1_013_904_223) >> 16) & 1 == 0;
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values((1..=ROWS as i64).rev())),
+                Arc::new(StringArray::from_iter_values(
+                    (0..ROWS).map(|row| if chosen(row) { "yes" } else { "no" }),
+                )),
+                Arc::new(StringArray::from_iter_values(
+                    (0..ROWS).map(|row| ["a", "b", "c"][row % 3]),
+                )),
+            ],
+        )
+        .unwrap();
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                postings_plist_min_docs: 1,
+                docs_chunk_max_rows: 90_001,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(
+                &batch,
+                &StringArray::from_iter_values(std::iter::repeat_n("{}", ROWS)),
+                None,
+            )
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let reader = VixReader::open_ranged_with_index_sidecar_first(
+            vortex_index::BytesRangeSource::new("data", data.into()),
+            index.map(|bytes| vortex_index::BytesRangeSource::new("index", bytes.into())),
+            true,
+        )
+        .unwrap();
+        let pool = ByteGate::new(256 * 1024 * 1024);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation = Arc::new(ObservedOperation {
+            operation: ReadOperation::new(Arc::new(FetchStats::default()), None)
+                .for_evaluation(&permit),
+            last: AtomicUsize::new(0),
+            optional: Mutex::new(Vec::new()),
+        });
+        vortex_index::with_read_operation(operation.clone(), || {
+            let query = VixQuery::Exact {
+                field: "filter".into(),
+                token: b"yes".to_vec(),
+            };
+            let bitmap = reader
+                .retain_query_bitmap(reader.eval(&query).unwrap())
+                .unwrap();
+            let bitmap_charge = bitmap.as_ref().inner().capacity();
+            let topn = || {
+                let mut rows = super::super::collect::simple_top_n(
+                    &reader,
+                    bitmap.as_ref(),
+                    &["group".into()],
+                    10,
+                    false,
+                )
+                .unwrap();
+                rows.sort();
+                rows
+            };
+            let expected = topn(); // Warm lazy metadata before comparing ownership.
+            let cursor = reader.single_term_plist_cursor(&query).unwrap().unwrap();
+            let baseline = owned(&reader, &operation);
+            cursor.ranks(&[200_000, 400_000, 599_000]).unwrap();
+            let with_cursor = owned(&reader, &operation);
+            let cursor_charge = with_cursor.checked_sub(baseline).unwrap();
+            assert!(
+                cursor_charge > 0,
+                "fixture must retain a remote postings window"
+            );
+            operation.optional.lock().clear();
+            assert_eq!(topn(), expected);
+            let combined = operation.optional.lock().clone();
+            assert!(
+                combined.len() > 1,
+                "TopN must admit memo metadata and payloads"
+            );
+            assert_eq!(
+                owned(&reader, &operation),
+                with_cursor,
+                "memo releases while cursor stays alive"
+            );
+            assert!(pool.state.lock().used >= *combined.iter().max().unwrap());
+            drop(cursor);
+            assert_eq!(
+                owned(&reader, &operation),
+                baseline,
+                "cursor releases its own window"
+            );
+            operation.optional.lock().clear();
+            assert_eq!(topn(), expected);
+            let memo_only = operation.optional.lock().clone();
+            assert_eq!(combined.len(), memo_only.len());
+            for (both, memo) in combined.iter().zip(&memo_only) {
+                assert_eq!(
+                    both - memo,
+                    cursor_charge,
+                    "every memo admission includes the live postings window exactly once"
+                );
+            }
+            assert_eq!(owned(&reader, &operation), baseline);
+            eprintln!(
+                "combined TopN/postings: cursor={cursor_charge}, memo_admissions={}, combined_max={}, memo_only_max={}",
+                combined.len(),
+                combined.iter().max().unwrap(),
+                memo_only.iter().max().unwrap()
+            );
+            drop(bitmap);
+            assert_eq!(
+                owned(&reader, &operation),
+                baseline - bitmap_charge,
+                "all evaluation-local owners released"
+            );
+        });
+        permit.check_refusal().unwrap();
+        drop(permit);
+        assert_eq!(
+            pool.state.lock().used,
+            0,
+            "high-water lease releases at evaluation end"
+        );
+    }
+
+    #[test]
     fn optional_plist_memory_refusal_keeps_the_evaluation_usable() {
         use vortex_index::VixReadOperation;
 
@@ -1649,6 +1837,94 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(third.check_refusal().is_err(), "refusal stays sticky");
         drop(third);
+        drop(first);
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_optional_budget_refusal_does_not_poison_required_reads() {
+        use vortex_index::VixReadOperation;
+
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation =
+            ReadOperation::new(Arc::new(FetchStats::default()), None).for_evaluation(&permit);
+        assert!(operation.try_check_memory(16).unwrap());
+        assert_eq!(pool.state.lock().used, 16);
+        assert!(!operation.try_check_memory(33).unwrap());
+        assert_eq!(pool.state.lock().used, 16);
+        permit.check_refusal().unwrap();
+        operation.check_memory(24).unwrap();
+        assert_eq!(pool.state.lock().used, 24);
+        operation.cancel();
+        assert!(matches!(
+            operation.try_check_memory(25),
+            Err(vortex_index::VixError::Cancelled)
+        ));
+        assert_eq!(pool.state.lock().used, 24);
+        drop(operation);
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_declines_without_live_evaluation_or_during_required_growth() {
+        use vortex_index::VixReadOperation;
+
+        let root = ReadOperation::new(Arc::new(FetchStats::default()), None);
+        assert!(!root.try_check_memory(16).unwrap());
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(1));
+        let permit = evaluation_fixture(&pool, &count);
+        let operation = root.for_evaluation(&permit);
+        assert!(operation.try_check_memory(16).unwrap());
+        {
+            let _required_growth = permit.memory.refusal.lock();
+            assert!(!operation.try_check_memory(24).unwrap());
+        }
+        {
+            let _required_growth = permit.memory.bytes.lock();
+            assert!(!operation.try_check_memory(24).unwrap());
+        }
+        assert_eq!(pool.state.lock().used, 16);
+        assert!(operation.try_check_memory(24).unwrap());
+        assert!(operation.try_check_memory(8).unwrap());
+        assert_eq!(pool.state.lock().used, 24, "optional checks cannot shrink");
+        drop(permit);
+        assert_eq!(pool.state.lock().used, 0);
+        assert!(
+            !operation.try_check_memory(16).unwrap(),
+            "expired owners cannot admit"
+        );
+        assert_eq!(pool.state.lock().used, 0);
+    }
+
+    #[test]
+    fn group_read_memo_shared_pool_and_sticky_required_refusal_stay_exact() {
+        use vortex_index::VixReadOperation;
+
+        let pool = ByteGate::new(32);
+        let count = Arc::new(Semaphore::new(2));
+        let first = evaluation_fixture(&pool, &count);
+        let second = evaluation_fixture(&pool, &count);
+        let operation =
+            ReadOperation::new(Arc::new(FetchStats::default()), None).for_evaluation(&first);
+        second.reserve_owned(16).unwrap();
+        assert!(operation.try_check_memory(8).unwrap());
+        assert!(!operation.try_check_memory(17).unwrap());
+        assert_eq!(pool.state.lock().used, 24);
+        first.check_refusal().unwrap();
+        operation.check_memory(16).unwrap();
+        assert_eq!(pool.state.lock().used, 32);
+        drop(second);
+        assert!(operation.try_check_memory(24).unwrap());
+        assert!(operation.check_memory(33).is_err());
+        assert!(
+            operation.try_check_memory(8).is_err(),
+            "required refusal stays sticky"
+        );
+        assert_eq!(pool.state.lock().used, 24);
         drop(first);
         assert_eq!(pool.state.lock().used, 0);
     }

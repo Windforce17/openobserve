@@ -1328,6 +1328,9 @@ impl GroupCounts {
     }
 }
 
+type DocsDictChunkVisitor<'a> =
+    dyn FnMut(vortex_index::DocsDictBatch, Option<&[u64]>) -> anyhow::Result<()> + 'a;
+
 /// Keep the selection itself chunk-local, including on legacy unzoned files.
 /// Density is evaluated per touched chunk, so clustered matches retain pruning.
 fn visit_selected_dict_chunks(
@@ -1335,7 +1338,20 @@ fn visit_selected_dict_chunks(
     field: &str,
     bitmap: &BooleanBuffer,
     window: Option<(i64, i64)>,
-    visitor: &mut dyn FnMut(vortex_index::DocsDictBatch, Option<&[u64]>) -> anyhow::Result<()>,
+    visitor: &mut DocsDictChunkVisitor<'_>,
+) -> anyhow::Result<()> {
+    reader.with_docs_read_memo(
+        config::get_config().limit.vix_group_read_memo_enabled,
+        || visit_selected_dict_chunks_inner(reader, field, bitmap, window, visitor),
+    )
+}
+
+fn visit_selected_dict_chunks_inner(
+    reader: &VixReader,
+    field: &str,
+    bitmap: &BooleanBuffer,
+    window: Option<(i64, i64)>,
+    visitor: &mut DocsDictChunkVisitor<'_>,
 ) -> anyhow::Result<()> {
     let schema = reader.docs_schema()?;
     let data_type = schema
@@ -2400,6 +2416,171 @@ mod tests {
 
     fn all_set(len: usize) -> BooleanBuffer {
         BooleanBuffer::new_set(len)
+    }
+
+    #[test]
+    fn group_read_memo_matches_legacy_across_segments_nulls_and_missing_columns() {
+        use std::ops::Range;
+
+        use futures::{FutureExt, future::BoxFuture};
+
+        struct CountingSource {
+            data: bytes::Bytes,
+            reads: std::sync::Mutex<Vec<Range<u64>>>,
+        }
+        impl vortex_index::VixRangeSource for CountingSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+            fn fetch(&self, range: Range<u64>) -> BoxFuture<'static, anyhow::Result<bytes::Bytes>> {
+                self.reads.lock().unwrap().push(range.clone());
+                let data = bytes::Bytes::copy_from_slice(
+                    &self.data[range.start as usize..range.end as usize],
+                );
+                futures::future::ready(Ok(data)).boxed()
+            }
+        }
+
+        const ROWS: usize = 200_003;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_timestamp", DataType::Int64, false),
+            Field::new("bd", DataType::Utf8, true),
+        ]));
+        let values: Vec<_> = (0..ROWS)
+            .map(|i| match i % 7 {
+                0 => None,
+                1 => Some(""),
+                _ => Some(["a", "b", "c"][i % 3]),
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values((1..=ROWS as i64).rev())),
+                Arc::new(StringArray::from(values.clone())),
+            ],
+        )
+        .unwrap();
+        let mut writer = VixWriter::new(
+            &schema,
+            VixWriterOptions {
+                docs_chunk_max_rows: 90_001,
+                ..Default::default()
+            },
+            false,
+        );
+        writer
+            .push_batch_with_source(
+                &batch,
+                &StringArray::from_iter_values(std::iter::repeat_n("{}", ROWS)),
+                None,
+            )
+            .unwrap();
+        let (data, index) = writer.finish().unwrap();
+        let index = index.map(|data| vortex_index::BytesRangeSource::new("index", data.into()));
+
+        for zoned in [true, false] {
+            let source = Arc::new(CountingSource {
+                data: if zoned {
+                    data.clone()
+                } else {
+                    vortex_index::test_support::strip_zone_map_property(&data).unwrap()
+                }
+                .into(),
+                reads: std::sync::Mutex::new(Vec::new()),
+            });
+            let reader = VixReader::open_ranged_with_index_sidecar_first(
+                source.clone(),
+                index
+                    .clone()
+                    .map(|source| source as Arc<dyn vortex_index::VixRangeSource>),
+                true,
+            )
+            .unwrap();
+            reader.docs_schema().unwrap();
+            let bitmaps = [
+                all_set(ROWS),
+                BooleanBuffer::from_iter((0..ROWS).map(|i| i % 2 == 0)),
+                BooleanBuffer::from_iter((0..ROWS).map(|i| !(65_536..131_072).contains(&i))),
+                BooleanBuffer::from_iter((0..ROWS).map(|i| [1, 65_537, 199_999].contains(&i))),
+                BooleanBuffer::new_unset(ROWS),
+            ];
+            for (shape, bitmap) in bitmaps.iter().enumerate() {
+                let mut answers = Vec::new();
+                let mut requests = Vec::new();
+                for enabled in [false, true] {
+                    source.reads.lock().unwrap().clear();
+                    let mut counts = HashMap::new();
+                    let mut value_bytes = 0;
+                    let mut visitor = |chunk, rows: Option<&[u64]>| {
+                        fold_top_n_chunk(
+                            &mut counts,
+                            &mut value_bytes,
+                            top_n_limits(),
+                            chunk,
+                            bitmap,
+                            rows,
+                            true,
+                            true,
+                        )
+                    };
+                    if enabled {
+                        visit_selected_dict_chunks(&reader, "bd", bitmap, None, &mut visitor)
+                            .unwrap();
+                    } else {
+                        reader
+                            .with_docs_read_memo(false, || {
+                                visit_selected_dict_chunks_inner(
+                                    &reader,
+                                    "bd",
+                                    bitmap,
+                                    None,
+                                    &mut visitor,
+                                )
+                            })
+                            .unwrap();
+                    }
+                    let sorted = counts
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let mut oracle = std::collections::BTreeMap::new();
+                    for row in bitmap.set_indices() {
+                        *oracle.entry(values[row].map(str::to_owned)).or_insert(0u64) += 1;
+                    }
+                    assert_eq!(sorted, oracle, "zoned={zoned} shape={shape} memo={enabled}");
+                    answers
+                        .push(serde_json::to_vec(&sorted.into_iter().collect::<Vec<_>>()).unwrap());
+                    let reads = source.reads.lock().unwrap().clone();
+                    if enabled {
+                        let unique: HashSet<_> = reads.iter().map(|r| (r.start, r.end)).collect();
+                        assert_eq!(unique.len(), reads.len(), "a physical range was reread");
+                    }
+                    requests.push(reads.len());
+                }
+                assert_eq!(answers[0], answers[1], "byte-identical group rows");
+                if shape == 0 {
+                    assert!(
+                        requests[1] < requests[0],
+                        "fixture must cross physical chunks: {requests:?}"
+                    );
+                }
+            }
+            for enabled in [false, true] {
+                let error = reader
+                    .with_docs_read_memo(enabled, || {
+                        visit_selected_dict_chunks_inner(
+                            &reader,
+                            "missing",
+                            &all_set(ROWS),
+                            None,
+                            &mut |_, _| Ok(()),
+                        )
+                    })
+                    .unwrap_err();
+                assert!(error.is::<AggregateFallback>());
+                assert_eq!(error.to_string(), "missing aggregate docs column");
+            }
+        }
     }
 
     fn rowwise_multi_histogram_reference(
