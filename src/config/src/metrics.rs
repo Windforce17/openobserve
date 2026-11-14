@@ -2146,6 +2146,45 @@ pub static VIX_READER_CACHE_DEMOTIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
     )
     .expect("Metric created")
 });
+pub static VIX_READER_CACHE_DEMOTION_ATTEMPTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_demotion_attempts_total",
+            "Exclusive-access attempts to demote full readers with one observed strong owner",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_READER_CACHE_DEMOTION_WEAK_SKIPS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_demotion_weak_skips_total",
+            "Demotion attempts blocked by weak handles or their concurrent upgrades",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
+pub static VIX_READER_CACHE_DEMOTION_RELEASED_BYTES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "vix_reader_cache_demotion_released_bytes_total",
+            "Reader allocation bytes released by successful demotions, excluding accounting resync",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &[],
+    )
+    .expect("Metric created")
+});
+
 // metrics for .vix range fetches (label `path`: `search` = index evaluation
 // through the cache ladder, `scan` = the DataFusion docs scan)
 pub static VIX_FETCH_COUNT_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -3375,6 +3414,17 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(VIX_READER_CACHE_DEMOTIONS_TOTAL.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(VIX_READER_CACHE_DEMOTION_ATTEMPTS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(VIX_READER_CACHE_DEMOTION_WEAK_SKIPS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(
+            VIX_READER_CACHE_DEMOTION_RELEASED_BYTES_TOTAL.clone(),
+        ))
+        .expect("Metric registered");
+    registry
         .register(Box::new(VIX_READER_CACHE_REJECTIONS_TOTAL.clone()))
         .expect("Metric registered");
     registry
@@ -3651,6 +3701,45 @@ mod tests {
         assert!(!gathered.is_empty());
     }
 
+    #[test]
+    fn test_reader_demotion_counters_registered_with_fixed_labels() {
+        for counter in [
+            &*VIX_READER_CACHE_DEMOTION_ATTEMPTS_TOTAL,
+            &*VIX_READER_CACHE_DEMOTIONS_TOTAL,
+            &*VIX_READER_CACHE_DEMOTION_WEAK_SKIPS_TOTAL,
+            &*VIX_READER_CACHE_DEMOTION_RELEASED_BYTES_TOTAL,
+        ] {
+            counter.with_label_values::<&str>(&[]).inc_by(0);
+        }
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let gathered = registry.gather();
+        for name in [
+            "vix_reader_cache_demotion_attempts_total",
+            "vix_reader_cache_demotions_total",
+            "vix_reader_cache_demotion_weak_skips_total",
+            "vix_reader_cache_demotion_released_bytes_total",
+        ] {
+            let expected = format!("{NAMESPACE}_{name}");
+            let family = gathered
+                .iter()
+                .find(|family| family.name() == expected)
+                .expect("reader demotion counter must be registered");
+            assert_eq!(
+                family.get_field_type(),
+                prometheus::proto::MetricType::COUNTER
+            );
+            assert_eq!(family.get_metric().len(), 1);
+            let mut labels = family.get_metric()[0]
+                .get_label()
+                .iter()
+                .map(|label| label.name())
+                .collect::<Vec<_>>();
+            labels.sort_unstable();
+            assert_eq!(labels, ["cluster", "instance", "role"]);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Force-initialise every LazyLock static so the coverage tool sees the
     // closure bodies as executed.  We clone each one (cheap — Arc clone for
@@ -3840,6 +3929,9 @@ mod tests {
         let _ = VIX_READER_CACHE_TIER_ENTRIES.clone();
         let _ = VIX_READER_CACHE_TIER_BYTES.clone();
         let _ = VIX_READER_CACHE_DEMOTIONS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_DEMOTION_ATTEMPTS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_DEMOTION_WEAK_SKIPS_TOTAL.clone();
+        let _ = VIX_READER_CACHE_DEMOTION_RELEASED_BYTES_TOTAL.clone();
         let _ = VIX_READER_CACHE_REJECTIONS_TOTAL.clone();
         let _ = VIX_READER_CACHE_EVICTIONS_TOTAL.clone();
         let _ = VIX_FETCH_COUNT_TOTAL.clone();

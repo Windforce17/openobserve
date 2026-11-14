@@ -443,6 +443,14 @@ struct CacheInner {
     window_bytes: usize,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DemotionStats {
+    attempts: u64,
+    successes: u64,
+    weak_skips: u64,
+    released_bytes: u64,
+}
+
 impl CacheInner {
     /// Demote LRU-first until the full tier fits the hot budget. Only a
     /// reader with no outstanding lease AND no outstanding handle can be
@@ -459,41 +467,69 @@ impl CacheInner {
     /// released left ghost bytes behind every cycle: prod 2026-10-02, 18 h
     /// pods - 2.29 MB accounted per demoted reader vs ~0.84 MB real, 1,870
     /// entries filling a 4 GiB budget that fits ~3,600.
-    fn demote_overflow(&self, state: &mut CacheState) {
-        while state.hot > self.hot_bytes {
-            let Some(key) = state
-                .main
-                .iter()
-                .find(|(_, entry)| {
-                    entry.tier == Tier::Full && Arc::strong_count(&entry.reader) == 1
-                })
-                .map(|(key, _)| key.clone())
-            else {
+    fn demote_overflow(&self, state: &mut CacheState) -> DemotionStats {
+        let mut stats = DemotionStats::default();
+        // One LRU pass: blocked handles remain full and are retried on the
+        // next enforcement, without restarting the scan for every candidate.
+        for (_, entry) in state.main.iter_mut() {
+            if state.hot <= self.hot_bytes {
                 break;
-            };
-            let Some(entry) = state.main.peek_mut(&key) else {
+            }
+            if entry.tier != Tier::Full || Arc::strong_count(&entry.reader) != 1 {
+                continue;
+            }
+            stats.attempts = stats.attempts.checked_add(1).expect("demotion attempts");
+            let Some(reader) = Arc::get_mut(&mut entry.reader) else {
+                // A Weak handle can also upgrade between the strong-count
+                // snapshot and get_mut. Neither case grants exclusive access.
+                stats.weak_skips = stats.weak_skips.checked_add(1).expect("demotion skips");
                 continue;
             };
-            // Exclusive access: demote, then take the exact size. Without
-            // it the entry still leaves the full tier (nothing releasable;
-            // its weight simply stops counting against the hot budget).
-            let exact = Arc::get_mut(&mut entry.reader).map(|reader| {
-                reader.demote();
-                reader.memory_size() + entry.observer.overhead
-            });
+            let released = reader.demote();
+            let after = reader
+                .memory_size()
+                .checked_add(entry.observer.overhead)
+                .expect("demoted reader size must fit");
             let before = entry.accounted;
-            let after = exact.unwrap_or(before);
-            state.hot -= before;
+            state.hot = state
+                .hot
+                .checked_sub(before)
+                .expect("full reader accounted");
+            state.total = state
+                .total
+                .checked_sub(before)
+                .and_then(|total| total.checked_add(after))
+                .expect("demoted reader total must fit");
             entry.accounted = after;
             entry.tier = Tier::Metadata;
-            state.total = state.total + after - before;
-            state.full_entries -= 1;
-            state.metadata_entries += 1;
-            state.demotions += 1;
-            metrics::VIX_READER_CACHE_DEMOTIONS_TOTAL
-                .with_label_values::<&str>(&[])
-                .inc();
+            state.full_entries = state
+                .full_entries
+                .checked_sub(1)
+                .expect("full reader present");
+            state.metadata_entries = state
+                .metadata_entries
+                .checked_add(1)
+                .expect("metadata entry count");
+            state.demotions = state.demotions.checked_add(1).expect("demotion count");
+            stats.successes = stats.successes.checked_add(1).expect("demotion successes");
+            stats.released_bytes = stats
+                .released_bytes
+                .checked_add(u64::try_from(released).expect("released bytes fit u64"))
+                .expect("demotion released bytes");
         }
+        metrics::VIX_READER_CACHE_DEMOTION_ATTEMPTS_TOTAL
+            .with_label_values::<&str>(&[])
+            .inc_by(stats.attempts);
+        metrics::VIX_READER_CACHE_DEMOTIONS_TOTAL
+            .with_label_values::<&str>(&[])
+            .inc_by(stats.successes);
+        metrics::VIX_READER_CACHE_DEMOTION_WEAK_SKIPS_TOTAL
+            .with_label_values::<&str>(&[])
+            .inc_by(stats.weak_skips);
+        metrics::VIX_READER_CACHE_DEMOTION_RELEASED_BYTES_TOTAL
+            .with_label_values::<&str>(&[])
+            .inc_by(stats.released_bytes);
+        stats
     }
 
     /// Bytes main (admitted readers, full or demoted) may hold: the budget
@@ -724,9 +760,9 @@ fn entry_overhead(key: &ReaderCacheKey) -> usize {
 /// Shared readers are conservatively charged once per admitted key, retaining
 /// each admission's observed high-water weight even if reader storage shrinks.
 /// Growth callbacks enforce the budget before returning; they never refresh LRU.
-/// Get/put/notification bookkeeping is O(1), plus O(entries actually demoted,
-/// evicted or rejected). Logical-file invalidation alone walks both segments
-/// to find all generations.
+/// Get bookkeeping is O(1). Hot-budget enforcement scans main at most once
+/// per mutation, including readers blocked by outstanding owners or handles.
+/// Logical-file invalidation walks both segments to find all generations.
 pub struct VixReaderCache {
     inner: Arc<CacheInner>,
 }
@@ -1802,6 +1838,266 @@ mod tests {
         assert!(cache.len() <= 7, "main's share must bound the cache");
         assert!(cache.inner.state.lock().rejections >= 5);
         assert!(cache.memory_size() <= entry_size * 8);
+    }
+
+    fn demotion_fixture(entries: usize) -> (VixReaderCache, Vec<ReaderCacheKey>) {
+        let mut cache = VixReaderCache::new(16 * 1024 * 1024);
+        let inner = Arc::get_mut(&mut cache.inner).unwrap();
+        inner.window_bytes = 0;
+        inner.hot_bytes = 0;
+        let keys = (0..entries)
+            .map(|i| ReaderCacheKey::new(format!("demotion-{i}"), 7, 100))
+            .collect::<Vec<_>>();
+        let mut leases = Vec::new();
+        for key in &keys {
+            let reader = Arc::try_unwrap(small_reader()).ok().unwrap();
+            assert_eq!(
+                reader
+                    .eval(&vortex_index::VixQuery::Exact {
+                        field: "level".to_owned(),
+                        token: b"a".to_vec(),
+                    })
+                    .unwrap()
+                    .count_set_bits(),
+                1
+            );
+            leases.push(cache.put(key.clone(), reader).unwrap());
+        }
+        assert_eq!(cache.inner.state.lock().main.len(), entries);
+        drop(leases);
+        (cache, keys)
+    }
+
+    fn assert_demotion_accounting(state: &CacheState) {
+        let entries = || state.main.iter().chain(state.window.iter());
+        assert_eq!(
+            state.total,
+            entries().map(|(_, e)| e.accounted).sum::<usize>()
+        );
+        assert_eq!(
+            state.hot,
+            entries()
+                .filter(|(_, e)| e.tier == Tier::Full)
+                .map(|(_, e)| e.accounted)
+                .sum::<usize>()
+        );
+        assert_eq!(
+            state.window_total,
+            state.window.iter().map(|(_, e)| e.accounted).sum::<usize>()
+        );
+        assert_eq!(
+            state.full_entries,
+            entries().filter(|(_, e)| e.tier == Tier::Full).count()
+        );
+        assert_eq!(
+            state.metadata_entries,
+            entries().filter(|(_, e)| e.tier == Tier::Metadata).count()
+        );
+    }
+
+    #[test]
+    fn weak_handle_blocks_demotion_until_released() {
+        let (cache, keys) = demotion_fixture(1);
+        let handle = cache.get(&keys[0]).unwrap();
+        let before = cache.memory_size();
+        {
+            let mut state = cache.inner.state.lock();
+            let entry = state.peek(&keys[0]).unwrap();
+            assert_eq!(Arc::strong_count(&entry.reader), 1);
+            assert_eq!(Arc::weak_count(&entry.reader), 1);
+            assert_eq!(entry.leases.load(Ordering::Acquire), 0);
+            let stats = cache.inner.demote_overflow(&mut state);
+            assert_eq!(
+                stats,
+                DemotionStats {
+                    attempts: 1,
+                    weak_skips: 1,
+                    ..DemotionStats::default()
+                }
+            );
+            assert_eq!(state.peek(&keys[0]).unwrap().tier, Tier::Full);
+            assert_eq!(state.hot, before);
+            assert_eq!(state.total, before);
+            assert_eq!(state.demotions, 0);
+            assert_demotion_accounting(&state);
+        }
+        let locked = handle.try_lock().unwrap();
+        {
+            let mut state = cache.inner.state.lock();
+            assert_eq!(cache.inner.demote_overflow(&mut state).weak_skips, 1);
+            assert_eq!(state.hot, before);
+        }
+        drop(locked);
+        let mut state = cache.inner.state.lock();
+        let stats = cache.inner.demote_overflow(&mut state);
+        assert_eq!(stats.attempts, 1);
+        assert_eq!(stats.successes, 1);
+        assert_eq!(stats.weak_skips, 0);
+        assert!(
+            stats.released_bytes > 0,
+            "fixture must release real allocations"
+        );
+        assert_eq!(stats.released_bytes, (before - state.total) as u64);
+        assert_eq!(state.hot, 0);
+        assert_eq!(state.demotions, 1);
+        assert_eq!(state.peek(&keys[0]).unwrap().tier, Tier::Metadata);
+        assert_demotion_accounting(&state);
+    }
+
+    #[test]
+    fn demotion_pass_skips_blocked_candidates_once_and_put_retries() {
+        let (cache, keys) = demotion_fixture(6);
+        let handles = [cache.peek(&keys[0]).unwrap(), cache.peek(&keys[2]).unwrap()];
+        let lease = cache
+            .peek(&keys[3])
+            .unwrap()
+            .try_lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .unwrap();
+        let before;
+        {
+            let mut state = cache.inner.state.lock();
+            let stats = cache.inner.demote_overflow(&mut state);
+            assert_eq!(stats.attempts, 5, "each eligible candidate is visited once");
+            assert_eq!(stats.weak_skips, 2);
+            assert_eq!(stats.successes, 3);
+            assert!(stats.released_bytes > 0);
+            for i in [0, 2, 3] {
+                assert_eq!(state.peek(&keys[i]).unwrap().tier, Tier::Full);
+            }
+            for i in [1, 4, 5] {
+                assert_eq!(state.peek(&keys[i]).unwrap().tier, Tier::Metadata);
+            }
+            assert_eq!(
+                state.main.iter().map(|(key, _)| key).collect::<Vec<_>>(),
+                keys.iter().collect::<Vec<_>>()
+            );
+            before = state.total;
+            assert_demotion_accounting(&state);
+        }
+        drop(handles);
+        drop(lease);
+        let added = ReaderCacheKey::new("retry-publish".to_owned(), 7, 100);
+        let reader = Arc::try_unwrap(small_reader()).ok().unwrap();
+        drop(cache.put(added.clone(), reader).unwrap());
+        let state = cache.inner.state.lock();
+        for key in &keys {
+            assert_eq!(state.peek(key).unwrap().tier, Tier::Metadata);
+        }
+        assert_eq!(state.demotions, 6);
+        assert!(state.total - state.peek(&added).unwrap().accounted < before);
+        assert_demotion_accounting(&state);
+    }
+
+    #[test]
+    fn demotion_release_bytes_exclude_accounting_resync() {
+        let (cache, keys) = demotion_fixture(1);
+        let before = cache.memory_size();
+        let (observer, reader_bytes) = {
+            let state = cache.inner.state.lock();
+            let entry = state.peek(&keys[0]).unwrap();
+            (Arc::clone(&entry.observer), entry.reader.memory_size())
+        };
+        let handle = cache.peek(&keys[0]).unwrap();
+        observer.memory_changed(reader_bytes + 4096);
+        assert_eq!(cache.memory_size(), before + 4096);
+        drop(handle);
+        let mut state = cache.inner.state.lock();
+        let stats = cache.inner.demote_overflow(&mut state);
+        assert_eq!(stats.successes, 1);
+        assert!(stats.released_bytes > 0);
+        assert_eq!(stats.released_bytes, (before - state.total) as u64);
+        assert_demotion_accounting(&state);
+    }
+
+    #[test]
+    fn blocked_hot_overflow_does_not_disable_total_capacity_eviction() {
+        let (cache, keys) = demotion_fixture(4);
+        let handles = keys
+            .iter()
+            .map(|key| cache.peek(key).unwrap())
+            .collect::<Vec<_>>();
+        let total = cache.memory_size();
+        {
+            let mut state = cache.inner.state.lock();
+            assert!(cache.inner.enforce(&mut state, 0).is_empty());
+            assert_eq!(state.total, total, "hot overflow alone must not evict");
+            assert_eq!(state.hot, total);
+            assert_eq!(state.demotions, 0);
+        }
+        for key in &keys[..2] {
+            let observer = Arc::clone(&cache.inner.state.lock().peek(key).unwrap().observer);
+            observer.memory_changed(cache.inner.max_bytes / 4 * 3);
+        }
+        {
+            let state = cache.inner.state.lock();
+            assert!(state.total <= cache.inner.max_bytes);
+            assert!(state.hot > cache.inner.hot_bytes);
+            assert_eq!(state.hot, state.total);
+            assert_eq!(state.demotions, 0);
+            assert!(!state.contains_key(&keys[0]), "LRU eviction still applies");
+            assert!(state.contains_key(keys.last().unwrap()));
+            assert_demotion_accounting(&state);
+        }
+        assert!(
+            handles[0].reader.upgrade().is_none(),
+            "weak handles must not pin eviction"
+        );
+    }
+
+    #[test]
+    fn concurrent_get_upgrade_and_demotion_preserve_accounting() {
+        let (cache, keys) = demotion_fixture(4);
+        let barrier = std::sync::Barrier::new(5);
+        std::thread::scope(|scope| {
+            for worker in 0..4 {
+                let cache = &cache;
+                let keys = &keys;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for i in 0..256 {
+                        let handle = cache.get(&keys[(i + worker) % keys.len()]).unwrap();
+                        if i % 2 == 0 {
+                            std::thread::yield_now();
+                        }
+                        let lease = handle.try_lock().unwrap().upgrade().unwrap().unwrap();
+                        assert_eq!(
+                            lease
+                                .eval(&vortex_index::VixQuery::Exact {
+                                    field: "level".to_owned(),
+                                    token: b"a".to_vec(),
+                                })
+                                .unwrap()
+                                .count_set_bits(),
+                            1
+                        );
+                    }
+                });
+            }
+            barrier.wait();
+            for _ in 0..1024 {
+                let mut state = cache.inner.state.lock();
+                assert!(cache.inner.enforce(&mut state, 0).is_empty());
+                assert_demotion_accounting(&state);
+                drop(state);
+                std::thread::yield_now();
+            }
+        });
+        let mut state = cache.inner.state.lock();
+        assert!(cache.inner.enforce(&mut state, 0).is_empty());
+        assert_eq!(state.hot, 0);
+        assert_eq!(state.metadata_entries, keys.len());
+        assert_demotion_accounting(&state);
+        for (_, entry) in state.main.iter() {
+            assert_eq!(entry.leases.load(Ordering::Acquire), 0);
+            assert_eq!(
+                entry.accounted,
+                entry.reader.memory_size() + entry.observer.overhead
+            );
+        }
     }
 
     /// An outstanding lease blocks demotion: the entry stays full while a
