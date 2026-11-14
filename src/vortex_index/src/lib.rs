@@ -76,6 +76,7 @@ mod conversion;
 mod cpu_executor;
 mod dict_blocks;
 mod docs;
+mod docs_footer;
 mod error;
 mod flat;
 mod merge;

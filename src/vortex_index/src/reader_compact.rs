@@ -17,6 +17,7 @@ static SETTINGS: OnceLock<ReaderCompactConfig> = OnceLock::new();
 /// Validate and freeze environment settings before starting any service work.
 /// Standalone engine users also initialize on their first reader open.
 pub fn initialize_reader_compact() -> std::io::Result<()> {
+    crate::docs_footer::settings()?;
     if SETTINGS.get().is_none() {
         let settings = ReaderCompactConfig::from_env()?;
         let _ = SETTINGS.set(settings);

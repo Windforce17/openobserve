@@ -1003,6 +1003,10 @@ impl RangedBlob {
         }
     }
 
+    pub(crate) fn configure_docs_footer(&mut self, config: crate::docs_footer::DocsFooterConfig) {
+        self.initial_read = config.initial_read();
+    }
+
     /// Blob length in bytes.
     pub fn len(&self) -> u64 {
         self.range.end - self.range.start
