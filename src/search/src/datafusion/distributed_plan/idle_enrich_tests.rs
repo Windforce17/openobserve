@@ -26,11 +26,15 @@ use tonic::{Request, Response, Status};
 use super::*;
 use crate::datafusion::distributed_plan::{NewEmptyExecVisitor, ReplaceTableScanExec};
 
+#[path = "redundant_repartition_tests.rs"]
+mod redundant_repartition_tests;
+
 type RpcStream<T> = Pin<Box<dyn futures::Stream<Item = std::result::Result<T, Status>> + Send>>;
 
 #[derive(Clone, Default)]
 struct LocalFlight {
     requests: Arc<Mutex<Vec<proto::cluster_rpc::FlightSearchRequest>>>,
+    data: Arc<Mutex<Vec<Vec<RecordBatch>>>>,
 }
 
 #[tonic::async_trait]
@@ -65,7 +69,19 @@ impl FlightService for LocalFlight {
         let scan = visitor.plan();
         let stream_type = TableReference::from(scan.name())
             .get_stream_type(StreamType::from(query.stream_type.as_str()));
-        if query.enrich_mode && stream_type == StreamType::EnrichmentTables {
+        let data = self.data.lock().get(query.partition as usize).cloned();
+        if let Some(data) = data {
+            let replacement = MemorySourceConfig::try_new_exec(
+                &[data],
+                scan.full_schema(),
+                scan.projection().cloned(),
+            )
+            .map_err(|e| Status::internal(e.to_string()))?;
+            plan = plan
+                .rewrite(&mut ReplaceTableScanExec::new(replacement))
+                .map_err(|e| Status::internal(e.to_string()))?
+                .data;
+        } else if query.enrich_mode && stream_type == StreamType::EnrichmentTables {
             // Model the follower's enrichment branch without an external metadata database.
             let batch =
                 RecordBatch::try_new(scan.schema(), vec![Arc::new(Int64Array::from(vec![42]))])
