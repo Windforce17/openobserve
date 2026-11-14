@@ -3860,6 +3860,12 @@ pub struct DiskCache {
     // MB, default is 10% of local volume available space and maximum 20GB
     #[env_config(name = "ZO_DISK_RESULT_CACHE_MAX_SIZE", default = 0)]
     pub result_max_size: usize,
+    #[env_config(
+        name = "ZO_DISK_SEGMENT_CACHE_MAX_SIZE",
+        default = 0,
+        help = "MB reserved for WAL segments from the whole-file budget after block allocation. 0 keeps segments in the result pool. Requires restart."
+    )]
+    pub segment_max_size: usize,
     #[env_config(name = "ZO_DISK_AGGREGATION_CACHE_MAX_SIZE", default = 0)]
     pub aggregation_max_size: usize,
     // MB, will skip the cache when a query need cache great than this value, default is 50% of
@@ -3918,6 +3924,14 @@ pub struct DiskCache {
 }
 
 impl DiskCache {
+    pub fn segment_skip_size(&self) -> usize {
+        if self.segment_max_size == 0 {
+            self.skip_size
+        } else {
+            self.segment_max_size.saturating_mul(self.bucket_num) / 2
+        }
+    }
+
     pub fn effective_block_strategy(&self) -> &str {
         if self.block_strategy.is_empty() {
             &self.cache_strategy
@@ -5434,6 +5448,22 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.disk_cache.block_fill_queue_size = 0;
     }
 
+    if cfg.disk_cache.segment_max_size > 0 {
+        cfg.disk_cache.segment_max_size = cfg
+            .disk_cache
+            .segment_max_size
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| anyhow::anyhow!("ZO_DISK_SEGMENT_CACHE_MAX_SIZE overflows bytes"))?;
+        if cfg.disk_cache.segment_max_size >= cfg.disk_cache.max_size {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_SEGMENT_CACHE_MAX_SIZE ({} bytes) must be smaller than the whole-file budget after block allocation ({} bytes)",
+                cfg.disk_cache.segment_max_size,
+                cfg.disk_cache.max_size
+            ));
+        }
+        cfg.disk_cache.max_size -= cfg.disk_cache.segment_max_size;
+    }
+
     if cfg.disk_cache.result_max_size == 0 {
         cfg.disk_cache.result_max_size = cfg.disk_cache.max_size / 10; // 10%
         if cfg.disk_cache.result_max_size > 1024 * 1024 * 1024 * 20 {
@@ -5516,6 +5546,15 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     cfg.disk_cache.release_size /= cfg.disk_cache.bucket_num;
     cfg.disk_cache.gc_size /= cfg.disk_cache.bucket_num;
     cfg.disk_cache.block_max_size /= cfg.disk_cache.bucket_num;
+
+    if cfg.disk_cache.segment_max_size > 0 {
+        cfg.disk_cache.segment_max_size /= cfg.disk_cache.bucket_num;
+        if cfg.disk_cache.segment_max_size < 1024 {
+            return Err(anyhow::anyhow!(
+                "ZO_DISK_SEGMENT_CACHE_MAX_SIZE must allow at least 1 KiB per disk cache bucket"
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -6099,6 +6138,109 @@ mod tests {
                 .contains("ZO_DISK_CACHE_BLOCK_FILL_QUEUE_SIZE")
         );
     }
+    #[test]
+    fn disk_cache_segment_budget_is_carved_after_blocks_before_derived_sizes() {
+        let mib = 1024 * 1024;
+        let cache_dir = std::env::temp_dir().join("o2-config-segment-budget-test");
+        let base = || {
+            let mut cfg = Config::init().unwrap();
+            cfg.common.data_cache_dir = format!("{}/", cache_dir.display());
+            cfg.disk_cache.max_size = 1024;
+            cfg.disk_cache.bucket_num = 4;
+            cfg.disk_cache.skip_size = 0;
+            cfg.disk_cache.release_size = 0;
+            cfg.disk_cache.result_max_size = 0;
+            cfg.disk_cache.aggregation_max_size = 0;
+            cfg.disk_cache.block_enabled = true;
+            cfg.disk_cache.block_max_size = 256;
+            cfg
+        };
+        for segment_mb in [0, 128, 512] {
+            let mut cfg = base();
+            cfg.disk_cache.segment_max_size = segment_mb;
+            check_disk_cache_config(&mut cfg).unwrap();
+            let remaining = (768 - segment_mb) * mib;
+            assert_eq!(cfg.disk_cache.block_max_size, 256 * mib / 4);
+            assert_eq!(cfg.disk_cache.segment_max_size, segment_mb * mib / 4);
+            assert_eq!(cfg.disk_cache.max_size, remaining / 4);
+            assert_eq!(cfg.disk_cache.skip_size, remaining / 2);
+            assert_eq!(cfg.disk_cache.release_size, remaining / 10 / 4);
+            assert_eq!(cfg.disk_cache.result_max_size, remaining / 10 / 4);
+            assert_eq!(cfg.disk_cache.aggregation_max_size, remaining / 10 / 4);
+            assert_eq!(
+                cfg.disk_cache.segment_skip_size(),
+                if segment_mb == 0 {
+                    remaining / 2
+                } else {
+                    segment_mb * mib / 2
+                }
+            );
+        }
+        for segment_mb in [768, 769, usize::MAX] {
+            let mut cfg = base();
+            cfg.disk_cache.segment_max_size = segment_mb;
+            assert!(
+                check_disk_cache_config(&mut cfg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ZO_DISK_SEGMENT_CACHE_MAX_SIZE")
+            );
+        }
+        let mut cfg = base();
+        cfg.disk_cache.block_enabled = false;
+        cfg.disk_cache.segment_max_size = 512;
+        check_disk_cache_config(&mut cfg).unwrap();
+        assert_eq!(cfg.disk_cache.max_size, 512 * mib / 4);
+        assert_eq!(cfg.disk_cache.block_max_size, 0);
+        let mut cfg = base();
+        cfg.disk_cache.segment_max_size = 1;
+        cfg.disk_cache.bucket_num = mib;
+        assert!(check_disk_cache_config(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn disk_cache_segment_env_probe() {
+        let Ok(expected) = std::env::var("OO_TEST_SEGMENT_SIZE_EXPECTED") else {
+            return;
+        };
+        let cache = DiskCache::init().expect("ZO_DISK_SEGMENT_CACHE_MAX_SIZE parse failed");
+        assert_eq!(cache.segment_max_size, expected.parse::<usize>().unwrap());
+    }
+
+    #[test]
+    fn disk_cache_segment_env_defaults_and_rejects_invalid_integers() {
+        for (value, expected) in [
+            (None, Some(0)),
+            (Some("0"), Some(0)),
+            (Some("65536"), Some(65536)),
+            (Some("-1"), None),
+            (Some("1.5"), None),
+            (Some("nope"), None),
+            (Some(""), None),
+            (Some("999999999999999999999999999999"), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", "config::tests::disk_cache_segment_env_probe"])
+                .env(
+                    "OO_TEST_SEGMENT_SIZE_EXPECTED",
+                    expected.unwrap_or(0).to_string(),
+                )
+                .env_remove("ZO_DISK_SEGMENT_CACHE_MAX_SIZE");
+            if let Some(value) = value {
+                child.env("ZO_DISK_SEGMENT_CACHE_MAX_SIZE", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     /// Empty keeps the DataFusion default; a set directory must be absolute
     /// and must not be the root or a data directory; the size defaults to
     /// 100 GiB and is converted from MB to bytes.

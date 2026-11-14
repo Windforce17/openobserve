@@ -339,7 +339,8 @@ fn segment_cache_type(metas: &[SegmentMeta]) -> file_data::CacheType {
         cfg.memory_cache
             .enabled
             .then_some(cfg.memory_cache.skip_size),
-        (!is_local_disk_storage() && cfg.disk_cache.enabled).then_some(cfg.disk_cache.skip_size),
+        (!is_local_disk_storage() && cfg.disk_cache.enabled)
+            .then_some(cfg.disk_cache.segment_skip_size()),
     )
 }
 
