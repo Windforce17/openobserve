@@ -993,6 +993,18 @@ pub static VIX_FILE_BLOOM_PROBE_FILES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| 
     .expect("Metric created")
 });
 
+pub static QUERY_EMPTY_QUERIER_REQUESTS_SKIPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "query_empty_querier_requests_skipped_total",
+            "Empty querier partitions returned locally without a Flight request (including the legacy fast path)",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
 // Follower storage scan branch capped by ZO_STORAGE_SCAN_MAX_BYTES: the
 // query kept the newest files within the budget and was marked partial.
 pub static QUERY_STORAGE_SCAN_CAPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -3188,6 +3200,9 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_STORAGE_SCAN_CAPPED_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_EMPTY_QUERIER_REQUESTS_SKIPPED_TOTAL.clone()))
         .expect("Metric registered");
 
     // stream stats aggregation metrics
