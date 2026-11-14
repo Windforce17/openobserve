@@ -132,9 +132,9 @@ struct FileData {
     data: Cache<String, DiskEntry>,
     stripes: [Mutex<()>; STRIPES],
     maintenance: super::MaintenanceGate,
-    /// Set once the startup load has checked every file left by the previous
-    /// run. Reads open paths without the index, so until then only keys this
-    /// process published (and therefore indexed) are served.
+    /// Set once startup has checked the previous run's files. Path-only
+    /// namespaces may be read afterwards; indexed namespaces always need
+    /// an entry, including while an eviction is waiting to unlink.
     checked: AtomicBool,
 }
 
@@ -394,9 +394,15 @@ impl FileData {
             })
     }
 
-    /// Whether a read may open `file`'s path: see [`FileData::checked`].
+    /// Reject managed misses before any filesystem access. Keep path-only
+    /// namespaces (notably startup-loaded metrics results) behind the startup
+    /// gate. Callers that read content still use `data.get` to refresh LRU.
     fn serves(&self, file: &str) -> bool {
-        self.checked.load(Ordering::Acquire) || self.data.contains_key(file)
+        let indexed = file.starts_with("files")
+            || file.starts_with("results")
+            || file.starts_with("aggregations")
+            || file.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX);
+        (self.checked.load(Ordering::Acquire) && !indexed) || self.data.contains_key(file)
     }
 
     /// Unlink a file found by the startup load, unless this process has
@@ -850,7 +856,7 @@ async fn get_opts_from(
     options: GetOptions,
 ) -> object_store::Result<GetResult> {
     if !files.serves(file) {
-        return Err(not_yet_checked(file));
+        return Err(not_servable(file));
     }
     files.data.get(file);
     let path = PathBuf::from(files.get_file_path(file));
@@ -917,12 +923,12 @@ async fn get_opts_from(
     })
 }
 
-/// Error for a key whose file the startup load has not checked yet.
-fn not_yet_checked(file: &str) -> object_store::Error {
+/// A managed index miss or a path-only key not yet checked at startup.
+fn not_servable(file: &str) -> object_store::Error {
     object_store::Error::NotFound {
         path: file.to_string(),
         source: Box::new(std::io::Error::other(
-            "disk cache startup check has not reached this file",
+            "disk cache key is not indexed or its startup check is incomplete",
         )),
     }
 }
@@ -1020,7 +1026,7 @@ async fn get_ranges_from(
     ranges: &[Range<u64>],
 ) -> object_store::Result<Vec<Bytes>> {
     if !files.serves(file) {
-        return Err(not_yet_checked(file));
+        return Err(not_servable(file));
     }
     files.data.get(file);
     let path = PathBuf::from(files.get_file_path(file));
@@ -1926,6 +1932,144 @@ mod tests {
             "aggregations/default/traces/disk-range-tests/{name}-{}.vxi",
             config::ider::generate()
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn indexed_misses_do_not_probe_paths_even_when_a_file_is_present() {
+        for (pool, key) in [
+            (FileType::Data, "files/no-fs-probe/logs/missing"),
+            (FileType::Result, "results/no-fs-probe/logs/missing"),
+            (
+                FileType::Aggregation,
+                "aggregations/no-fs-probe/logs/missing",
+            ),
+            (FileType::Result, "wal_segments/no-fs-probe/missing"),
+        ] {
+            let files = test_cache(pool, 4096, "lru");
+            files.checked.store(true, Ordering::Release);
+            // No setup or assertion touches this key's path: strace can verify
+            // that all four missing read APIs make zero path syscalls.
+            assert!(files.get(key, None).await.is_none());
+            assert!(files.get_size(key).await.is_none());
+            assert!(matches!(
+                get_opts_from(&files, key, GetOptions::default()).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+            assert!(matches!(
+                get_ranges_from(&files, key, &[0..2, 2..4]).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+
+            let orphan = key.replace("missing", "unindexed-present");
+            let path = write_cache_file(&files, &orphan, b"orphan", 100_000);
+            assert!(files.get(&orphan, None).await.is_none());
+            assert!(files.get_size(&orphan).await.is_none());
+            assert!(matches!(
+                get_opts_from(&files, &orphan, GetOptions::default()).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+            assert!(matches!(
+                get_ranges_from(&files, &orphan, &[0..2, 2..4]).await,
+                Err(object_store::Error::NotFound { .. })
+            ));
+            assert!(
+                Path::new(&path).exists(),
+                "a read miss must not unlink an orphan"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_only_namespaces_keep_the_startup_gate_and_reads() {
+        let files = test_cache(FileType::Result, 4096, "lru");
+        for key in ["metrics_results/path-only/value", "legacy/path-only/value"] {
+            write_cache_file(&files, key, b"abcdef", 100_000);
+            files.checked.store(false, Ordering::Release);
+            assert!(files.get(key, None).await.is_none());
+            assert!(files.get_size(key).await.is_none());
+            assert!(
+                get_opts_from(&files, key, GetOptions::default())
+                    .await
+                    .is_err()
+            );
+            assert!(get_ranges_from(&files, key, &[0..2, 2..4]).await.is_err());
+            files.checked.store(true, Ordering::Release);
+            assert_eq!(
+                files.get(key, None).await.unwrap(),
+                Bytes::from_static(b"abcdef")
+            );
+            assert_eq!(files.get_size(key).await, Some(6));
+            assert_eq!(
+                get_opts_from(&files, key, GetOptions::default())
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"abcdef")
+            );
+            assert_eq!(
+                get_ranges_from(&files, key, &[0..2, 2..4]).await.unwrap(),
+                vec![Bytes::from_static(b"ab"), Bytes::from_static(b"cd")]
+            );
+            assert!(!files.data.contains_key(key));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn indexed_read_hits_refresh_lru_and_evicted_paths_are_not_served() {
+        for api in ["get", "get_opts", "get_ranges"] {
+            let files = TestCache::new(FileType::Data, 2048, false, Vec::new());
+            files.checked.store(true, Ordering::Release);
+            let a = "files/index-gate/logs/a";
+            let b = "files/index-gate/logs/b";
+            let c = "files/index-gate/logs/c";
+            files.put(a, &[1; 1024]).await;
+            files.data.run_pending_tasks();
+            files.put(b, &[2; 1024]).await;
+            files.data.run_pending_tasks();
+            match api {
+                "get" => assert_eq!(files.get(a, None).await.unwrap().len(), 1024),
+                "get_opts" => assert_eq!(
+                    get_opts_from(&files, a, GetOptions::default())
+                        .await
+                        .unwrap()
+                        .meta
+                        .size,
+                    1024
+                ),
+                _ => assert_eq!(
+                    get_ranges_from(&files, a, &[0..2, 2..4])
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                ),
+            }
+            files.data.run_pending_tasks();
+            files.put(c, &[3; 1024]).await;
+            files.data.run_pending_tasks();
+            assert!(files.data.contains_key(a), "{api} must promote the hit");
+            assert!(
+                !files.data.contains_key(b),
+                "{api} must evict the untouched entry"
+            );
+            assert!(Path::new(&files.get_file_path(b)).exists());
+            assert!(files.get(b, None).await.is_none());
+            assert!(files.get_size(b).await.is_none());
+            assert!(
+                get_opts_from(&files, b, GetOptions::default())
+                    .await
+                    .is_err()
+            );
+            assert!(get_ranges_from(&files, b, &[0..2, 2..4]).await.is_err());
+            files.queue.start();
+            files.quiesce().await;
+            files.reconcile();
+        }
     }
 
     #[test]
