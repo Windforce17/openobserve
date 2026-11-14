@@ -1542,7 +1542,10 @@ impl BlockCache {
         let released = {
             let mut state = entry.state.lock();
             state.evicted = true;
-            state.present_bytes
+            let released = state.present_bytes;
+            state.bits.fill(0);
+            state.present_bytes = 0;
+            released
         };
         let [org, stream_type] = key_labels(&entry.key);
         metrics::QUERY_DISK_BLOCK_CACHE_FILES
@@ -3966,6 +3969,36 @@ mod tests {
         assert_eq!(read.outcome, Outcome::Miss);
         assert_eq!(read.bytes, remote.data.slice(100..1000));
         assert_eq!(remote.calls(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_after_completed_fill_clears_state_and_releases_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path(), 1 << 30);
+        let remote = Remote::new(1 << 20);
+        cache
+            .read_through(KEY, 0..10, None, &remote.fetcher())
+            .await
+            .unwrap();
+        settle(&cache).await;
+        let entry = cache.get_entry(KEY).unwrap();
+        assert_eq!(cache.stats(), (1 << 30, BS, 1));
+        assert!(is_set(&entry.state.lock().bits, 0));
+        cache.remove(KEY);
+        assert_eq!(cache.stats(), (1 << 30, 0, 0));
+        {
+            let state = entry.state.lock();
+            assert!(state.evicted);
+            assert_eq!(state.present_bytes, 0);
+            assert!(state.bits.iter().all(|word| *word == 0));
+        }
+        assert_eq!(entry.mark_present(0..1), 0);
+        let wanted = 0..1;
+        assert_eq!(
+            entry.missing_runs(std::slice::from_ref(&wanted), None),
+            vec![0..1]
+        );
+        wait_gone(&dir.path().join(KEY)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
