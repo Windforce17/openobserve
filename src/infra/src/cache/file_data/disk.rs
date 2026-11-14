@@ -355,7 +355,7 @@ impl FileData {
                     update_metrics(&key, -(entry.size as i64), -1);
                     if matches!(cause, RemovalCause::Size | RemovalCause::Expired) {
                         metrics::DISK_CACHE_EVICTED_BYTES_TOTAL
-                            .with_label_values(&[file_type.label()]).inc_by(entry.size as u64);
+                            .with_label_values(&[cache_metric_label(&key, file_type)]).inc_by(entry.size as u64);
                         files.pending_deletes.fetch_add(1, Ordering::Relaxed);
                         metrics::DISK_CACHE_PENDING_DELETES
                             .with_label_values(&[file_type.label()]).inc();
@@ -508,6 +508,9 @@ impl FileData {
                 start.elapsed().as_millis()
             );
         }
+        metrics::DISK_CACHE_WRITTEN_BYTES_TOTAL
+            .with_label_values(&[cache_metric_label(file, self.file_type)])
+            .inc_by(data_size as u64);
         Ok(true)
     }
 
@@ -636,7 +639,29 @@ fn unlink_tmp(path: &str) -> Result<(), anyhow::Error> {
     }
 }
 
+fn cache_metric_label(file: &str, pool: FileType) -> &'static str {
+    if file.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX) {
+        "segment"
+    } else {
+        pool.label()
+    }
+}
+
+fn record_read(files: &FileData, file: &str, hit: bool) {
+    metrics::DISK_CACHE_READS_TOTAL
+        .with_label_values(&[
+            cache_metric_label(file, files.file_type),
+            if hit { "hit" } else { "miss" },
+        ])
+        .inc();
+}
+
 fn update_metrics(file: &str, bytes: i64, entries: i64) {
+    if file.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX) {
+        metrics::DISK_CACHE_SEGMENT_USED_BYTES.add(bytes);
+        metrics::DISK_CACHE_SEGMENT_FILES.add(entries);
+        return;
+    }
     let columns: Vec<_> = file.split('/').collect();
     match columns.as_slice() {
         ["files", org, stream_type, ..] => {
@@ -814,7 +839,9 @@ pub async fn get_opts(file: &str, options: GetOptions) -> object_store::Result<G
             source: Box::new(std::io::Error::other("file not found")),
         });
     };
-    get_opts_from(files, file, options).await
+    let result = get_opts_from(files, file, options).await;
+    record_read(files, file, result.is_ok());
+    result
 }
 
 async fn get_opts_from(
@@ -951,13 +978,17 @@ fn evict_stale(
 #[inline]
 pub async fn get(file: &str, range: Option<Range<u64>>) -> Option<Bytes> {
     let files = get_file_reader(file)?;
-    files.get(file, range).await
+    let result = files.get(file, range).await;
+    record_read(files, file, result.is_some());
+    result
 }
 
 #[inline]
 pub async fn get_size(file: &str) -> Option<usize> {
     let files = get_file_reader(file)?;
-    files.get_size(file).await
+    let result = files.get_size(file).await;
+    record_read(files, file, result.is_some());
+    result
 }
 
 /// Batched range read against the disk cache: one `File::open` followed
@@ -977,7 +1008,9 @@ pub async fn get_ranges(file: &str, ranges: &[Range<u64>]) -> object_store::Resu
             source: Box::new(std::io::Error::other("file not found")),
         });
     };
-    get_ranges_from(files, file, ranges).await
+    let result = get_ranges_from(files, file, ranges).await;
+    record_read(files, file, result.is_ok());
+    result
 }
 
 #[cfg(unix)]
@@ -1454,6 +1487,12 @@ impl StartupRemovals {
     fn remove(&mut self, files: &FileData, key: &str, damage: StartupDamage, size: u64) {
         match files.remove_unindexed(key) {
             Ok(true) => {
+                if matches!(damage, StartupDamage::RecentResult)
+                    && key.starts_with(crate::wal_segments::SEGMENT_KEY_PREFIX)
+                {
+                    metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.inc();
+                    metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_BYTES_TOTAL.inc_by(size);
+                }
                 self.bytes += size;
                 match damage {
                     StartupDamage::Empty => self.empty += 1,
@@ -1887,6 +1926,70 @@ mod tests {
             "aggregations/default/traces/disk-range-tests/{name}-{}.vxi",
             config::ider::generate()
         )
+    }
+
+    #[test]
+    fn segment_observation_does_not_change_the_result_pool() {
+        let segment = "wal_segments/node/00000000000000000001";
+        assert!(std::ptr::eq(cache_for_key(segment), &**RESULT_FILES));
+        assert_eq!(cache_metric_label(segment, FileType::Result), "segment");
+        assert_eq!(
+            cache_metric_label("results/org/logs/key", FileType::Result),
+            "result"
+        );
+        assert_eq!(
+            cache_metric_label("wal_segments_other/key", FileType::Result),
+            "result"
+        );
+    }
+
+    #[tokio::test]
+    async fn segment_publication_reads_eviction_and_recent_removal_are_observed() {
+        let files = test_cache(FileType::Result, 1024, "lru");
+        let first = "wal_segments/observed/first";
+        let second = "wal_segments/observed/second";
+        let written = metrics::DISK_CACHE_WRITTEN_BYTES_TOTAL.with_label_values(&["segment"]);
+        let evicted = metrics::DISK_CACHE_EVICTED_BYTES_TOTAL.with_label_values(&["segment"]);
+        let before_written = written.get();
+        let before_evicted = evicted.get();
+        files.put(first, &[1; 1024]).await;
+        files.put(second, &[2; 1024]).await;
+        files.quiesce().await;
+        assert!(written.get() >= before_written + 2048);
+        assert!(evicted.get() >= before_evicted + 1024);
+        assert_eq!(files.size().1, 1024);
+        assert_eq!(files.len(), 1);
+        files.reconcile();
+
+        let key = format!("wal_segments/observed/{}", config::ider::generate());
+        let hit = metrics::DISK_CACHE_READS_TOTAL.with_label_values(&["segment", "hit"]);
+        let miss = metrics::DISK_CACHE_READS_TOTAL.with_label_values(&["segment", "miss"]);
+        let before_hit = hit.get();
+        let before_miss = miss.get();
+        assert!(get(&key, None).await.is_none());
+        set(&key, Bytes::from_static(b"segment")).await.unwrap();
+        assert_eq!(
+            get(&key, None).await.unwrap(),
+            Bytes::from_static(b"segment")
+        );
+        assert!(hit.get() > before_hit);
+        assert!(miss.get() > before_miss);
+        remove(&key).await.unwrap();
+
+        let recent = "wal_segments/observed/recent";
+        write_cache_file(&files, recent, &[3; 1024], 100_000);
+        let count = metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.get();
+        let bytes = metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_BYTES_TOTAL.get();
+        let mut removals = StartupRemovals::default();
+        removals.remove(&files, recent, StartupDamage::RecentResult, 1024);
+        assert!(!Path::new(&files.get_file_path(recent)).exists());
+        assert!(metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.get() > count);
+        assert!(metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_BYTES_TOTAL.get() >= bytes + 1024);
+        let count = metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.get();
+        removals.remove(&files, recent, StartupDamage::RecentResult, 1024);
+        assert_eq!(removals.recent_results, 1);
+        // A missing path is not a second successful removal.
+        assert!(metrics::DISK_CACHE_SEGMENT_STARTUP_RECENT_FILES_TOTAL.get() >= count);
     }
 
     #[tokio::test]
