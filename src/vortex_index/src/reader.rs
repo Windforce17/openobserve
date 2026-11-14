@@ -177,6 +177,24 @@ impl ReaderMemory {
         self.reserve_with(bytes, |owned| crate::check_read_memory(owned))
     }
 
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<Option<PendingMemory>> {
+        let previous = self
+            .total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                total.checked_add(bytes)
+            })
+            .map_err(|_| VixError::Malformed("reader memory size overflow".to_string()))?;
+        let pending = PendingMemory {
+            memory: Arc::clone(self),
+            bytes,
+        };
+        if !crate::source::try_check_read_memory(previous + bytes)? {
+            return Ok(None);
+        }
+        self.peak.fetch_max(previous + bytes, Ordering::AcqRel);
+        Ok(Some(pending))
+    }
+
     pub(crate) fn reserve_with(
         self: &Arc<Self>,
         bytes: usize,
@@ -531,7 +549,79 @@ enum PlistCursorRecord {
         /// header and normally carries the first few postings groups too.
         prefix: Bytes,
         header_len: usize,
+        reuse: Option<PlistCursorReuse>,
     },
+}
+
+const PLIST_CURSOR_REUSE_MAX_BYTES: usize = 1024 * 1024;
+
+struct PlistCursorReuse {
+    memory: Arc<ReaderMemory>,
+    window: OnceLock<(Range<u64>, Bytes)>,
+}
+
+impl PlistCursorReuse {
+    fn new(memory: Arc<ReaderMemory>) -> Self {
+        Self {
+            memory,
+            window: OnceLock::new(),
+        }
+    }
+
+    fn get(&self, range: &Range<u64>) -> Option<Bytes> {
+        let (owned, bytes) = self.window.get()?;
+        (owned.start <= range.start && range.end <= owned.end).then(|| {
+            bytes.slice((range.start - owned.start) as usize..(range.end - owned.start) as usize)
+        })
+    }
+
+    fn fetch_ranks(
+        &self,
+        source: &dyn VixRangeSource,
+        ranges: &[Range<u64>],
+    ) -> Result<Option<Vec<Bytes>>> {
+        if self.window.get().is_some() {
+            return Ok(None);
+        }
+        let Some(start) = ranges.iter().map(|range| range.start).min() else {
+            return Ok(None);
+        };
+        let end = ranges.iter().map(|range| range.end).max().unwrap_or(start);
+        let Some(length) = end.checked_sub(start).and_then(|n| usize::try_from(n).ok()) else {
+            return Ok(None);
+        };
+        if length > PLIST_CURSOR_REUSE_MAX_BYTES {
+            return Ok(None);
+        }
+        // Account the cursor metadata, Bytes owner and reference-count storage.
+        let overhead = std::mem::size_of::<Self>()
+            + std::mem::size_of::<PendingMemory>()
+            + std::mem::size_of::<Bytes>()
+            + 4 * std::mem::size_of::<usize>();
+        // Admit both the fetch and its compact copy before allocating either.
+        // Rejection only disables reuse; the original sparse read still works.
+        let Some(fetch_pending) = self.memory.try_reserve(length)? else {
+            return Ok(None);
+        };
+        let Some(pending) = self.memory.try_reserve(length + overhead)? else {
+            return Ok(None);
+        };
+        // A bounded envelope preserves the gaps that a coalescing source would
+        // otherwise discard when it returns only the requested rank groups.
+        let fetched =
+            crate::source::block_fetch_many(source, std::iter::once(start..end).collect())?;
+        let bytes = pending.own(Bytes::copy_from_slice(&fetched[0]));
+        drop(fetched);
+        drop(fetch_pending);
+        let windows = ranges
+            .iter()
+            .map(|range| bytes.slice((range.start - start) as usize..(range.end - start) as usize))
+            .collect();
+        // Losing concurrent fills keep their charge through the returned slices.
+        // Only one window survives the rank call; no lock is held during IO.
+        let _ = self.window.set((start..end, bytes));
+        Ok(Some(windows))
+    }
 }
 
 impl PlistCursor {
@@ -550,6 +640,7 @@ impl PlistCursor {
         record: &Range<u64>,
         prefix: &Bytes,
         relative: &Range<usize>,
+        reuse: Option<&PlistCursorReuse>,
     ) -> Result<Bytes> {
         if relative.end <= prefix.len() {
             return Ok(prefix.slice(relative.clone()));
@@ -563,6 +654,9 @@ impl PlistCursor {
             .checked_add(relative.end as u64)
             .filter(|&end| end <= record.end)
             .ok_or_else(|| VixError::Malformed("plist window exceeds its record".to_string()))?;
+        if let Some(bytes) = reuse.and_then(|reuse| reuse.get(&(start..end))) {
+            return Ok(bytes);
+        }
         crate::source::block_fetch(source.as_ref(), start..end)
     }
 
@@ -585,6 +679,7 @@ impl PlistCursor {
                 range,
                 prefix,
                 header_len,
+                reuse,
             } => {
                 let record_len = usize::try_from(range.end - range.start)
                     .map_err(|_| anyhow::anyhow!("plist record length overflows usize"))?;
@@ -634,11 +729,23 @@ impl PlistCursor {
                         .checked_add(relative.end as u64)
                         .filter(|&end| end <= range.end)
                         .ok_or_else(|| anyhow::anyhow!("plist window exceeds its record"))?;
+                    if let Some(bytes) = reuse.as_ref().and_then(|reuse| reuse.get(&(start..end))) {
+                        windows[index] = Some(bytes);
+                        continue;
+                    }
                     remote_indices.push(index);
                     remote_ranges.push(start..end);
                 }
                 if !remote_ranges.is_empty() {
-                    let fetched = crate::source::block_fetch_many(source.as_ref(), remote_ranges)?;
+                    let reused = reuse
+                        .as_ref()
+                        .map(|reuse| reuse.fetch_ranks(source.as_ref(), &remote_ranges))
+                        .transpose()?
+                        .flatten();
+                    let fetched = match reused {
+                        Some(fetched) => fetched,
+                        None => crate::source::block_fetch_many(source.as_ref(), remote_ranges)?,
+                    };
                     for (index, bytes) in remote_indices.into_iter().zip(fetched) {
                         windows[index] = Some(bytes);
                     }
@@ -692,6 +799,7 @@ impl PlistCursor {
                 range,
                 prefix,
                 header_len,
+                reuse,
             } => {
                 let record_len = usize::try_from(range.end - range.start)
                     .map_err(|_| anyhow::anyhow!("plist record length overflows usize"))?;
@@ -702,7 +810,8 @@ impl PlistCursor {
                     postings::RangePlan::Decode {
                         range: relative, ..
                     } => {
-                        let window = Self::ranged_window(source, range, prefix, relative)?;
+                        let window =
+                            Self::ranged_window(source, range, prefix, relative, reuse.as_ref())?;
                         Ok(postings::for_each_from_plan(
                             header,
                             record_len,
@@ -2969,6 +3078,8 @@ impl VixReader {
                     range: start..end,
                     prefix,
                     header_len,
+                    reuse: crate::reader_compact::plist_cursor_reuse()
+                        .then(|| PlistCursorReuse::new(Arc::clone(&self.memory))),
                 }
             }
         };
@@ -8366,6 +8477,7 @@ mod tests {
                 range: object_prefix as u64..(object_prefix + record.len()) as u64,
                 prefix: record.slice(..header_len),
                 header_len,
+                reuse: None,
             },
             doc_count: ids.len() as u64,
         };
@@ -8410,6 +8522,10 @@ mod tests {
 #[cfg(test)]
 #[path = "reader_memory_regressions.rs"]
 mod memory_regressions;
+
+#[cfg(test)]
+#[path = "reader_plist_reuse_tests.rs"]
+mod plist_reuse_tests;
 
 #[cfg(test)]
 #[path = "reader_contains_any_tests.rs"]

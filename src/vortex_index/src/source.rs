@@ -59,6 +59,12 @@ pub trait VixReadOperation: Send + Sync {
         Ok(())
     }
 
+    /// Try optional reader growth without making a refusal sticky. Unknown
+    /// operation implementations disable optional retention conservatively.
+    fn try_check_memory(&self, _owned_bytes: usize) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Own a newly allocated IO payload until its last buffer reference drops.
     /// Shared resident bytes and opening metadata do not use this hook.
     fn reserve_io(&self, _bytes: usize) -> Result<Option<Arc<dyn Send + Sync>>> {
@@ -334,6 +340,16 @@ pub fn check_read_cancelled() -> std::result::Result<(), VixError> {
 /// operation's typed error chain, with cancellation taking precedence.
 pub fn check_read_memory(owned_bytes: usize) -> Result<()> {
     check_operation_memory(current_read_operation().as_deref(), owned_bytes)
+}
+
+pub(crate) fn try_check_read_memory(owned_bytes: usize) -> Result<bool> {
+    let Some(operation) = current_read_operation() else {
+        return Ok(true);
+    };
+    check_read_cancelled()?;
+    let result = operation.try_check_memory(owned_bytes);
+    check_read_cancelled()?;
+    result
 }
 
 pub(crate) fn check_operation_memory(
