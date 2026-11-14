@@ -19,8 +19,8 @@ use arrow_schema::{Field, FieldRef, Fields};
 use datafusion::{
     arrow::{
         array::{
-            Array, ArrayData, ArrayRef, BooleanArray, StringArray, StructArray,
-            as_large_list_array, as_list_array, as_string_array,
+            Array, ArrayData, ArrayRef, BooleanArray, LargeStringArray, StringArray,
+            StringViewArray, StructArray, as_large_list_array, as_list_array,
         },
         datatypes::DataType,
     },
@@ -35,6 +35,81 @@ use datafusion::{
     prelude::create_udf,
     scalar::ScalarValue,
 };
+use hashlink::LinkedHashMap;
+use parking_lot::Mutex;
+
+const REGEX_CACHE_CAPACITY: usize = 256;
+static REGEX_CACHE: Lazy<Mutex<RegexCache>> = Lazy::new(|| Mutex::new(RegexCache::default()));
+
+#[derive(Default)]
+struct RegexCache {
+    entries: LinkedHashMap<String, Arc<regex::Regex>>,
+}
+
+impl RegexCache {
+    fn get_or_compile(
+        &mut self,
+        pattern: &str,
+    ) -> std::result::Result<Arc<regex::Regex>, regex::Error> {
+        if let Some(regex) = self.entries.to_back(pattern) {
+            return Ok(Arc::clone(regex));
+        }
+        #[cfg(test)]
+        REGEX_COMPILATIONS.with(|count| count.set(count.get().checked_add(1).unwrap()));
+        let regex = Arc::new(regex::Regex::new(pattern)?);
+        if self.entries.len() == REGEX_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.insert(pattern.to_owned(), Arc::clone(&regex));
+        Ok(regex)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static REGEX_COMPILATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(super) fn cached_regex(pattern: &str) -> std::result::Result<Arc<regex::Regex>, regex::Error> {
+    // Serializing cache misses also prevents concurrent batches from compiling the same key.
+    // Matching happens after releasing this lock; the cache owns at most 256 compiled patterns.
+    REGEX_CACHE.lock().get_or_compile(pattern)
+}
+
+pub(super) enum StringArrayRef<'a> {
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Utf8View(&'a StringViewArray),
+}
+
+impl<'a> StringArrayRef<'a> {
+    pub(super) fn new(array: &'a ArrayRef) -> Result<Self> {
+        match array.data_type() {
+            DataType::Utf8 => Ok(Self::Utf8(array.as_any().downcast_ref().unwrap())),
+            DataType::LargeUtf8 => Ok(Self::LargeUtf8(array.as_any().downcast_ref().unwrap())),
+            DataType::Utf8View => Ok(Self::Utf8View(array.as_any().downcast_ref().unwrap())),
+            other => Err(DataFusionError::Execution(format!(
+                "unsupported string data type {other:?}"
+            ))),
+        }
+    }
+
+    pub(super) fn value(&self, index: usize) -> &'a str {
+        match self {
+            Self::Utf8(array) => array.value(index),
+            Self::LargeUtf8(array) => array.value(index),
+            Self::Utf8View(array) => array.value(index),
+        }
+    }
+
+    pub(super) fn is_null(&self, index: usize) -> bool {
+        match self {
+            Self::Utf8(array) => array.is_null(index),
+            Self::LargeUtf8(array) => array.is_null(index),
+            Self::Utf8View(array) => array.is_null(index),
+        }
+    }
+}
 
 /// Implementation of regexp_match
 pub static REGEX_MATCH_UDF: Lazy<ScalarUDF> = Lazy::new(|| {
@@ -110,18 +185,16 @@ pub fn regex_match_expr_impl(matches: bool) -> ScalarFunctionImplementation {
         // the golang regexp library which is different than Rust's regexp
         let pattern = clean_non_meta_escapes(pattern);
 
-        let pattern = regex::Regex::new(&pattern)
+        let pattern = cached_regex(&pattern)
             .map_err(|e| DataFusionError::Plan(format!("error compiling regex pattern: {e}")))?;
 
         match &args[0] {
             ColumnarValue::Array(arr) => {
-                let results = as_string_array(arr)
-                    .iter()
-                    .map(|row| {
-                        // in arrow, any value can be null.
-                        // Here we decide to make our UDF to return null when either base or
-                        // exponent is null.
-                        row.map(|v| pattern.is_match(v) == matches)
+                let values = StringArrayRef::new(arr)?;
+                let results = (0..arr.len())
+                    .map(|index| {
+                        (!values.is_null(index))
+                            .then(|| pattern.is_match(values.value(index)) == matches)
                     })
                     .collect::<BooleanArray>();
 
@@ -389,7 +462,7 @@ fn regex_pattern_to_fields(pattern: &str, ret_type: &DataType) -> Result<Vec<Fie
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use datafusion::{
         arrow::{array::Int64Array, datatypes::Schema, record_batch::RecordBatch},
         assert_batches_eq,
@@ -547,5 +620,248 @@ mod tests {
     fn test_regex_pattern_to_fields_empty_pattern_errors() {
         let result = regex_pattern_to_fields("", &DataType::Utf8);
         assert!(result.is_err());
+    }
+
+    pub(in crate::datafusion::udf) fn legacy_regex_match_expr_impl(
+        matches: bool,
+    ) -> ScalarFunctionImplementation {
+        let func = move |args: &[ColumnarValue]| {
+            assert_eq!(args.len(), 2); // only works over a single column and pattern at a time.
+
+            let pattern = match &args[1] {
+                ColumnarValue::Array(_) => {
+                    return Err(DataFusionError::NotImplemented(format!(
+                        "regex_match({matches}) with non scalar patterns not yet implemented"
+                    )));
+                }
+                ColumnarValue::Scalar(ScalarValue::Utf8(pattern)) => pattern,
+                ColumnarValue::Scalar(arg) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "Expected string pattern to regex_match({matches}), got: {arg:?}"
+                    )));
+                }
+            };
+
+            let pattern = pattern.as_ref().ok_or_else(|| {
+                DataFusionError::NotImplemented(
+                    "NULL patterns not supported in regex_match".to_string(),
+                )
+            })?;
+
+            let pattern = clean_non_meta_escapes(pattern);
+
+            let pattern = regex::Regex::new(&pattern).map_err(|e| {
+                DataFusionError::Plan(format!("error compiling regex pattern: {e}"))
+            })?;
+
+            match &args[0] {
+                ColumnarValue::Array(arr) => {
+                    let results = datafusion::arrow::array::as_string_array(arr)
+                        .iter()
+                        .map(|row| row.map(|v| pattern.is_match(v) == matches))
+                        .collect::<BooleanArray>();
+
+                    Ok(ColumnarValue::Array(Arc::new(results) as ArrayRef))
+                }
+                ColumnarValue::Scalar(ScalarValue::Utf8(row)) => {
+                    let res = row.as_ref().map(|v| pattern.is_match(v) == matches);
+                    Ok(ColumnarValue::Scalar(ScalarValue::Boolean(res)))
+                }
+                ColumnarValue::Scalar(v) => Err(DataFusionError::Plan(format!(
+                    "regex_match({matches}) expected first argument to be utf8, got ('{v}')"
+                ))),
+            }
+        };
+
+        Arc::new(func)
+    }
+
+    #[test]
+    fn regex_cache_is_bounded_and_refreshes_lru() {
+        let mut cache = RegexCache::default();
+        let first = cache.get_or_compile("cache_first").unwrap();
+        for index in 1..REGEX_CACHE_CAPACITY {
+            cache.get_or_compile(&format!("cache_{index}")).unwrap();
+        }
+        assert!(Arc::ptr_eq(
+            &first,
+            &cache.get_or_compile("cache_first").unwrap()
+        ));
+        cache.get_or_compile("cache_overflow").unwrap();
+        assert_eq!(cache.entries.len(), REGEX_CACHE_CAPACITY);
+        assert!(!cache.entries.contains_key("cache_1"));
+        assert!(cache.entries.contains_key("cache_first"));
+        for index in 0..REGEX_CACHE_CAPACITY * 2 {
+            cache.get_or_compile(&format!("extra_{index}")).unwrap();
+            assert_eq!(cache.entries.len(), REGEX_CACHE_CAPACITY);
+        }
+        assert!(!cache.entries.contains_key("cache_first"));
+        assert!(cache.get_or_compile("[").is_err());
+        assert_eq!(cache.entries.len(), REGEX_CACHE_CAPACITY);
+    }
+
+    #[test]
+    fn regex_cache_concurrent_misses_compile_once() {
+        let cache = Arc::new(Mutex::new(RegexCache::default()));
+        let compiled: usize = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let cache = Arc::clone(&cache);
+                    scope.spawn(move || {
+                        cache.lock().get_or_compile("concurrent_pattern").unwrap();
+                        REGEX_COMPILATIONS.get()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .sum()
+        });
+        assert_eq!(compiled, 1);
+    }
+
+    #[test]
+    fn regex_constant_pattern_compiles_once_across_batches() {
+        let before = REGEX_COMPILATIONS.get();
+        for _ in 0..5 {
+            for matches in [true, false] {
+                let args = [
+                    ColumnarValue::Array(Arc::new(StringArray::from(vec![
+                        Some("cache:batch_42"),
+                        None,
+                        Some(""),
+                    ]))),
+                    ColumnarValue::Scalar(ScalarValue::Utf8(Some(r"cache\:batch_\d+".into()))),
+                ];
+                regex_match_expr_impl(matches)(&args).unwrap();
+            }
+        }
+        assert_eq!(REGEX_COMPILATIONS.get() - before, 1);
+        let before = REGEX_COMPILATIONS.get();
+        cached_regex(r"cache:batch_\d+").unwrap();
+        assert_eq!(REGEX_COMPILATIONS.get(), before);
+    }
+
+    #[test]
+    fn regex_boolean_differential_strings_nulls_and_errors() {
+        let rows = vec![
+            None,
+            Some(""),
+            Some("error:42"),
+            Some("中文é🙂"),
+            Some("panic\\path"),
+        ];
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(rows.clone())),
+            Arc::new(LargeStringArray::from(rows.clone())),
+            Arc::new(StringViewArray::from(rows.clone())),
+        ];
+        for matches in [true, false] {
+            for pattern in [
+                Some(""),
+                Some(r"\:"),
+                Some(r"(err|panic)"),
+                Some("中文|é|🙂"),
+                Some("["),
+                None,
+            ] {
+                let pattern = ColumnarValue::Scalar(ScalarValue::Utf8(pattern.map(str::to_owned)));
+                let expected = legacy_regex_match_expr_impl(matches)(&[
+                    ColumnarValue::Array(Arc::clone(&arrays[0])),
+                    pattern.clone(),
+                ]);
+                for array in &arrays {
+                    let actual = regex_match_expr_impl(matches)(&[
+                        ColumnarValue::Array(Arc::clone(array)),
+                        pattern.clone(),
+                    ]);
+                    match (&actual, &expected) {
+                        (Ok(ColumnarValue::Array(actual)), Ok(ColumnarValue::Array(expected))) => {
+                            assert_eq!(actual.to_data(), expected.to_data())
+                        }
+                        (Err(actual), Err(expected)) => {
+                            assert_eq!(actual.to_string(), expected.to_string())
+                        }
+                        _ => panic!("result mismatch: {actual:?} vs {expected:?}"),
+                    }
+                }
+                for row in &rows {
+                    let args = [
+                        ColumnarValue::Scalar(ScalarValue::Utf8(row.map(str::to_owned))),
+                        pattern.clone(),
+                    ];
+                    assert_eq!(
+                        format!("{:?}", regex_match_expr_impl(matches)(&args)),
+                        format!("{:?}", legacy_regex_match_expr_impl(matches)(&args)),
+                    );
+                }
+            }
+            let args = [
+                ColumnarValue::Array(Arc::clone(&arrays[0])),
+                ColumnarValue::Array(Arc::clone(&arrays[0])),
+            ];
+            assert_eq!(
+                regex_match_expr_impl(matches)(&args)
+                    .unwrap_err()
+                    .to_string(),
+                legacy_regex_match_expr_impl(matches)(&args)
+                    .unwrap_err()
+                    .to_string(),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn regex_planner_coercion_and_physical_roundtrip() {
+        use datafusion::physical_plan::collect;
+        use datafusion_proto::bytes::{
+            physical_plan_from_bytes_with_extension_codec,
+            physical_plan_to_bytes_with_extension_codec,
+        };
+
+        use crate::datafusion::{
+            distributed_plan::codec::get_physical_extension_codec,
+            udf::regexp_matches_udf::REGEX_MATCHES_UDF,
+        };
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let rows = vec![Some("error42"), None, Some("中文")];
+            let array: ArrayRef = match data_type {
+                DataType::Utf8 => Arc::new(StringArray::from(rows)),
+                DataType::LargeUtf8 => Arc::new(LargeStringArray::from(rows)),
+                _ => Arc::new(StringViewArray::from(rows)),
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new("s", data_type.clone(), true)]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).unwrap();
+            let ctx = SessionContext::new();
+            ctx.register_udf(REGEX_MATCH_UDF.clone());
+            ctx.register_udf(REGEX_NOT_MATCH_UDF.clone());
+            ctx.register_udf(REGEX_MATCHES_UDF.clone());
+            ctx.register_table(
+                "t",
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+            )
+            .unwrap();
+            let plan = ctx.sql("SELECT re_match(s, 'err'), re_not_match(s, 'err'), re_matches(s, '[0-9]+') FROM t")
+                .await.unwrap().create_physical_plan().await.unwrap();
+            let display = datafusion::physical_plan::displayable(plan.as_ref())
+                .indent(true)
+                .to_string();
+            println!("{data_type:?}: {display}");
+            if data_type != DataType::Utf8 {
+                assert!(display.contains("CAST(s@0 AS Utf8)"), "{display}");
+            }
+            let codec = get_physical_extension_codec();
+            let bytes =
+                physical_plan_to_bytes_with_extension_codec(Arc::clone(&plan), &codec).unwrap();
+            let restored =
+                physical_plan_from_bytes_with_extension_codec(&bytes, &ctx.task_ctx(), &codec)
+                    .unwrap();
+            assert_eq!(plan.schema(), restored.schema());
+            let expected = collect(plan, ctx.task_ctx()).await.unwrap();
+            let actual = collect(restored, ctx.task_ctx()).await.unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(actual.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+        }
     }
 }
