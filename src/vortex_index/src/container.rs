@@ -949,6 +949,12 @@ fn container_from_meta(
         *target = Some(slice(range));
     }
 
+    if let Some(BlobHandle::Ranged(blob)) = &mut docs {
+        let config = crate::docs_footer::settings()
+            .map_err(|error| VixError::Malformed(error.to_string()))?;
+        blob.configure_docs_footer(config);
+    }
+
     Ok(VixContainer {
         pending_memory: None,
         properties: meta.properties,
