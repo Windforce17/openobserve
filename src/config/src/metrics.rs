@@ -587,6 +587,54 @@ pub static DISK_CACHE_DELETE_ERRORS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
 
 // querier disk block cache stats (block-granular tier behind the whole-file
 // disk cache; see infra::cache::file_data::block)
+pub static QUERY_DISK_BLOCK_CACHE_EVICTION_BATCHES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "query_disk_block_cache_eviction_batches_total",
+            "Block cache capacity eviction sweeps that acquired the bucket eviction gate",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static QUERY_DISK_BLOCK_CACHE_EVICTION_BYTES_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "query_disk_block_cache_eviction_bytes_total",
+            "Sum of present bytes released by block cache capacity eviction sweeps",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MIN: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "query_disk_block_cache_bucket_used_bytes_min",
+            "Minimum block cache bucket usage, sampled every 15 seconds",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
+pub static QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MAX: Lazy<IntGauge> = Lazy::new(|| {
+    IntGauge::with_opts(
+        Opts::new(
+            "query_disk_block_cache_bucket_used_bytes_max",
+            "Maximum block cache bucket usage, sampled every 15 seconds",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+
 pub static QUERY_DISK_BLOCK_CACHE_USED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     IntGaugeVec::new(
         Opts::new(
@@ -2925,6 +2973,26 @@ fn register_metrics(registry: &Registry) {
         .expect("Metric registered");
     registry
         .register(Box::new(DISK_CACHE_DELETE_ERRORS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(
+            QUERY_DISK_BLOCK_CACHE_EVICTION_BATCHES_TOTAL.clone(),
+        ))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(
+            QUERY_DISK_BLOCK_CACHE_EVICTION_BYTES_TOTAL.clone(),
+        ))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(
+            QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MIN.clone(),
+        ))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(
+            QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MAX.clone(),
+        ))
         .expect("Metric registered");
     registry
         .register(Box::new(QUERY_DISK_BLOCK_CACHE_USED_BYTES.clone()))

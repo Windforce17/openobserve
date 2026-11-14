@@ -166,7 +166,7 @@ pub async fn init() -> Result<(), anyhow::Error> {
         root,
         block_size,
         per_bucket,
-        (per_bucket / 10).max(block_size),
+        release_size(per_bucket, cfg.disk_cache.block_release_percent, block_size),
         cfg.disk_cache.effective_block_strategy(),
         cfg.disk_cache.bucket_num,
         cfg.disk_cache.block_fill_queue_size as u64,
@@ -174,6 +174,17 @@ pub async fn init() -> Result<(), anyhow::Error> {
     if GLOBAL.set(Arc::clone(&cache)).is_err() {
         return Ok(());
     }
+    let observed = Arc::downgrade(&cache);
+    tokio::task::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            let Some(cache) = observed.upgrade() else {
+                break;
+            };
+            cache.update_bucket_usage_metrics();
+        }
+    });
     tokio::task::spawn(async move {
         log::info!("Loading disk block cache start");
         match cache.load().await {
@@ -182,6 +193,16 @@ pub async fn init() -> Result<(), anyhow::Error> {
         }
     });
     Ok(())
+}
+
+fn release_size(per_bucket: u64, percent: usize, block_size: u64) -> u64 {
+    assert!(
+        (1..=50).contains(&percent),
+        "validated block release percentage"
+    );
+    let bytes = u64::try_from(u128::from(per_bucket) * percent as u128 / 100)
+        .expect("a validated percentage cannot exceed the bucket capacity");
+    bytes.max(block_size)
 }
 
 /// The kernel's boot id, recorded in the lineage marker for diagnostics and
@@ -1136,6 +1157,24 @@ impl BlockCache {
         (max, used, entries)
     }
 
+    fn bucket_usage_bounds(&self) -> (u64, u64) {
+        self.buckets
+            .iter()
+            .fold((u64::MAX, 0), |(min, max), bucket| {
+                let used = bucket.cur_size.load(Ordering::Relaxed);
+                (min.min(used), max.max(used))
+            })
+    }
+
+    fn update_bucket_usage_metrics(&self) {
+        let (min, max) = self.bucket_usage_bounds();
+        // Prometheus integer gauges are signed; saturate instead of wrapping.
+        metrics::QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MIN
+            .set(i64::try_from(min).unwrap_or(i64::MAX));
+        metrics::QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MAX
+            .set(i64::try_from(max).unwrap_or(i64::MAX));
+    }
+
     fn get_entry(&self, key: &str) -> Option<Arc<Entry>> {
         self.bucket(key).index.read().entries.get(key).cloned()
     }
@@ -1526,6 +1565,14 @@ impl BlockCache {
         {
             return;
         }
+        let need = need
+            .max(
+                bucket
+                    .cur_size
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(bucket.max_size),
+            )
+            .max(self.block_size);
         let start = std::time::Instant::now();
         let mut victims = Vec::new();
         let mut released = 0u64;
@@ -1546,6 +1593,8 @@ impl BlockCache {
             bucket.pend_unlinks(&victims);
         }
         bucket.cur_size.fetch_sub(released, Ordering::Relaxed);
+        metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BATCHES_TOTAL.inc();
+        metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BYTES_TOTAL.inc_by(released);
         bucket.evicting.store(false, Ordering::Release);
         log::info!(
             "[BlockCache] evicted {} entries, released {released} bytes, took {} ms",
@@ -2167,6 +2216,120 @@ mod tests {
         if strategy == "fifo" {
             assert_eq!(cache.bucket(a).touch_write_locks.load(Ordering::Relaxed), 0);
         }
+    }
+
+    #[test]
+    fn release_percent_default_is_exact_and_arithmetic_does_not_wrap() {
+        for capacity in [0, 1, 99, 100, 101, 65_536, 64 << 30, u64::MAX] {
+            assert_eq!(release_size(capacity, 10, BS), (capacity / 10).max(BS));
+            for percent in [1, 5, 10, 50] {
+                let expected = (u128::from(capacity) * percent as u128 / 100).max(u128::from(BS));
+                assert_eq!(u128::from(release_size(capacity, percent, BS)), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn release_percent_controls_actual_capacity_eviction() {
+        for percent in [1, 5, 10, 50] {
+            let dir = tempfile::tempdir().unwrap();
+            let max_size = 100 * BS;
+            let cache = BlockCache::new(
+                dir.path().to_path_buf(),
+                BS,
+                max_size,
+                release_size(max_size, percent, BS),
+                "fifo",
+                1,
+                FILL_BUDGET,
+            );
+            let remote = Remote::new(BS as usize);
+            let fetch = remote.fetcher();
+            for i in 0..100 {
+                cache
+                    .read_through(&format!("files/release/logs/{i}"), 0..BS, None, &fetch)
+                    .await
+                    .unwrap();
+                settle(&cache).await;
+            }
+            assert_eq!(cache.stats().1, max_size);
+            let batches = metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BATCHES_TOTAL.get();
+            let bytes = metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BYTES_TOTAL.get();
+            cache
+                .read_through("files/release/logs/overflow", 0..BS, None, &fetch)
+                .await
+                .unwrap();
+            settle(&cache).await;
+            let released = percent as u64 * BS;
+            assert_eq!(cache.stats().1, 101 * BS - released, "{percent}%");
+            assert_eq!(cache.stats().2, 101 - percent);
+            for i in 0..percent {
+                assert!(
+                    cache
+                        .get_entry(&format!("files/release/logs/{i}"))
+                        .is_none()
+                );
+            }
+            assert!(metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BATCHES_TOTAL.get() > batches);
+            assert!(metrics::QUERY_DISK_BLOCK_CACHE_EVICTION_BYTES_TOTAL.get() >= bytes + released);
+        }
+    }
+
+    #[tokio::test]
+    async fn eviction_covers_existing_overage_and_at_least_one_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_with_strategy(dir.path(), 2 * BS, "fifo");
+        if !keeps_holes(dir.path()) {
+            return;
+        }
+        // Startup adoption does not trigger eviction. Adopt real dense files
+        // above capacity, then exercise the next queued fill's eviction.
+        for i in 0..5 {
+            let key = format!("files/overage/logs/{i}");
+            let path = cache.path_for(&key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![1; BS as usize]).unwrap();
+            assert!(cache.adopt_file(&key, &path));
+        }
+        let remote = Remote::new(BS as usize);
+        let fetch = remote.fetcher();
+        cache
+            .read_through("files/overage/logs/new", 0..BS, None, &fetch)
+            .await
+            .unwrap();
+        settle(&cache).await;
+        assert_eq!(cache.stats(), (2 * BS, 2 * BS, 2));
+        cache.evict(&cache.buckets[0], 0);
+        assert_eq!(cache.stats(), (2 * BS, BS, 1));
+    }
+
+    #[tokio::test]
+    async fn bucket_usage_extrema_include_empty_buckets_without_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = BlockCache::new(
+            dir.path().to_path_buf(),
+            BS,
+            10 * BS,
+            BS,
+            "fifo",
+            3,
+            FILL_BUDGET,
+        );
+        assert_eq!(cache.bucket_usage_bounds(), (0, 0));
+        cache.buckets[0].cur_size.store(BS, Ordering::Relaxed);
+        cache.buckets[1].cur_size.store(3 * BS, Ordering::Relaxed);
+        assert_eq!(cache.bucket_usage_bounds(), (0, 3 * BS));
+        cache.buckets[2].cur_size.store(2 * BS, Ordering::Relaxed);
+        assert_eq!(cache.bucket_usage_bounds(), (BS, 3 * BS));
+        cache.update_bucket_usage_metrics();
+        assert_eq!(
+            metrics::QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MIN.get(),
+            BS as i64
+        );
+        assert_eq!(
+            metrics::QUERY_DISK_BLOCK_CACHE_BUCKET_USED_BYTES_MAX.get(),
+            (3 * BS) as i64
+        );
     }
 
     #[tokio::test]
