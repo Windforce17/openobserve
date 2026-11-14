@@ -1005,6 +1005,19 @@ pub static QUERY_EMPTY_QUERIER_REQUESTS_SKIPPED_TOTAL: Lazy<IntCounter> = Lazy::
     .expect("Metric created")
 });
 
+pub static QUERY_STAR_HITS_BATCHES_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    IntCounterVec::new(
+        Opts::new(
+            "query_star_hits_batches_total",
+            "Row-store star batches converted by the direct or fallback path",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+        &["path"],
+    )
+    .expect("Metric created")
+});
+
 // Follower storage scan branch capped by ZO_STORAGE_SCAN_MAX_BYTES: the
 // query kept the newest files within the budget and was marked partial.
 pub static QUERY_STORAGE_SCAN_CAPPED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -3226,6 +3239,9 @@ fn register_metrics(registry: &Registry) {
     registry
         .register(Box::new(QUERY_EMPTY_QUERIER_REQUESTS_SKIPPED_TOTAL.clone()))
         .expect("Metric registered");
+    registry
+        .register(Box::new(QUERY_STAR_HITS_BATCHES_TOTAL.clone()))
+        .expect("Metric registered");
 
     // stream stats aggregation metrics
     registry
@@ -3751,6 +3767,37 @@ mod tests {
     // -----------------------------------------------------------------------
     // gather
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn star_direct_hits_metrics_registered_with_fixed_labels() {
+        for path in ["direct", "fallback"] {
+            QUERY_STAR_HITS_BATCHES_TOTAL
+                .with_label_values(&[path])
+                .inc();
+        }
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let metrics = registry.gather();
+        let family = metrics
+            .iter()
+            .find(|metric| metric.name() == "zo_query_star_hits_batches_total")
+            .unwrap();
+        let mut paths: Vec<_> = family
+            .get_metric()
+            .iter()
+            .map(|metric| {
+                let labels = metric.get_label();
+                assert_eq!(labels.len(), 4);
+                labels
+                    .iter()
+                    .find(|label| label.name() == "path")
+                    .unwrap()
+                    .value()
+            })
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["direct", "fallback"]);
+    }
 
     #[test]
     fn test_gather_returns_string() {
