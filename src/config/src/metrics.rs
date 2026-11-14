@@ -2399,6 +2399,28 @@ pub static SEGMENT_SCAN_RETAINED_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
     )
     .expect("Metric created")
 });
+pub static SEGMENT_SCAN_REGIONS_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "segment_scan_regions_total",
+            "Version-2 directory regions considered by query filters, including skipped regions",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
+pub static SEGMENT_SCAN_REGIONS_SKIPPED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
+    IntCounter::with_opts(
+        Opts::new(
+            "segment_scan_regions_skipped_total",
+            "Version-2 regions skipped before reading any frame header",
+        )
+        .namespace(NAMESPACE)
+        .const_labels(create_const_labels()),
+    )
+    .expect("Metric created")
+});
 /// Segment scans that waited for pool bytes (`waited`) or gave up after the
 /// full wait (`timed_out`). `waited` non-zero means concurrent scans
 /// oversubscribed the pool and were serialized instead of OOM-killing the
@@ -3541,6 +3563,12 @@ fn register_metrics(registry: &Registry) {
         .register(Box::new(SEGMENT_SCAN_RETAINED_BYTES.clone()))
         .expect("Metric registered");
     registry
+        .register(Box::new(SEGMENT_SCAN_REGIONS_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
+        .register(Box::new(SEGMENT_SCAN_REGIONS_SKIPPED_TOTAL.clone()))
+        .expect("Metric registered");
+    registry
         .register(Box::new(SEGMENT_SCAN_POOL_WAITS_TOTAL.clone()))
         .expect("Metric registered");
     registry
@@ -3759,6 +3787,35 @@ mod tests {
         register_metrics(&registry);
         let gathered = registry.gather();
         assert!(!gathered.is_empty());
+    }
+
+    #[test]
+    fn test_segment_region_counters_registered_with_fixed_labels() {
+        let registry = Registry::new();
+        register_metrics(&registry);
+        let gathered = registry.gather();
+        for name in [
+            "segment_scan_regions_total",
+            "segment_scan_regions_skipped_total",
+        ] {
+            let expected = format!("{NAMESPACE}_{name}");
+            let family = gathered
+                .iter()
+                .find(|family| family.name() == expected)
+                .expect("segment region counter must be registered");
+            assert_eq!(
+                family.get_field_type(),
+                prometheus::proto::MetricType::COUNTER
+            );
+            assert_eq!(family.get_metric().len(), 1);
+            let mut labels = family.get_metric()[0]
+                .get_label()
+                .iter()
+                .map(|label| label.name())
+                .collect::<Vec<_>>();
+            labels.sort_unstable();
+            assert_eq!(labels, ["cluster", "instance", "role"]);
+        }
     }
 
     #[test]
