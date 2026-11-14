@@ -2952,6 +2952,12 @@ pub struct Limit {
     )]
     pub query_querier_timeout: u64,
     #[env_config(
+        name = "ZO_QUERY_SKIP_IDLE_ENRICH_NODE",
+        default = false,
+        help = "Skip the otherwise mandatory empty querier for ordinary scans and non-grouping-set partial aggregates. Enrichment, final aggregates, grouping sets, multi-input plans, ingesters and super-cluster dispatch retain their existing behavior."
+    )]
+    pub query_skip_idle_enrich_node: bool,
+    #[env_config(
         name = "ZO_QUERY_REDISPATCH_ENABLED",
         default = true,
         help = "Let the leader send a querier partition ONE more time to another querier when \
@@ -5755,6 +5761,62 @@ pub fn ensure_not_empty(s: &str, name: &str) -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_enrich_config_child() {
+        let Ok(expected) = std::env::var("OO_TEST_IDLE_ENRICH_EXPECTED") else {
+            return;
+        };
+        let cfg = Config::init().unwrap();
+        assert_eq!(cfg.limit.query_skip_idle_enrich_node, expected == "true");
+    }
+
+    #[test]
+    fn idle_enrich_config_default_valid_and_invalid_values() {
+        for value in [
+            None,
+            Some("false"),
+            Some("true"),
+            Some("TRUE"),
+            Some("1"),
+            Some(""),
+            Some("invalid"),
+        ] {
+            let valid = matches!(value, None | Some("false" | "true" | "TRUE"));
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::tests::idle_enrich_config_child",
+                    "--nocapture",
+                ])
+                .env(
+                    "OO_TEST_IDLE_ENRICH_EXPECTED",
+                    if matches!(value, Some("true" | "TRUE")) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )
+                .env_remove("ZO_QUERY_SKIP_IDLE_ENRICH_NODE");
+            if let Some(value) = value {
+                child.env("ZO_QUERY_SKIP_IDLE_ENRICH_NODE", value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "value={value:?}, stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if !valid {
+                assert!(
+                    String::from_utf8_lossy(&output.stderr)
+                        .contains("ZO_QUERY_SKIP_IDLE_ENRICH_NODE")
+                );
+            }
+        }
+    }
 
     #[test]
     fn download_scheduler_defaults_and_rollback_limits() {

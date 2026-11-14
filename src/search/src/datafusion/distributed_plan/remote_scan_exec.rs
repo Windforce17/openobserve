@@ -30,15 +30,21 @@ use config::{
         cluster::NodeInfo,
         inverted_index::IndexOptimizeMode,
         search::{ScanStats, SearchEventType},
+        sql::TableReferenceExt,
+        stream::StreamType,
     },
     utils::rand::generate_random_string,
 };
 use datafusion::{
-    common::{DataFusionError, Result},
+    common::{
+        DataFusionError, Result, TableReference,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     execution::{SendableRecordBatchStream, TaskContext},
     physical_expr::{EquivalenceProperties, Partitioning},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+        aggregates::{AggregateExec, AggregateMode},
         execution_plan::{Boundedness, EmissionType},
         metrics::{ExecutionPlanMetricsSet, MetricsSet},
         stream::RecordBatchStreamAdapter,
@@ -50,7 +56,7 @@ use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 use rand::prelude::SliceRandom;
 
-use super::node::RemoteScanNode;
+use super::{empty_exec::NewEmptyExec, node::RemoteScanNode};
 use crate::datafusion::distributed_plan::{
     codec::get_physical_extension_codec,
     common::{EmptyStream, QueryContext, get_empty_stream, process_partial_err},
@@ -69,7 +75,7 @@ pub struct RemoteScanExec {
     pub peak_memory: Arc<AtomicUsize>,
     pub partial_err: Arc<Mutex<String>>,
     pub cluster_metrics: Arc<Mutex<Vec<Metrics>>>,
-    pub enrich_mode_node_idx: usize,
+    pub enrich_mode_node_idx: Option<usize>,
     pub metrics: ExecutionPlanMetricsSet,
     /// Re-dispatch bookkeeping shared by the partitions of one execution.
     redispatch: Arc<RedispatchState>,
@@ -77,9 +83,18 @@ pub struct RemoteScanExec {
 
 impl RemoteScanExec {
     /// Create a new RemoteScanExec
-    pub fn new(
+    pub fn new(input: Arc<dyn ExecutionPlan>, remote_scan_node: RemoteScanNode) -> Result<Self> {
+        Self::new_with_skip_idle_enrich_node(
+            input,
+            remote_scan_node,
+            config::get_config().limit.query_skip_idle_enrich_node,
+        )
+    }
+
+    fn new_with_skip_idle_enrich_node(
         input: Arc<dyn ExecutionPlan>,
         mut remote_scan_node: RemoteScanNode,
+        skip_idle_enrich_node: bool,
     ) -> Result<Self> {
         let output_partitions = remote_scan_node.nodes.len();
         let cache = Self::compute_properties(&input, output_partitions);
@@ -99,7 +114,14 @@ impl RemoteScanExec {
             .collect::<Vec<_>>();
         // random shuffle the node ids
         node_ids.shuffle(&mut rand::rng());
-        let enrich_mode_node_idx = node_ids.pop().unwrap_or_default();
+        let enrich_mode_node_idx =
+            if skip_idle_enrich_node && can_skip_idle_enrich_node(&input, &remote_scan_node)? {
+                None
+            } else {
+                node_ids
+                    .pop()
+                    .or_else(|| (output_partitions > 0).then_some(0))
+            };
         let redispatch = Arc::new(RedispatchState::new(
             &remote_scan_node,
             enrich_mode_node_idx,
@@ -311,7 +333,7 @@ impl ExecutionPlan for RemoteScanExec {
         let fut = get_remote_batch(
             self.remote_scan_node.clone(),
             partition,
-            partition == self.enrich_mode_node_idx,
+            Some(partition) == self.enrich_mode_node_idx,
             self.input.schema().clone(),
             self.scan_stats(),
             self.partial_err(),
@@ -330,6 +352,53 @@ impl ExecutionPlan for RemoteScanExec {
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
+}
+
+fn can_skip_idle_enrich_node(
+    input: &Arc<dyn ExecutionPlan>,
+    remote_scan_node: &RemoteScanNode,
+) -> Result<bool> {
+    if remote_scan_node.super_cluster_info.is_super_cluster {
+        return Ok(false);
+    }
+    let stream_type = StreamType::from(remote_scan_node.query_identifier.stream_type.as_str());
+    let mut has_scan = false;
+    let mut can_skip = true;
+    input.apply(|plan| {
+        if let Some(scan) = plan.downcast_ref::<NewEmptyExec>() {
+            has_scan = true;
+            // Resolve exactly as the follower does, including qualified table names.
+            if TableReference::from(scan.name()).get_stream_type(stream_type)
+                == StreamType::EnrichmentTables
+            {
+                can_skip = false;
+            }
+        } else if let Some(aggregate) = plan.downcast_ref::<AggregateExec>() {
+            // A final/single aggregate pushed below this boundary can produce a row
+            // on empty input. Keep its designated node; no leader merge is guaranteed.
+            // Grouping sets also need the partial stage to seed empty total groups.
+            if aggregate.group_expr().has_grouping_set()
+                || !matches!(
+                    aggregate.mode(),
+                    AggregateMode::Partial | AggregateMode::PartialReduce
+                )
+            {
+                can_skip = false;
+            }
+        } else if plan.children().len() != 1
+            || matches!(plan.name(), "AnalyzeExec" | "DistributeAnalyzeExec")
+        {
+            // Other leaves (including broadcast enrichment) and multi-input plans
+            // or analysis output may supply rows independently of the file list.
+            can_skip = false;
+        }
+        Ok(if can_skip {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
+    })?;
+    Ok(can_skip && has_scan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,6 +450,7 @@ async fn get_remote_batch(
         && !enrich_mode
         && remote_scan_node.is_file_list_empty(partition)
     {
+        config::metrics::QUERY_EMPTY_QUERIER_REQUESTS_SKIPPED_TOTAL.inc();
         let empty_stream = EmptyStream::new(
             &trace_id,
             schema.clone(),
@@ -502,7 +572,7 @@ struct RedispatchInner {
 }
 
 impl RedispatchState {
-    fn new(remote_scan_node: &RemoteScanNode, enrich_mode_node_idx: usize) -> Self {
+    fn new(remote_scan_node: &RemoteScanNode, enrich_mode_node_idx: Option<usize>) -> Self {
         let is_super = remote_scan_node.super_cluster_info.is_super_cluster;
         let n = remote_scan_node.nodes.len();
         let eligible: Vec<bool> = remote_scan_node
@@ -513,7 +583,7 @@ impl RedispatchState {
         let participant: Vec<bool> = (0..n)
             .map(|i| {
                 eligible[i]
-                    && (i == enrich_mode_node_idx || !remote_scan_node.is_file_list_empty(i))
+                    && (Some(i) == enrich_mode_node_idx || !remote_scan_node.is_file_list_empty(i))
             })
             .collect();
         let participants = participant.iter().filter(|p| **p).count();
@@ -1091,6 +1161,10 @@ pub fn is_parquet_file_not_found(e: &tonic::Status) -> bool {
 }
 
 #[cfg(test)]
+#[path = "idle_enrich_tests.rs"]
+mod idle_enrich_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
@@ -1362,7 +1436,7 @@ mod tests {
     async fn engine_generation_failure_has_at_most_one_redispatch() {
         let node = scan_node(&[true, true, false], &[]);
         for policy in [None, Some(POLICY)] {
-            let state = RedispatchState::new(&node, usize::MAX);
+            let state = RedispatchState::new(&node, None);
             let calls = Mutex::new(Vec::new());
             let result = race_attempts(
                 "engine-retry",
@@ -1383,7 +1457,7 @@ mod tests {
                 assert_eq!(*calls.lock(), vec![(0, false), (2, true)]);
             }
         }
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         let result = race_attempts(
             "engine-retry",
             0,
@@ -1407,7 +1481,7 @@ mod tests {
     async fn engine_generation_unknown_node_never_connects_and_reports_partial() {
         for ingesters in [vec![], vec![0]] {
             let remote_scan_node = scan_node(&[true], &ingesters);
-            let state = RedispatchState::new(&remote_scan_node, 0);
+            let state = RedispatchState::new(&remote_scan_node, Some(0));
             if !ingesters.is_empty() {
                 assert!(
                     !state.is_eligible(0),
@@ -1492,7 +1566,7 @@ mod tests {
     fn pick_target_skips_own_node_ingesters_and_suspects_and_spreads_load() {
         // n0, n1 have files; n2, n3 are idle queriers; n4 is an ingester.
         let node = scan_node(&[true, true, false, false, true], &[4]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         assert!(!state.is_eligible(4));
         let first = state.pick_target(0, RedispatchReason::Failure).unwrap();
         assert!(
@@ -1514,7 +1588,7 @@ mod tests {
     fn straggler_budget_caps_hedges_but_not_failure_redispatch() {
         // Four participants: a budget of one straggler re-dispatch.
         let node = scan_node(&[true, true, true, true, false, false], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         assert!(!state.is_straggler(0, 10_000, &POLICY), "no answers yet");
         state.record_answer(2, 100);
         state.record_answer(3, 100);
@@ -1531,7 +1605,7 @@ mod tests {
     #[tokio::test]
     async fn transport_failure_is_redispatched_once_to_another_querier() {
         let node = scan_node(&[true, true, false], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let result = race_attempts(
             "t",
@@ -1565,7 +1639,7 @@ mod tests {
             tonic::Status::deadline_exceeded("timeout"),
             tonic::Status::cancelled("cancelled by user"),
         ] {
-            let state = RedispatchState::new(&node, usize::MAX);
+            let state = RedispatchState::new(&node, None);
             let calls = Arc::new(Mutex::new(Vec::new()));
             let code = status.code();
             let status = Mutex::new(Some(status));
@@ -1597,7 +1671,7 @@ mod tests {
     #[tokio::test]
     async fn at_most_one_extra_attempt_and_the_first_failure_is_reported() {
         let node = scan_node(&[true, true, true, false], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let result = race_attempts(
             "t",
@@ -1622,7 +1696,7 @@ mod tests {
     #[tokio::test]
     async fn no_redispatch_without_policy() {
         let node = scan_node(&[true, true, false], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let result = race_attempts(
             "t",
@@ -1645,7 +1719,7 @@ mod tests {
     async fn straggler_gets_one_extra_attempt_and_the_first_answer_wins() {
         // n1 already answered, so it is the only candidate target.
         let node = scan_node(&[true, true], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         // The other participant answered in 10 ms: the threshold is the 50 ms minimum.
         state.record_answer(1, 10);
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1685,7 +1759,7 @@ mod tests {
     async fn first_attempt_still_wins_when_the_extra_attempt_fails() {
         // n1 already answered, so it is the only candidate target.
         let node = scan_node(&[true, true], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         state.record_answer(1, 10);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let result = race_attempts(
@@ -1716,7 +1790,7 @@ mod tests {
     #[tokio::test]
     async fn extra_attempt_is_cancelled_when_the_first_attempt_answers() {
         let node = scan_node(&[true, true, false], &[]);
-        let state = RedispatchState::new(&node, usize::MAX);
+        let state = RedispatchState::new(&node, None);
         state.record_answer(1, 10);
         let extra_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let result = race_attempts(
