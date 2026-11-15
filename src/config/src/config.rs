@@ -3678,6 +3678,14 @@ pub struct Compact {
     #[env_config(name = "ZO_COMPACT_MAX_FILE_SIZE", default = 2048)] // MB
     pub max_file_size: usize,
     #[env_config(
+        name = "ZO_COMPACT_MAX_FILE_SIZE_COMPRESSED",
+        default = 0,
+        help = "Compaction input compressed-byte target in MiB. 0 preserves legacy behavior. \
+                When enabled, ZO_COMPACT_MAX_FILE_SIZE remains the uncompressed hard cap; \
+                either half-target makes an existing file final. Excludes index sidecars and downsampling."
+    )]
+    pub max_file_size_compressed: usize,
+    #[env_config(
         name = "ZO_COMPACT_DOWNLOAD_BUDGET_MB",
         default = 2048,
         help = "Process-wide cap (MB) on in-flight compaction download bytes across ALL merge \
@@ -5599,16 +5607,16 @@ fn check_compact_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
         cfg.compact.interval = 10;
     }
 
-    // Convert the compaction size limit from configured MB to runtime bytes.
-    // ONE target for every file class (2026-09-30): the former per-class
-    // "indexed" ceilings produced a second merge generation for a 1.6× size
-    // gain (logs 231 rewrites / h, traces 1,294 / h, 3.45 TB rewritten per
-    // 1.8 TB ingested) while the single-file heal already rebuilt index-less
-    // files at this size.
+    // The original-byte target remains a hard cap in compressed-target mode.
     if cfg.compact.max_file_size < 1 {
         cfg.compact.max_file_size = 512;
     }
-    cfg.compact.max_file_size *= 1024 * 1024;
+    cfg.compact.max_file_size =
+        compact_size_bytes(cfg.compact.max_file_size, "ZO_COMPACT_MAX_FILE_SIZE")?;
+    cfg.compact.max_file_size_compressed = compact_size_bytes(
+        cfg.compact.max_file_size_compressed,
+        "ZO_COMPACT_MAX_FILE_SIZE_COMPRESSED",
+    )?;
     if cfg.compact.delete_files_delay_hours < 1 {
         cfg.compact.delete_files_delay_hours = 2;
     }
@@ -5642,6 +5650,21 @@ fn check_compact_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
     }
 
     Ok(())
+}
+
+fn compact_size_bytes(mib: usize, name: &str) -> Result<usize, anyhow::Error> {
+    mib.checked_mul(1024 * 1024)
+        .filter(|bytes| i64::try_from(*bytes).is_ok())
+        .ok_or_else(|| anyhow::anyhow!("{name} is too large to represent as signed byte metadata"))
+}
+
+impl Compact {
+    pub fn merge_size_limits(&self) -> crate::compact::MergeSizeLimits {
+        crate::compact::MergeSizeLimits::new(
+            self.max_file_size as i64,
+            self.max_file_size_compressed as i64,
+        )
+    }
 }
 
 fn check_sns_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
@@ -7828,5 +7851,74 @@ mod empty_topn_config_tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod compressed_target_config_tests {
+    use super::{Compact, Config, check_compact_config};
+
+    #[test]
+    fn compressed_target_env_defaults_off_and_rejects_invalid_values() {
+        const KEY: &str = "ZO_COMPACT_MAX_FILE_SIZE_COMPRESSED";
+        const CHILD: &str = "OO_COMPRESSED_TARGET_CONFIG_EXPECTED";
+        if let Ok(expected) = std::env::var(CHILD) {
+            let mut cfg = Config {
+                compact: Compact::init().expect("invalid compaction environment"),
+                ..Default::default()
+            };
+            check_compact_config(&mut cfg).expect("invalid compaction size");
+            assert_eq!(
+                cfg.compact.max_file_size_compressed,
+                expected.parse::<usize>().unwrap() * 1024 * 1024
+            );
+            return;
+        }
+        for (value, expected) in [
+            (None, Some(0)),
+            (Some("0"), Some(0)),
+            (Some("1024"), Some(1024)),
+            (Some("-1"), None),
+            (Some("1.5"), None),
+            (Some("garbage"), None),
+            (Some(""), None),
+            (Some("8796093022208"), None),
+            (Some("18446744073709551615"), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::compressed_target_config_tests::compressed_target_env_defaults_off_and_rejects_invalid_values",
+                ])
+                .env(CHILD, expected.unwrap_or(0).to_string())
+                .env("ZO_COMPACT_MAX_FILE_SIZE", "4096")
+                .env_remove(KEY);
+            if let Some(value) = value {
+                child.env(KEY, value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {output:?}"
+            );
+            if expected.is_some() {
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_target_runtime_units_and_original_hard_cap() {
+        let mut cfg = Config::default();
+        cfg.compact.max_file_size = 4096;
+        cfg.compact.max_file_size_compressed = 1024;
+        check_compact_config(&mut cfg).unwrap();
+        let limits = cfg.compact.merge_size_limits();
+        assert_eq!(limits.original, 4096 * 1024 * 1024);
+        assert_eq!(limits.compressed, 1024 * 1024 * 1024);
+        cfg.compact.max_file_size = usize::MAX;
+        assert!(check_compact_config(&mut cfg).is_err());
     }
 }

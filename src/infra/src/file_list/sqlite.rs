@@ -76,6 +76,16 @@ GROUP BY stream, date, bloom_ver
 ORDER BY date DESC, bloom_ver LIMIT $3;
 "#;
 
+const OLD_DATA_HOURS_SQL: &str = r#"
+SELECT date
+    FROM file_list
+    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4
+        AND original_size <= $5 AND compressed_size <= $6
+    GROUP BY date
+    HAVING count(*) >= $7
+        OR ($8 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
+            "#;
+
 pub struct SqliteFileList {}
 
 impl SqliteFileList {
@@ -825,23 +835,24 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
         let stream_key = format!("{org_id}/{stream_type}/{stream_name}");
 
         let cfg = get_config();
-        let max_size = if include_oversize {
-            i64::MAX
-        } else {
-            cfg.compact.max_file_size as i64 * 95 / 100
-        };
+        let (max_size, max_compressed_size) = cfg
+            .compact
+            .merge_size_limits()
+            .query_limits(include_oversize);
         let pool = CLIENT_RO.clone();
         let ret = sqlx::query_as::<_, super::FileRecord>(
                 r#"
 SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened
     FROM file_list
-    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4;
+    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4
+        AND compressed_size <= $5;
                 "#,
             )
             .bind(stream_key)
             .bind(date_start)
             .bind(date_end)
             .bind(max_size)
+            .bind(max_compressed_size)
             .fetch_all(&pool)
             .await;
         Ok(ret?.iter().map(|r| r.into()).collect())
@@ -1212,26 +1223,16 @@ SELECT stream, date FROM file_list WHERE index_size > 0 AND bloom_ver = 0 AND da
         let pool = CLIENT_RO.clone();
         let cfg = get_config();
         let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
-        // Indexed .vix rows use the higher dictionary-passthrough target's
-        // half-size debt line ($8); flat and index-less rows stay on the
-        // rebuild-safe global line ($5). $7 preserves the lone-unindexed
-        // healing wedge.
-        let sql = r#"
-SELECT date
-    FROM file_list
-    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4
-        AND original_size <= $5
-    GROUP BY date
-    HAVING count(*) >= $6
-        OR ($7 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
-            "#;
+        let limits = cfg.compact.merge_size_limits();
+        let sql = OLD_DATA_HOURS_SQL;
 
         let ret = sqlx::query(sql)
             .bind(stream_key)
             .bind(time_start)
             .bind(max_ts_upper_bound)
             .bind(time_end)
-            .bind(cfg.compact.max_file_size as i64 / 2)
+            .bind(limits.original / 2)
+            .bind(limits.candidate_compressed_limit())
             .bind(cfg.compact.old_data_min_files)
             .bind(include_lone_unindexed)
             .fetch_all(&pool)
@@ -5593,5 +5594,71 @@ WHERE file_list_jobs.status = $5;"#;
                 .await
                 .unwrap();
         assert_eq!(surviving, 0, "both date groups must be gone");
+    }
+}
+
+#[cfg(test)]
+mod compressed_target_tests {
+    use config::compact::MergeSizeLimits;
+    use sqlx::Row;
+
+    use super::OLD_DATA_HOURS_SQL;
+
+    #[tokio::test]
+    async fn compressed_target_debt_sql_matches_planner_boundaries() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE file_list (stream TEXT, date TEXT, min_ts INTEGER, max_ts INTEGER, original_size INTEGER, compressed_size INTEGER, index_size INTEGER, file TEXT)")
+            .execute(&pool).await.unwrap();
+        for (date, original, compressed, count, index, extension) in [
+            ("a", 50, 10, 2, 1, "vix"),
+            ("b", 51, 1, 2, 1, "vix"),
+            ("c", 1, 11, 2, 1, "vix"),
+            ("d", 1, 1, 1, 0, "vix"),
+            ("e", 1, 1, 1, 0, "parquet"),
+            ("f", 1, 11, 1, 0, "vix"),
+        ] {
+            for id in 0..count {
+                sqlx::query("INSERT INTO file_list VALUES ('s', ?, 1, 2, ?, ?, ?, ?)")
+                    .bind(date)
+                    .bind(original)
+                    .bind(compressed)
+                    .bind(index)
+                    .bind(format!("{id}.{extension}"))
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        for (compressed, include_lone, expected) in [
+            (0, false, vec!["a", "c"]),
+            (0, true, vec!["a", "c", "d", "f"]),
+            (20, false, vec!["a"]),
+            (20, true, vec!["a", "d"]),
+        ] {
+            let limits = MergeSizeLimits::new(100, compressed);
+            let rows = sqlx::query(OLD_DATA_HOURS_SQL)
+                .bind("s")
+                .bind(0_i64)
+                .bind(10_i64)
+                .bind(10_i64)
+                .bind(limits.original / 2)
+                .bind(limits.candidate_compressed_limit())
+                .bind(2_i64)
+                .bind(include_lone)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            let mut actual: Vec<String> = rows.iter().map(|row| row.get("date")).collect();
+            actual.sort();
+            assert_eq!(
+                actual, expected,
+                "compressed={compressed}, lone={include_lone}"
+            );
+        }
+        pool.close().await;
     }
 }
