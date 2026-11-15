@@ -35,6 +35,7 @@ pub(crate) fn plist_cursor_reuse() -> bool {
 /// Standalone engine users also initialize on their first reader open.
 pub fn initialize_reader_compact() -> std::io::Result<()> {
     crate::docs_footer::settings()?;
+    crate::docs_footer_copy::settings()?;
     if PLIST_CURSOR_REUSE.get().is_none() {
         let enabled = parse_plist_cursor_reuse(std::env::var("ZO_VIX_PLIST_CURSOR_REUSE"))?;
         let _ = PLIST_CURSOR_REUSE.set(enabled);

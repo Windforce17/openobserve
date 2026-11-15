@@ -2502,7 +2502,7 @@ fn rebuild_core_file_sidecar_with_caps_and_cancellation(
     // data object it describes (byte-identical by construction here) so a
     // sidecar-first open never needs the data tail. One data-tail read; the
     // heal just streamed the whole object.
-    writer.set_data_footer(vortex_index::read_data_footer_payload(&input.1)?);
+    writer.set_data_source(&input.1)?;
     // W1: the AUTO additive bloom budget is a percentage of the stored
     // data object (untouched by the heal)
     writer.set_data_object_bytes(input.1.len());

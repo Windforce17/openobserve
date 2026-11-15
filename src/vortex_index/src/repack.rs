@@ -210,6 +210,7 @@ pub fn repack_sidecar(
     );
     // S3: the data object's footer, as stored (the repack never touches it)
     let data_footer = read_data_footer_payload(&data)?;
+    let docs_footer_copy = crate::docs_footer_copy::prepare_source(&data, &data_footer)?;
     properties.insert(
         PROP_DATA_FOOTER.to_string(),
         String::from_utf8(data_footer)
@@ -250,10 +251,15 @@ pub fn repack_sidecar(
         };
         blobs.push((BLOB_TYPE_DICT, BLOB_TAG_DICT, part));
     }
-    let sidecar = build_container_parts(
+    let mut sidecar = build_container_parts(
         properties.into_iter().collect(),
         blobs,
         opts.sidecar_tail_zstd,
+    )?;
+    crate::docs_footer_copy::append(
+        &mut sidecar,
+        docs_footer_copy.as_deref(),
+        crate::container::tail_fetch_size(),
     )?;
     Ok(SidecarRepack {
         sidecar,
