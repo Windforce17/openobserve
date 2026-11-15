@@ -18,6 +18,7 @@
 pub mod allocator_reclaim;
 pub mod axum;
 pub mod cluster;
+pub mod compact;
 pub mod config;
 pub mod config_path_manager;
 pub mod datafusion;

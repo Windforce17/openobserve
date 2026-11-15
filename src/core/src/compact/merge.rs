@@ -21,6 +21,7 @@ use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use config::{
     FileFormat,
     cluster::LOCAL_NODE,
+    compact::MergeSizeLimits,
     get_config, ider, is_local_disk_storage,
     meta::stream::{
         FileKey, FileListBookKeepMode, FileListDeleted, FileMeta, MergeStrategy,
@@ -793,7 +794,7 @@ pub async fn merge_by_stream(
                 stream_type,
                 &stream_name,
                 &prefix,
-                cfg.compact.max_file_size as i64,
+                cfg.compact.merge_size_limits(),
                 HourAge {
                     open: is_open_hour,
                     settled: is_settled,
@@ -834,7 +835,7 @@ pub async fn merge_by_stream(
             }
             let (mut batch_groups, replan_required) = queue_required_index_repairs(
                 batch_groups,
-                cfg.compact.max_file_size as i64,
+                cfg.compact.merge_size_limits(),
                 &mut heal_probe,
             )
             .await?;
@@ -1310,7 +1311,7 @@ async fn complete_merge_pass(
 /// the best-effort healing sweep of files outside merge groups.
 async fn queue_required_index_repairs<F, Fut>(
     batches: Vec<MergeBatch>,
-    global_limit: i64,
+    limits: MergeSizeLimits,
     mut heal_reason: F,
 ) -> Result<(Vec<MergeBatch>, bool), anyhow::Error>
 where
@@ -1340,7 +1341,7 @@ where
                 batch.files.iter().all(|file| file.meta.index_size > 0),
                 original_size,
                 compressed_size,
-                global_limit,
+                limits,
             );
         let mut repairs = Vec::new();
         if requires_indexed_merge {
@@ -1416,10 +1417,8 @@ struct PartitionPlan {
 /// - Core files (`.vix`) and flat data files (parquet/vortex) never merge together, and core groups
 ///   are sidecar-homogeneous: indexed and index-less core files never share a group (a mixed group
 ///   rejects the dictionary fast path and rebuilds every input).
-/// - ONE byte target for every class (`ZO_COMPACT_MAX_FILE_SIZE`). Above half of it a file is FINAL
-///   (2026-09-30, "one config, merge once"): the debt line (`ZO_COMPACT_OLD_DATA_MIN_FILES` over
-///   files <= target/2) already treats it as done, so it never joins a merge group - its bytes are
-///   rewritten and indexed at most once.
+/// - A file above either active half-target is final, matching the debt query. Original bytes
+///   always bound decoding; compressed bytes optionally bound storage.
 /// - Healing probes (container-metadata cheap; a current file is a no-op): index-less final files
 ///   every round - the index is the only thing they still need and it is built sidecar-only,
 ///   without rewriting the data (waiting for the closed-hour pass here was the "2 h lag": logs L0s
@@ -1437,33 +1436,41 @@ fn plan_partition(
     stream_type: StreamType,
     stream_name: &str,
     prefix: &str,
-    max_file_size: i64,
+    limits: MergeSizeLimits,
     age: HourAge,
     downsampling: bool,
     job_strategy: &MergeStrategy,
     coverage_enabled: bool,
 ) -> PartitionPlan {
+    // Downsampling aggregates across the full legacy batch (for example AVG).
+    // Splitting it by a new byte target would change aggregation semantics.
+    let limits = if downsampling {
+        MergeSizeLimits::new(limits.original, 0)
+    } else {
+        limits
+    };
     let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
         .into_iter()
         .partition(|f| f.key.ends_with(config::FILE_EXT_VIX));
     let (plain_candidates, indexed_candidates): (Vec<FileKey>, Vec<FileKey>) =
         core_files.into_iter().partition(|f| f.meta.index_size == 0);
-    let final_size_floor = max_file_size / 2;
     let (_final_flat, mut flat_files): (Vec<FileKey>, Vec<FileKey>) = flat_candidates
         .into_iter()
-        .partition(|f| f.meta.original_size > final_size_floor);
+        .partition(|f| limits.is_final(f.meta.original_size, f.meta.compressed_size));
     let (final_plain, mut plain_core): (Vec<FileKey>, Vec<FileKey>) = plain_candidates
         .into_iter()
-        .partition(|f| f.meta.original_size > final_size_floor);
+        .partition(|f| limits.is_final(f.meta.original_size, f.meta.compressed_size));
     let (final_indexed, mut indexed_core): (Vec<FileKey>, Vec<FileKey>) = indexed_candidates
         .into_iter()
-        .partition(|f| f.meta.original_size > final_size_floor);
+        .partition(|f| limits.is_final(f.meta.original_size, f.meta.compressed_size));
     let final_core_files: Vec<FileKey> = final_plain.into_iter().chain(final_indexed).collect();
 
     for files in [&mut flat_files, &mut plain_core, &mut indexed_core] {
         match job_strategy {
             MergeStrategy::FileSize => {
-                files.sort_by_key(|k| k.meta.original_size);
+                files.sort_by_key(|k| {
+                    limits.sort_size(k.meta.original_size, k.meta.compressed_size)
+                });
             }
             MergeStrategy::FileTime => {
                 files.sort_by_key(|k| k.meta.min_ts);
@@ -1497,7 +1504,7 @@ fn plan_partition(
             stream_type,
             stream_name,
             prefix,
-            max_file_size,
+            limits,
             age.settled,
             job_strategy,
         );
@@ -1552,7 +1559,7 @@ fn plan_partition(
 const MIN_PARTIAL_FAN_IN: usize = 8;
 
 /// Cut `files` (already sorted by the job strategy) into merge batches
-/// bounded by `max_file_size` (one target for every class) and
+/// bounded by the active byte budgets and
 /// `compact.max_group_files`, appending them to `batch_groups`. A full group
 /// always seals. The below-budget trailing remainder seals when the hour is
 /// `settled` (the straggler window has passed — see `merge_by_stream`) or
@@ -1566,7 +1573,7 @@ fn group_files_into_batches(
     stream_type: StreamType,
     stream_name: &str,
     prefix: &str,
-    max_file_size: i64,
+    limits: MergeSizeLimits,
     settled: bool,
     job_strategy: &MergeStrategy,
 ) {
@@ -1585,10 +1592,13 @@ fn group_files_into_batches(
         (g, c) => std::cmp::min(g, c as usize),
     };
     let mut new_file_list: Vec<FileKey> = Vec::new();
-    let mut new_file_size = 0;
+    let mut new_file_size: i64 = 0;
+    let mut new_compressed_size: i64 = 0;
     for file in files.iter() {
-        if new_file_size + file.meta.original_size > max_file_size
-            || (max_group_len > 0 && new_file_list.len() >= max_group_len)
+        if limits.exceeds_plan(
+            new_file_size.saturating_add(file.meta.original_size),
+            new_compressed_size.saturating_add(file.meta.compressed_size),
+        ) || (max_group_len > 0 && new_file_list.len() >= max_group_len)
         {
             if new_file_list.len() <= 1 {
                 if *job_strategy == MergeStrategy::FileSize {
@@ -1605,13 +1615,15 @@ fn group_files_into_batches(
                 if settled
                     && *job_strategy == MergeStrategy::FileTime
                     && new_file_list.first().is_some_and(|current| {
-                        current.meta.original_size <= file.meta.original_size
+                        limits.sort_size(current.meta.original_size, current.meta.compressed_size)
+                            <= limits.sort_size(file.meta.original_size, file.meta.compressed_size)
                     })
                 {
                     continue;
                 }
                 new_file_list.clear();
                 new_file_size = file.meta.original_size;
+                new_compressed_size = file.meta.compressed_size;
                 new_file_list.push(file.clone());
                 continue; // replace previous file with current file
             }
@@ -1626,13 +1638,28 @@ fn group_files_into_batches(
                 cancel: MergeCancellation::default(),
             });
             new_file_size = 0;
+            new_compressed_size = 0;
             new_file_list.clear();
         }
-        new_file_size += file.meta.original_size;
+        new_file_size = new_file_size.saturating_add(file.meta.original_size);
+        new_compressed_size = new_compressed_size.saturating_add(file.meta.compressed_size);
         new_file_list.push(file.clone());
+        if new_file_list.len() > 1 && limits.reached(new_file_size, new_compressed_size) {
+            batch_groups.push(MergeBatch {
+                batch_id: batch_groups.len(),
+                org_id: org_id.to_string(),
+                stream_type,
+                stream_name: stream_name.to_string(),
+                prefix: prefix.to_string(),
+                files: std::mem::take(&mut new_file_list),
+                cancel: MergeCancellation::default(),
+            });
+            new_file_size = 0;
+            new_compressed_size = 0;
+        }
     }
-    // The trailing batch is always below max_file_size (the loop flushes a group
-    // only when adding the next file would exceed it). Until the hour is settled
+    // An enabled target seals on equality too. Legacy mode keeps its original
+    // look-ahead cut. Until the hour is settled
     // more files will arrive, and sealing a small remainder now would force
     // re-merging it later (write amplification): carry it, unless it is already
     // MIN_PARTIAL_FAN_IN files wide. The settled sweep-up seals whatever is left.
@@ -1817,14 +1844,16 @@ pub async fn merge_files(
         return Ok((Vec::new(), Vec::new()));
     }
 
-    let mut new_file_size = 0;
-    let mut new_compressed_file_size = 0;
+    let mut new_file_size: i64 = 0;
+    let mut new_compressed_file_size: i64 = 0;
     let mut new_file_list = Vec::new();
     let cfg = get_config();
-    let max_file_size = cfg.compact.max_file_size as i64;
+    let limits = cfg.compact.merge_size_limits();
     for file in files_with_size.iter() {
-        if (new_file_size + file.meta.original_size > max_file_size
-            || new_compressed_file_size + file.meta.compressed_size > max_file_size
+        if (limits.exceeds_execution(
+            new_file_size.saturating_add(file.meta.original_size),
+            new_compressed_file_size.saturating_add(file.meta.compressed_size),
+        )
             // #51: bound the merge WIDTH too — bytes alone let sliver-debt
             // hours stack 1,600+ files into one k-way merge (memory tracks
             // width; heap CPU superlinear). The remainder merges next pass.
@@ -1835,8 +1864,9 @@ pub async fn merge_files(
         {
             break;
         }
-        new_file_size += file.meta.original_size;
-        new_compressed_file_size += file.meta.compressed_size;
+        new_file_size = new_file_size.saturating_add(file.meta.original_size);
+        new_compressed_file_size =
+            new_compressed_file_size.saturating_add(file.meta.compressed_size);
         new_file_list.push(file.clone());
         // metrics
         metrics::COMPACT_MERGED_FILES
@@ -2256,11 +2286,11 @@ fn indexed_group_exceeds_global_rebuild_limit(
     all_inputs_indexed: bool,
     original_size: i64,
     compressed_size: i64,
-    global_limit: i64,
+    limits: MergeSizeLimits,
 ) -> bool {
     matches!(stream_type, StreamType::Logs | StreamType::Traces)
         && all_inputs_indexed
-        && (original_size > global_limit || compressed_size > global_limit)
+        && limits.exceeds_execution(original_size, compressed_size)
 }
 
 /// Merge one same-kind group of core `.vix` files into a single core
@@ -2329,7 +2359,7 @@ async fn merge_core_group(
         all_inputs_indexed,
         new_file_meta.original_size,
         input_compressed_size,
-        cfg.compact.max_file_size as i64,
+        cfg.compact.merge_size_limits(),
     );
 
     // A single-file healing batch rewrites only an immutable, uniquely
@@ -2361,11 +2391,12 @@ async fn merge_core_group(
         return Err(anyhow::anyhow!(
             "[COMPACTOR:WORKER:{thread_id}] refusing oversized indexed log/trace rebuild after \
              sidecar-only healing required a docs rewrite: inputs={}, original_size={}, \
-             compressed_size={}, global_rebuild_limit={}",
+             compressed_size={}, original_rebuild_limit={}, compressed_rebuild_limit={}",
             new_file_list.len(),
             new_file_meta.original_size,
             input_compressed_size,
             cfg.compact.max_file_size,
+            cfg.compact.merge_size_limits().execution_compressed_limit(),
         ));
     }
 
@@ -3652,7 +3683,7 @@ mod tests {
             let mut probed = Vec::new();
             let (planned, replan) = queue_required_index_repairs(
                 vec![legacy, compatible.clone()],
-                1_000,
+                MergeSizeLimits::new(1_000, 0),
                 |file: FileKey| {
                     probed.push(file.key.clone());
                     ready(Ok(file
@@ -3704,13 +3735,16 @@ mod tests {
                 file.meta.compressed_size = compressed;
             }
             let mut probes = 0;
-            let (planned, replan) =
-                queue_required_index_repairs(vec![batch.clone()], 1_000, |_: FileKey| {
+            let (planned, replan) = queue_required_index_repairs(
+                vec![batch.clone()],
+                MergeSizeLimits::new(1_000, 0),
+                |_: FileKey| {
                     probes += 1;
                     ready(Ok(None))
-                })
-                .await
-                .unwrap();
+                },
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 probes, expected_probes,
                 "{stream_type}/{index_size}/{original}/{compressed}"
@@ -3728,7 +3762,7 @@ mod tests {
     async fn index_repair_probe_error_prevents_dispatch() {
         let result = queue_required_index_repairs(
             vec![indexed_trace_batch(0, &["legacy.vix", "late.vix"], 600)],
-            1_000,
+            MergeSizeLimits::new(1_000, 0),
             |_: FileKey| ready(Err(anyhow::anyhow!("object store unavailable"))),
         )
         .await;
@@ -3762,21 +3796,25 @@ mod tests {
         .await;
         let schema = Arc::new(Schema::empty());
         let cancel = MergeCancellation::default();
-        let result = queue_required_index_repairs(vec![batch.clone()], 1_000, |file: FileKey| {
-            let schema = Arc::clone(&schema);
-            let cancel = cancel.clone();
-            async move {
-                single_core_file_heal_reason(
-                    StreamType::Traces,
-                    &file,
-                    schema,
-                    vec![],
-                    vec![],
-                    &cancel,
-                )
-                .await
-            }
-        })
+        let result = queue_required_index_repairs(
+            vec![batch.clone()],
+            MergeSizeLimits::new(1_000, 0),
+            |file: FileKey| {
+                let schema = Arc::clone(&schema);
+                let cancel = cancel.clone();
+                async move {
+                    single_core_file_heal_reason(
+                        StreamType::Traces,
+                        &file,
+                        schema,
+                        vec![],
+                        vec![],
+                        &cancel,
+                    )
+                    .await
+                }
+            },
+        )
         .await;
         match result {
             Err(error) => assert!(storage::is_not_found_error(&error), "{error:#}"),
@@ -3792,9 +3830,11 @@ mod tests {
         // live data file: only the independent DATA HEAD can authorize it.
         batch.files.swap(0, 1);
         assert!(
-            queue_required_index_repairs(vec![batch], 1_000, |_: FileKey| {
-                ready(Err(anyhow::anyhow!("index sidecar not found")))
-            })
+            queue_required_index_repairs(
+                vec![batch],
+                MergeSizeLimits::new(1_000, 0),
+                |_: FileKey| { ready(Err(anyhow::anyhow!("index sidecar not found"))) }
+            )
             .await
             .is_err()
         );
@@ -3842,9 +3882,13 @@ mod tests {
                     && file.meta.index_generation == 0)
                     .then(|| "missing duration terms".to_string())))
             };
-            let (repairs, replan) = queue_required_index_repairs(vec![batch.clone()], 1_000, probe)
-                .await
-                .unwrap();
+            let (repairs, replan) = queue_required_index_repairs(
+                vec![batch.clone()],
+                MergeSizeLimits::new(1_000, 0),
+                probe,
+            )
+            .await
+            .unwrap();
             assert_eq!(repairs.len(), 1);
             assert_eq!(repairs[0].files.len(), 1);
             // Both successful in-place publication and a sidecar CAS loser
@@ -3892,9 +3936,13 @@ mod tests {
 
             let mut refreshed = batch;
             refreshed.files[0].meta.index_generation = 1;
-            let (merges, replan) = queue_required_index_repairs(vec![refreshed], 1_000, probe)
-                .await
-                .unwrap();
+            let (merges, replan) = queue_required_index_repairs(
+                vec![refreshed],
+                MergeSizeLimits::new(1_000, 0),
+                probe,
+            )
+            .await
+            .unwrap();
             assert!(!replan);
             assert_eq!(merges[0].files.len(), 2);
             assert_eq!(merges[0].files[0].meta.index_generation, 1);
@@ -4228,7 +4276,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
-            cfg.compact.max_file_size as i64,
+            MergeSizeLimits::new(cfg.compact.max_file_size as i64, 0),
             true,
             &MergeStrategy::FileTime,
         );
@@ -4252,7 +4300,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
-            cfg.compact.max_file_size as i64,
+            MergeSizeLimits::new(cfg.compact.max_file_size as i64, 0),
             false,
             &MergeStrategy::FileTime,
         );
@@ -4268,7 +4316,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
-            cfg.compact.max_file_size as i64,
+            MergeSizeLimits::new(cfg.compact.max_file_size as i64, 0),
             false,
             &MergeStrategy::FileTime,
         );
@@ -4307,7 +4355,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
-            1_024,
+            MergeSizeLimits::new(1_024, 0),
             true,
             &MergeStrategy::FileTime,
         );
@@ -4341,7 +4389,7 @@ mod tests {
             StreamType::Logs,
             "s1",
             "files/org/logs/s1/2026/08/24/00",
-            1_024,
+            MergeSizeLimits::new(1_024, 0),
             false,
             &MergeStrategy::FileTime,
         );
@@ -4366,7 +4414,7 @@ mod tests {
                 StreamType::Logs,
                 "default",
                 "files/org/logs/default/2026/09/01/00",
-                target,
+                MergeSizeLimits::new(target, 0),
                 true,
                 &MergeStrategy::FileTime,
             );
@@ -4412,7 +4460,7 @@ mod tests {
                 StreamType::Traces,
                 "default",
                 "files/org/traces/default/2026/09/30/03",
-                target,
+                MergeSizeLimits::new(target, 0),
                 settled,
                 &MergeStrategy::FileTime,
             );
@@ -4456,7 +4504,7 @@ mod tests {
             stream_type,
             "default",
             "files/org/logs/default/2026/09/30/03",
-            4096 * MIB,
+            MergeSizeLimits::new(4096 * MIB, 0),
             age,
             false,
             &MergeStrategy::FileTime,
@@ -4497,7 +4545,7 @@ mod tests {
                 StreamType::Logs,
                 "logs",
                 "prefix",
-                1000,
+                MergeSizeLimits::new(1000, 0),
                 age,
                 false,
                 &MergeStrategy::FileTime,
@@ -4631,7 +4679,7 @@ mod tests {
                         true,
                         original,
                         compressed,
-                        1_000,
+                        MergeSizeLimits::new(1_000, 0),
                     ),
                     expected,
                     "{stream_type}/{original}/{compressed}"
@@ -4641,7 +4689,7 @@ mod tests {
                     false,
                     original,
                     compressed,
-                    1_000,
+                    MergeSizeLimits::new(1_000, 0),
                 ));
             }
         }
@@ -4650,7 +4698,7 @@ mod tests {
             true,
             1_200,
             1_200,
-            1_000,
+            MergeSizeLimits::new(1_000, 0),
         ));
     }
 
@@ -5482,5 +5530,344 @@ mod tests {
         })
         .await;
         assert!(done, "node-b must still own the fenced job at cleanup");
+    }
+}
+
+#[cfg(test)]
+mod compressed_target_tests {
+    use super::*;
+
+    fn file(id: usize, original: i64, compressed: i64, extension: &str, indexed: bool) -> FileKey {
+        FileKey {
+            key: format!("f{id}.{extension}"),
+            meta: FileMeta {
+                min_ts: id as i64,
+                max_ts: id as i64 + 1,
+                records: 100,
+                original_size: original,
+                compressed_size: compressed,
+                index_size: i64::from(indexed),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    fn plan(
+        files: Vec<FileKey>,
+        limits: MergeSizeLimits,
+        settled: bool,
+        strategy: MergeStrategy,
+    ) -> PartitionPlan {
+        plan_partition(
+            files,
+            "org",
+            StreamType::Logs,
+            "default",
+            "prefix",
+            limits,
+            HourAge {
+                open: !settled,
+                settled,
+            },
+            false,
+            &strategy,
+            true,
+        )
+    }
+
+    fn widths(plan: &PartitionPlan) -> Vec<usize> {
+        plan.batch_groups
+            .iter()
+            .map(|batch| batch.files.len())
+            .collect()
+    }
+
+    #[test]
+    fn compressed_target_stream_ratios_and_both_caps() {
+        // MiB-sized metadata; no payload allocation. The same policy yields
+        // different fan-in for high- and low-compression streams.
+        for (stream, original, compressed, expected) in [
+            ("logs/default", 1500, 100, vec![5, 5, 2]),
+            ("logs/apisix", 500, 450, vec![2, 2, 2, 2, 2, 2]),
+            ("traces/default", 900, 300, vec![3, 3, 3, 3]),
+            ("logs/e2b_prod_logs", 1000, 200, vec![5, 5, 2]),
+        ] {
+            let limits = MergeSizeLimits::new(8192, 1024);
+            for (extension, indexed) in [("vix", true), ("vix", false), ("parquet", false)] {
+                for strategy in [
+                    MergeStrategy::FileSize,
+                    MergeStrategy::FileTime,
+                    MergeStrategy::TimeRange,
+                ] {
+                    let files = (0..12)
+                        .map(|id| file(id, original, compressed, extension, indexed))
+                        .collect();
+                    let plan = plan(files, limits, true, strategy);
+                    assert_eq!(widths(&plan), expected, "{stream}/{extension}/{indexed}");
+                    for batch in plan.batch_groups {
+                        let original = batch.files.iter().map(|file| file.meta.original_size).sum();
+                        let compressed = batch
+                            .files
+                            .iter()
+                            .map(|file| file.meta.compressed_size)
+                            .sum();
+                        assert!(!limits.exceeds_execution(original, compressed));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_target_final_union_and_late_files() {
+        let limits = MergeSizeLimits::new(8192, 1024);
+        let mut files = vec![file(0, 4097, 1, "vix", true), file(1, 1, 513, "vix", true)];
+        files.extend((2..10).map(|id| file(id, 10, 1, "vix", true)));
+        let planned = plan(files, limits, true, MergeStrategy::FileTime);
+        assert_eq!(widths(&planned), [8]);
+        assert!(
+            planned.batch_groups[0]
+                .files
+                .iter()
+                .all(|file| file.meta.min_ts >= 2)
+        );
+        assert_eq!(planned.heal_candidates.len(), 2);
+        let exact = vec![
+            file(0, 4096, 512, "vix", true),
+            file(1, 4096, 512, "vix", true),
+        ];
+        assert_eq!(
+            widths(&plan(exact, limits, false, MergeStrategy::FileTime)),
+            [2]
+        );
+    }
+
+    #[test]
+    fn compressed_target_unsettled_tail_and_class_isolation() {
+        let limits = MergeSizeLimits::new(1000, 100);
+        for count in [2, 7, 8] {
+            let files: Vec<_> = (0..count).map(|id| file(id, 1, 1, "vix", false)).collect();
+            let planned = plan(files.clone(), limits, false, MergeStrategy::FileTime);
+            assert_eq!(planned.batch_groups.len(), usize::from(count >= 8));
+            assert_eq!(
+                widths(&plan(files, limits, true, MergeStrategy::FileTime)),
+                [count]
+            );
+        }
+        let files = vec![
+            file(0, 100, 10, "vix", false),
+            file(1, 100, 10, "vix", false),
+            file(2, 100, 10, "vix", true),
+            file(3, 100, 10, "vix", true),
+            file(4, 100, 10, "parquet", false),
+            file(5, 100, 10, "parquet", false),
+        ];
+        let planned = plan(files, limits, true, MergeStrategy::FileTime);
+        assert_eq!(widths(&planned), [2, 2, 2]);
+        for batch in planned.batch_groups {
+            assert_eq!(
+                batch.files[0].meta.index_size,
+                batch.files[1].meta.index_size
+            );
+            assert_eq!(
+                batch.files[0].key.ends_with("vix"),
+                batch.files[1].key.ends_with("vix")
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_target_file_size_orders_by_compressed_bytes() {
+        let files = vec![
+            file(0, 400, 10, "vix", true),
+            file(1, 100, 30, "vix", true),
+            file(2, 200, 20, "vix", true),
+        ];
+        let active = plan(
+            files.clone(),
+            MergeSizeLimits::new(2000, 100),
+            true,
+            MergeStrategy::FileSize,
+        );
+        let legacy = plan(
+            files,
+            MergeSizeLimits::new(2000, 0),
+            true,
+            MergeStrategy::FileSize,
+        );
+        let order = |plan: PartitionPlan| {
+            plan.batch_groups[0]
+                .files
+                .iter()
+                .map(|file| file.meta.min_ts)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(order(active), [0, 2, 1]);
+        assert_eq!(order(legacy), [1, 2, 0]);
+    }
+
+    #[test]
+    fn compressed_target_migration_reaches_fixed_point_even_if_output_shrinks() {
+        let old = MergeSizeLimits::new(4096, 0);
+        let new = MergeSizeLimits::new(8192, 1024);
+        let initial: Vec<_> = (0..17).map(|id| file(id, 2500, 160, "vix", true)).collect();
+        assert!(
+            plan(initial.clone(), old, true, MergeStrategy::FileTime)
+                .batch_groups
+                .is_empty()
+        );
+        // Keeping the original cap unchanged deliberately does not re-open old final files.
+        assert!(
+            plan(
+                initial.clone(),
+                MergeSizeLimits::new(4096, 1024),
+                true,
+                MergeStrategy::FileTime
+            )
+            .batch_groups
+            .is_empty()
+        );
+        for shrink in [1, 2, 16] {
+            let mut files = initial.clone();
+            let mut merges = 0;
+            for round in 0..initial.len() {
+                let planned = plan(files.clone(), new, true, MergeStrategy::FileTime);
+                if planned.batch_groups.is_empty() {
+                    assert!(round > 0);
+                    break;
+                }
+                let before = files.len();
+                for (index, batch) in planned.batch_groups.iter().enumerate() {
+                    assert!(batch.files.len() >= 2);
+                    files.retain(|file| !batch.files.iter().any(|input| input.key == file.key));
+                    let original = batch
+                        .files
+                        .iter()
+                        .map(|file| file.meta.original_size)
+                        .sum::<i64>()
+                        / shrink;
+                    let compressed = batch
+                        .files
+                        .iter()
+                        .map(|file| file.meta.compressed_size)
+                        .sum::<i64>()
+                        / shrink;
+                    files.push(file(
+                        1000 + round * 100 + index,
+                        original,
+                        compressed,
+                        "vix",
+                        true,
+                    ));
+                    merges += 1;
+                }
+                assert!(
+                    files.len() < before,
+                    "each successful ordinary merge retires at least one file"
+                );
+            }
+            assert!(merges < initial.len());
+            assert!(
+                plan(files.clone(), new, true, MergeStrategy::FileTime)
+                    .batch_groups
+                    .is_empty()
+            );
+            // Rolling back cannot split the larger output or rewrite it alone.
+            assert!(
+                plan(files, old, true, MergeStrategy::FileTime)
+                    .batch_groups
+                    .len()
+                    <= 1
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_target_downsampling_preserves_legacy_aggregation_scope() {
+        for count in [1, 3, 7] {
+            // Compressed sizes deliberately exceed the optional half-target:
+            // downsampling must keep exactly the legacy original-size filter.
+            let files: Vec<_> = (0..count)
+                .map(|id| file(id, 200, 60, "parquet", false))
+                .chain(std::iter::once(file(count, 501, 1, "parquet", false)))
+                .collect();
+            for compressed in [0, 100] {
+                let planned = plan_partition(
+                    files.clone(),
+                    "org",
+                    StreamType::Metrics,
+                    "m",
+                    "prefix",
+                    MergeSizeLimits::new(1000, compressed),
+                    HourAge {
+                        open: false,
+                        settled: true,
+                    },
+                    true,
+                    &MergeStrategy::FileTime,
+                    false,
+                );
+                assert_eq!(widths(&planned), [count]);
+                assert!(
+                    planned.batch_groups[0]
+                        .files
+                        .iter()
+                        .all(|file| { file.meta.original_size == 200 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compressed_target_mixed_fleet_cannot_cycle_ordinary_merges() {
+        let policies = [
+            MergeSizeLimits::new(4096, 0),
+            MergeSizeLimits::new(16384, 1024),
+            MergeSizeLimits::new(8192, 512),
+        ];
+        for shrink in [1, 2, 16] {
+            let mut files: Vec<_> = (0..33).map(|id| file(id, 2500, 160, "vix", true)).collect();
+            let initial = files.len();
+            let mut merges = 0;
+            for round in 0..initial {
+                let before_round = files.len();
+                for limits in policies {
+                    let planned = plan(files.clone(), limits, true, MergeStrategy::FileTime);
+                    for batch in planned.batch_groups {
+                        assert!(batch.files.len() >= 2);
+                        let before = files.len();
+                        let original = batch
+                            .files
+                            .iter()
+                            .map(|f| f.meta.original_size)
+                            .sum::<i64>()
+                            / shrink;
+                        let compressed = batch
+                            .files
+                            .iter()
+                            .map(|f| f.meta.compressed_size)
+                            .sum::<i64>()
+                            / shrink;
+                        files.retain(|f| !batch.files.iter().any(|input| input.key == f.key));
+                        merges += 1;
+                        files.push(file(1000 + merges, original, compressed, "vix", true));
+                        assert!(files.len() < before);
+                    }
+                }
+                if files.len() == before_round {
+                    break;
+                }
+                assert!(round + 1 < initial);
+            }
+            assert!(merges > 0 && merges < initial);
+            for limits in policies {
+                assert!(
+                    plan(files.clone(), limits, true, MergeStrategy::FileTime)
+                        .batch_groups
+                        .is_empty()
+                );
+            }
+        }
     }
 }

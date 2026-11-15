@@ -52,6 +52,17 @@ const FILE_LIST_MIGRATION_LIMIT: i64 = 1_000_000;
 /// The number of days to post-partition the file_list table.
 const FILE_LIST_POST_PARTITION_DAYS: i64 = 7;
 
+const OLD_DATA_HOURS_SQL: &str = r#"
+SELECT date
+    FROM file_list
+    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4
+        AND original_size <= $5 AND compressed_size <= $10
+        AND date >= $7 AND date < $8
+    GROUP BY date
+    HAVING count(*) >= $6
+        OR ($9 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
+            "#;
+
 pub struct PostgresFileList {}
 
 impl PostgresFileList {
@@ -893,23 +904,22 @@ SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, 
             .inc();
 
         let cfg = get_config();
-        // One merge target for every file class; closed-hour healing still
-        // requests every size.
-        let max_size = if include_oversize {
-            i64::MAX
-        } else {
-            cfg.compact.max_file_size as i64 * 95 / 100
-        };
+        let (max_size, max_compressed_size) = cfg
+            .compact
+            .merge_size_limits()
+            .query_limits(include_oversize);
         let sql = r#"
 SELECT id, account, stream, date, file, min_ts, max_ts, records, original_size, compressed_size, index_size, index_generation, bloom_ver, flattened
     FROM file_list
-    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4;
+    WHERE stream = $1 AND date >= $2 AND date <= $3 AND original_size <= $4
+        AND compressed_size <= $5;
                 "#;
         let ret = sqlx::query_as::<_, super::FileRecord>(sql)
             .bind(stream_key)
             .bind(date_start)
             .bind(date_end)
             .bind(max_size)
+            .bind(max_compressed_size)
             .fetch_all(&pool)
             .await;
         let time = start.elapsed().as_secs_f64();
@@ -1410,32 +1420,22 @@ ORDER BY date DESC, bloom_ver LIMIT $3;
         let cfg = get_config();
         let max_ts_upper_bound = super::calculate_max_ts_upper_bound(time_end, stream_type);
         let (date_from, date_to) = derive_date_range(time_start, time_end);
-        // $9 (M31b follow-up): also surface hours holding ANY index-less
-        // .vix data file — the lone-deferred/lone-L0 heal wedge (see the
-        // mod.rs doc). Flat parquet rows never carry a vix index and are
-        // excluded by the extension filter. Every file class shares the one
-        // half-target debt line ($5).
-        let sql = r#"
-SELECT date
-    FROM file_list
-    WHERE stream = $1 AND max_ts >= $2 AND max_ts <= $3 AND min_ts <= $4
-        AND original_size <= $5
-        AND date >= $7 AND date < $8
-    GROUP BY date
-    HAVING count(*) >= $6
-        OR ($9 AND sum(CASE WHEN index_size = 0 AND file LIKE '%.vix' THEN 1 ELSE 0 END) > 0);
-            "#;
+        // Both active half-targets must fit, exactly complementing the
+        // planner's final-file predicate. Full-size healing fetches all sizes.
+        let limits = cfg.compact.merge_size_limits();
+        let sql = OLD_DATA_HOURS_SQL;
 
         let ret = sqlx::query(sql)
             .bind(stream_key)
             .bind(time_start)
             .bind(max_ts_upper_bound)
             .bind(time_end)
-            .bind(cfg.compact.max_file_size as i64 / 2)
+            .bind(limits.original / 2)
             .bind(cfg.compact.old_data_min_files)
             .bind(date_from)
             .bind(date_to)
             .bind(include_lone_unindexed)
+            .bind(limits.candidate_compressed_limit())
             .fetch_all(&pool)
             .await?;
 
