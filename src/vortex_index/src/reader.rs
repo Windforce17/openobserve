@@ -933,6 +933,7 @@ pub struct VixReader {
     dict_decoded_len: Option<usize>,
     terms_blob: Option<BlobHandle>,
     docs_blob: BlobHandle,
+    docs_footer_copy_allowed: bool,
     /// The per-file value-bloom blob (`None` on files written before the
     /// capability existed).
     bloom_blob: Option<BlobHandle>,
@@ -1065,6 +1066,7 @@ impl DocsPointReader<'_> {
         }
         let _scope = self.reader.memory.enter();
         check_read_cancelled()?;
+        self.reader.try_docs_footer_copy(&self.blob)?;
         let (schema, _opening) = crate::container::blob_arrow_schema_owned(&self.blob)?;
         let schema = Arc::new(schema);
         Ok(Arc::clone(self.schema.get_or_init(|| schema)))
@@ -1265,6 +1267,9 @@ impl VixReader {
         let _index_pending = index_container
             .as_mut()
             .and_then(|index| index.pending_memory.take());
+        let docs_footer_copy_allowed = index_container
+            .as_ref()
+            .is_some_and(|index| crate::docs_footer_copy::eligible(&container, index));
         // DATA object: docs blob + data-descriptive properties.
         let properties = &container.properties;
         require_supported_data_format(properties)?;
@@ -1593,6 +1598,7 @@ impl VixReader {
             dict_decoded_len,
             terms_blob,
             docs_blob,
+            docs_footer_copy_allowed,
             bloom_blob,
             plist_blob,
             plist_min_docs,
@@ -3366,6 +3372,43 @@ impl VixReader {
         Ok(())
     }
 
+    fn try_docs_footer_copy(&self, blob: &BlobHandle) -> Result<()> {
+        if !self.docs_footer_copy_allowed {
+            return Ok(());
+        }
+        let BlobHandle::Ranged(docs) = blob else {
+            return Ok(());
+        };
+        if docs.footer_cached() {
+            return Ok(());
+        }
+        // Reuse an existing index source, not a new cache-entry allocation.
+        // Small all-resident indexes without a ranged handle use the data path.
+        let index = [
+            &self.dict_blocks_blob,
+            &self.plist_blob,
+            &self.terms_blob,
+            &self.bloom_blob,
+            &self.dict_blob,
+        ]
+        .into_iter()
+        .find_map(|blob| match blob {
+            Some(BlobHandle::Ranged(blob)) => Some(&blob.source),
+            _ => None,
+        });
+        let Some(index) = index else {
+            return Ok(());
+        };
+        match crate::docs_footer_copy::load(index, docs) {
+            Ok(_) => Ok(()),
+            Err(error @ (VixError::Cancelled | VixError::Callback(_))) => Err(error),
+            Err(error) => {
+                log::warn!("vix: ignoring optional {error}; reading docs footer");
+                Ok(())
+            }
+        }
+    }
+
     /// Load (or return the cached) docs-blob schema.
     fn docs_schema_inner(&self) -> Result<SchemaRef> {
         let _scope = self.memory.enter();
@@ -3373,6 +3416,7 @@ impl VixReader {
         if let Some(schema) = self.docs_schema.get() {
             return Ok(Arc::clone(schema));
         }
+        self.try_docs_footer_copy(&self.docs_blob)?;
         let (schema, _opening) = crate::container::blob_arrow_schema_owned(&self.docs_blob)?;
         let schema = Arc::new(crate::reader_compact::schema(schema));
         for required in [TIMESTAMP_COL_NAME, SOURCE_COL_NAME] {

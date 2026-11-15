@@ -30,6 +30,7 @@ roaring.workspace = true
 ryu = "1.0"
 serde.workspace = true
 serde_json.workspace = true
+sha256.workspace = true
 tantivy-fst.workspace = true
 puffin.workspace = true
 tempfile.workspace = true

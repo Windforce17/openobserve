@@ -77,6 +77,7 @@ mod cpu_executor;
 mod dict_blocks;
 mod docs;
 mod docs_footer;
+mod docs_footer_copy;
 mod error;
 mod flat;
 mod merge;

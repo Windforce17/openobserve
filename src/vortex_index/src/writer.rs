@@ -1136,6 +1136,7 @@ pub struct VixWriter {
     /// read through [`Self::set_data_footer`]. `None` = not stamped (readers
     /// fall back to the data-tail fetch).
     data_footer: Option<Vec<u8>>,
+    docs_footer_copy: Option<Vec<u8>>,
     /// W1: the data object's byte size the AUTO additive budget applies to
     /// on a sidecar-only finish ([`Self::finish_index_sidecar`]), supplied
     /// by the heal through [`Self::set_data_object_bytes`]; `finish_inner`
@@ -1471,6 +1472,7 @@ impl VixWriter {
             bloom_sections: Vec::new(),
             bloomed_fields: BTreeSet::new(),
             data_footer: None,
+            docs_footer_copy: None,
             data_object_bytes: 0,
         }
     }
@@ -3675,6 +3677,7 @@ impl VixWriter {
 
         let index_container_started = std::time::Instant::now();
         // S3: the sidecar embeds the footer of the data object just written
+        self.docs_footer_copy = crate::docs_footer_copy::prepare_output(&output, &data_footer)?;
         self.data_footer = Some(data_footer);
         let index_output =
             self.build_index_sidecar_container(row_count, term_count, blobs, dict_field_pages)?;
@@ -4253,11 +4256,14 @@ impl VixWriter {
         if self.opts.columns_complete {
             index_properties.push((PROP_COLUMNS_COMPLETE.to_string(), "true".to_string()));
         }
-        Ok(Some(build_container_parts(
-            index_properties,
-            blobs,
-            self.opts.sidecar_tail_zstd,
-        )?))
+        let mut index =
+            build_container_parts(index_properties, blobs, self.opts.sidecar_tail_zstd)?;
+        crate::docs_footer_copy::append(
+            &mut index,
+            self.docs_footer_copy.as_deref(),
+            crate::container::tail_fetch_size(),
+        )?;
+        Ok(Some(index))
     }
 
     /// Sidecar-only heal (M3, DESIGN-V2 §5): finish ONLY the `.vxi` index
@@ -4351,7 +4357,19 @@ impl VixWriter {
     /// the new sidecar describes. Without it the sidecar is not stamped and
     /// readers fall back to the data-tail fetch.
     pub fn set_data_footer(&mut self, payload: Vec<u8>) {
+        self.docs_footer_copy = None;
         self.data_footer = Some(payload);
+    }
+
+    /// Read metadata from the actual immutable data object during sidecar heal.
+    pub fn set_data_source(
+        &mut self,
+        source: &Arc<dyn crate::VixRangeSource>,
+    ) -> anyhow::Result<()> {
+        let payload = crate::container::read_data_footer_payload(source)?;
+        self.docs_footer_copy = crate::docs_footer_copy::prepare_source(source, &payload)?;
+        self.data_footer = Some(payload);
+        Ok(())
     }
 
     /// Per-field oversize-skip counts accumulated by this writer's pushes

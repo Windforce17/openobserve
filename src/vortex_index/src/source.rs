@@ -1350,6 +1350,17 @@ impl RangedBlob {
         }
     }
 
+    /// Publish only a fully parsed candidate; no copy-specific state survives.
+    pub(crate) fn adopt_footer(&self, candidate: &Self) {
+        if let Some(ranges) = candidate.footer.ranges.get()
+            && self.footer.ranges.set(ranges.clone()).is_ok()
+            && let Some(memory) = self.footer.memory.get()
+        {
+            memory.add(FooterState::retained_bytes(ranges));
+            memory.notify();
+        }
+    }
+
     /// The vortex IO bridge over this window.
     pub fn read_at(&self) -> BlobReadAt {
         BlobReadAt {

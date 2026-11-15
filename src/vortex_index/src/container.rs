@@ -874,6 +874,8 @@ impl std::fmt::Debug for BlobHandle {
 /// recognized blobs it carries — `docs` only for data objects, the index
 /// blobs for sidecars.
 pub(crate) struct VixContainer {
+    pub(crate) footer_fingerprint: String,
+    pub(crate) docs_copy_available: bool,
     pub(crate) pending_memory: Option<crate::reader::PendingMemory>,
     pub properties: BTreeMap<String, String>,
     pub dict: Option<BlobHandle>,
@@ -915,6 +917,10 @@ fn container_from_meta(
     let mut plist = None;
     let mut stats = None;
     for blob in &meta.blobs {
+        // An optional copy never makes the authoritative container unreadable.
+        if crate::docs_footer_copy::is_copy(blob) {
+            continue;
+        }
         let range = blob.get_offset(None);
         if range.start > range.end || range.end > total_len {
             return Err(VixError::Malformed(format!(
@@ -956,6 +962,21 @@ fn container_from_meta(
     }
 
     Ok(VixContainer {
+        footer_fingerprint: crate::docs_footer_copy::fingerprint(&meta)?,
+        docs_copy_available: meta
+            .blobs
+            .iter()
+            .filter(|blob| crate::docs_footer_copy::is_copy(blob))
+            .count()
+            == 1
+            && meta.blobs.iter().any(|blob| {
+                crate::docs_footer_copy::is_copy(blob)
+                    && blob.compression_codec.is_none()
+                    && blob
+                        .offset
+                        .checked_add(blob.length)
+                        .is_some_and(|end| end <= total_len)
+            }),
         pending_memory: None,
         properties: meta.properties,
         dict,
@@ -1377,6 +1398,10 @@ impl FooterTail<'_> {
         // instead would pin the whole eager window (footer JSON included)
         // behind any one surviving blob — `demote` keeps the `Mem` blobs —
         // while the reader accounted only the slices.
+        let copy_in_tail = meta
+            .blobs
+            .iter()
+            .any(|blob| crate::docs_footer_copy::is_copy(blob) && blob.offset >= tail_start);
         let mut container = container_from_meta(meta, total, |range| {
             if range.start >= tail_start {
                 let start = (range.start - tail_start) as usize;
@@ -1395,9 +1420,21 @@ impl FooterTail<'_> {
         })?;
         // Keep the tail/copy reservation through publication too. Combining the
         // reservations is allocation-free and does not momentarily drop ownership.
+        container.docs_copy_available &= copy_in_tail;
         container.pending_memory = Some(pending);
         Ok(container)
     }
+}
+
+pub(crate) fn read_footer_meta(
+    source: &Arc<dyn VixRangeSource>,
+) -> Result<(PuffinMeta, crate::reader::PendingMemory)> {
+    let probe = TailProbe::plan(source, DEFAULT_TAIL_FETCH_BYTES)?;
+    let tail = block_fetch(source.as_ref(), probe.range())?;
+    let FooterTail { tail, pending, .. } = probe.complete(tail)?;
+    let meta = parse_puffin_footer_from_bytes(&tail)
+        .map_err(|error| VixError::Malformed(format!("puffin footer: {error:#}")))?;
+    Ok((meta, pending))
 }
 
 /// DESIGN-COLD-MISS §2 S3: the DATA object's puffin footer payload (its
