@@ -874,7 +874,7 @@ impl std::fmt::Debug for BlobHandle {
 /// recognized blobs it carries — `docs` only for data objects, the index
 /// blobs for sidecars.
 pub(crate) struct VixContainer {
-    pub(crate) footer_fingerprint: String,
+    pub(crate) footer_fingerprint: Option<String>,
     pub(crate) docs_copy_available: bool,
     pub(crate) pending_memory: Option<crate::reader::PendingMemory>,
     pub properties: BTreeMap<String, String>,
@@ -906,6 +906,7 @@ pub(crate) struct VixContainer {
 fn container_from_meta(
     meta: PuffinMeta,
     total_len: u64,
+    needs_fingerprint: bool,
     mut slice: impl FnMut(std::ops::Range<u64>) -> BlobHandle,
 ) -> Result<VixContainer> {
     let mut dict = None;
@@ -962,7 +963,9 @@ fn container_from_meta(
     }
 
     Ok(VixContainer {
-        footer_fingerprint: crate::docs_footer_copy::fingerprint(&meta)?,
+        footer_fingerprint: needs_fingerprint
+            .then(|| crate::docs_footer_copy::fingerprint(&meta))
+            .transpose()?,
         docs_copy_available: meta
             .blobs
             .iter()
@@ -1002,7 +1005,7 @@ pub(crate) fn parse_container(data: &Bytes) -> Result<VixContainer> {
     ))?;
     let meta = parse_puffin_footer_from_bytes(data)
         .map_err(|e| VixError::Malformed(format!("puffin footer: {e:#}")))?;
-    let mut container = container_from_meta(meta, data.len() as u64, |range| {
+    let mut container = container_from_meta(meta, data.len() as u64, false, |range| {
         BlobHandle::Mem(data.slice(range.start as usize..range.end as usize))
     })?;
     container.pending_memory = Some(pending);
@@ -1253,10 +1256,12 @@ pub(crate) fn parse_container_pair_ranged(
         index.as_ref(),
         index_probe.range(),
     )?;
-    Ok((
-        data_probe.finish(data_tail)?,
-        index_probe.finish(index_tail)?,
-    ))
+    let index_container = index_probe.finish(index_tail)?;
+    let needs_fingerprint = crate::docs_footer_copy::for_source(&index_container, data);
+    let data_container = data_probe
+        .complete(data_tail)?
+        .into_container_with_fingerprint(needs_fingerprint)?;
+    Ok((data_container, index_container))
 }
 
 /// One planned eager-tail probe of a ranged container: the tail window and
@@ -1383,6 +1388,10 @@ struct FooterTail<'a> {
 
 impl FooterTail<'_> {
     fn into_container(self) -> Result<VixContainer> {
+        self.into_container_with_fingerprint(false)
+    }
+
+    fn into_container_with_fingerprint(self, needs_fingerprint: bool) -> Result<VixContainer> {
         let Self {
             source,
             total,
@@ -1402,7 +1411,7 @@ impl FooterTail<'_> {
             .blobs
             .iter()
             .any(|blob| crate::docs_footer_copy::is_copy(blob) && blob.offset >= tail_start);
-        let mut container = container_from_meta(meta, total, |range| {
+        let mut container = container_from_meta(meta, total, needs_fingerprint, |range| {
             if range.start >= tail_start {
                 let start = (range.start - tail_start) as usize;
                 let end = (range.end - tail_start) as usize;
@@ -1460,12 +1469,13 @@ pub fn read_data_footer_payload(source: &Arc<dyn VixRangeSource>) -> Result<Vec<
 pub(crate) fn container_from_data_footer(
     source: &Arc<dyn VixRangeSource>,
     payload: &str,
+    needs_fingerprint: bool,
 ) -> Result<VixContainer> {
     let memory = crate::source::current_reader_memory();
     let pending = memory.reserve(footer_memory_bound(payload.len()))?;
     let meta: PuffinMeta = serde_json::from_str(payload)
         .map_err(|e| VixError::Malformed(format!("sidecar {PROP_DATA_FOOTER} payload: {e}")))?;
-    let mut container = container_from_meta(meta, source.len(), |range| {
+    let mut container = container_from_meta(meta, source.len(), needs_fingerprint, |range| {
         BlobHandle::Ranged(RangedBlob::new(Arc::clone(source), range))
     })?;
     container.pending_memory = Some(pending);

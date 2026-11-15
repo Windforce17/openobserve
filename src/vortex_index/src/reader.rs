@@ -1243,7 +1243,8 @@ impl VixReader {
         else {
             return parse_container_ranged_with_tail(source, DEFAULT_TAIL_FETCH_BYTES);
         };
-        match crate::container::container_from_data_footer(source, payload) {
+        let needs_fingerprint = crate::docs_footer_copy::for_source(index_container, source);
+        match crate::container::container_from_data_footer(source, payload, needs_fingerprint) {
             Ok(container) => Ok(container),
             Err(e @ (VixError::Cancelled | VixError::Callback(_))) => Err(e),
             Err(e) => {

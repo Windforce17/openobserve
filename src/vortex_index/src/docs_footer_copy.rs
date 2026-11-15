@@ -79,7 +79,14 @@ fn malformed(error: impl std::fmt::Display) -> VixError {
     VixError::Malformed(format!("docs footer copy: {error}"))
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static FINGERPRINT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn fingerprint(meta: &PuffinMeta) -> Result<String> {
+    #[cfg(test)]
+    FINGERPRINT_CALLS.with(|calls| calls.set(calls.get() + 1));
     Ok(sha256::digest(serde_json::to_vec(meta)?))
 }
 
@@ -305,7 +312,23 @@ pub(crate) fn append(index: &mut Vec<u8>, copy: Option<&[u8]>, eager_tail: u64) 
     Ok(true)
 }
 
+pub(crate) fn for_source(
+    index: &container::VixContainer,
+    source: &Arc<dyn VixRangeSource>,
+) -> bool {
+    index.docs_copy_available
+        && settings().is_ok_and(|settings| settings.read)
+        && !source
+            .describe()
+            .rsplit('/')
+            .next()
+            .is_some_and(|key| key.starts_with("l0_"))
+}
+
 pub(crate) fn eligible(data: &container::VixContainer, index: &container::VixContainer) -> bool {
+    let Some(data_fingerprint) = data.footer_fingerprint.as_ref() else {
+        return false;
+    };
     // Segment builders use deterministic l0_* keys and overwrite on lease retries.
     // Do not extend sidecar-first metadata trust to their docs layout.
     let mutable_key = matches!(&data.docs, Some(BlobHandle::Ranged(blob))
@@ -318,7 +341,7 @@ pub(crate) fn eligible(data: &container::VixContainer, index: &container::VixCon
             .get(container::PROP_DATA_FOOTER)
             .and_then(|payload| serde_json::from_str::<PuffinMeta>(payload).ok())
             .and_then(|meta| fingerprint(&meta).ok())
-            .is_some_and(|hash| hash == data.footer_fingerprint)
+            .is_some_and(|hash| &hash == data_fingerprint)
 }
 
 fn header(

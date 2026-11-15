@@ -170,6 +170,59 @@ fn default_off_strict_switches() {
 }
 
 #[test]
+fn no_copy_never_fingerprints() {
+    let (data, index, _) = fixture();
+    FINGERPRINT_CALLS.with(|calls| calls.set(0));
+    for sidecar_first in [false, true] {
+        let (reader, ..) = open(&data, &index, sidecar_first);
+        assert_eq!(source_answer(&reader).len(), 3);
+    }
+    let reader = VixReader::open_with_index(
+        Bytes::copy_from_slice(&data),
+        Some(Bytes::copy_from_slice(&index)),
+    )
+    .unwrap();
+    assert_eq!(source_answer(&reader).len(), 3);
+    crate::VixDocs::open_ranged(CachedSource::new(data.clone())).unwrap();
+    crate::VixDocs::open(Bytes::from(data)).unwrap();
+    assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 0);
+}
+
+#[test]
+fn copy_fingerprints_only_the_needed_data_container() {
+    let (data, index, copy) = fixture();
+    let new = copy_index(&index, &copy);
+    let index_source: Arc<dyn VixRangeSource> = CachedSource::new(new.clone());
+    FINGERPRINT_CALLS.with(|calls| calls.set(0));
+    let index_container =
+        container::parse_container_ranged_with_tail(&index_source, 128 * 1024).unwrap();
+    assert!(index_container.docs_copy_available);
+    assert!(index_container.footer_fingerprint.is_none());
+    assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 0);
+    let data_source: Arc<dyn VixRangeSource> = CachedSource::new(data.clone());
+    let data_container =
+        VixReader::data_container_from_sidecar(&data_source, &index_container).unwrap();
+    assert!(data_container.footer_fingerprint.is_some());
+    assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 1);
+    assert!(eligible(&data_container, &index_container));
+    for sidecar_first in [false, true] {
+        FINGERPRINT_CALLS.with(|calls| calls.set(0));
+        let (reader, data_source, index_source) = open(&data, &new, sidecar_first);
+        // One data-container hash and one comparison against the sidecar payload.
+        assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 2);
+        let data_reads = data_source.reads.load(Ordering::SeqCst);
+        let index_reads = index_source.reads.load(Ordering::SeqCst);
+        reader.docs_schema().unwrap();
+        let hashes = if sidecar_first { 3 } else { 2 };
+        assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), hashes);
+        reader.docs_schema().unwrap();
+        assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), hashes);
+        assert_eq!(data_source.reads.load(Ordering::SeqCst), data_reads);
+        assert_eq!(index_source.reads.load(Ordering::SeqCst), index_reads);
+    }
+}
+
+#[test]
 fn lazy_copy_matches_legacy_results_and_cache_ownership() {
     let (data, index, copy) = fixture();
     let new = copy_index(&index, &copy);
@@ -429,6 +482,7 @@ fn deterministic_l0_keys_do_not_use_the_copy() {
     let new = copy_index(&index, &copy);
     let mut data = CachedSource::new(data);
     Arc::get_mut(&mut data).unwrap().name = "files/o/logs/s/l0_h2_retry_123.vix".into();
+    FINGERPRINT_CALLS.with(|calls| calls.set(0));
     let reader = VixReader::open_ranged_with_index_mode(
         data.clone(),
         Some(CachedSource::new(new)),
@@ -441,6 +495,7 @@ fn deterministic_l0_keys_do_not_use_the_copy() {
         data.reads.load(Ordering::SeqCst) > 0,
         "known mutable keys must use the data footer"
     );
+    assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 0);
 }
 
 #[test]
@@ -517,10 +572,14 @@ fn reader_disabled_child() {
     let (data, index, _) = fixture();
     let meta = puffin::reader::parse_puffin_footer_from_bytes(&index).unwrap();
     assert_eq!(meta.blobs.iter().filter(|b| is_copy(b)).count(), 1);
-    let (reader, data_source, _) = open(&data, &index, true);
-    reader.docs_schema().unwrap();
-    assert!(data_source.reads.load(Ordering::SeqCst) > 0);
-    assert_eq!(source_answer(&reader).len(), 3);
+    FINGERPRINT_CALLS.with(|calls| calls.set(0));
+    for sidecar_first in [false, true] {
+        let (reader, data_source, _) = open(&data, &index, sidecar_first);
+        reader.docs_schema().unwrap();
+        assert!(data_source.reads.load(Ordering::SeqCst) > 0);
+        assert_eq!(source_answer(&reader).len(), 3);
+    }
+    assert_eq!(FINGERPRINT_CALLS.with(|calls| calls.get()), 0);
 }
 
 fn verify_written_copy(data: &[u8], index: &[u8], expected: &StringArray) {
