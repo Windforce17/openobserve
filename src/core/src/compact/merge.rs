@@ -895,6 +895,7 @@ pub async fn merge_by_stream(
                             candidate.key,
                         );
                         batch_groups.push(MergeBatch {
+                            job_id: 0,
                             batch_id: batch_groups.len(),
                             org_id: org_id.clone(),
                             stream_type,
@@ -946,7 +947,8 @@ pub async fn merge_by_stream(
                     && in_flight < JOB_BATCH_IN_FLIGHT
                     && next_batch < batch_group_len
                 {
-                    let batch = batch_groups[next_batch].clone();
+                    let mut batch = batch_groups[next_batch].clone();
+                    batch.job_id = job_id;
                     if let Err(e) =
                         send_merge_batch(&worker_tx, inner_tx.clone(), batch, &job_cancel).await
                     {
@@ -1477,6 +1479,7 @@ fn plan_partition(
     let mut plan = PartitionPlan::default();
     if downsampling && !flat_files.is_empty() {
         plan.batch_groups.push(MergeBatch {
+            job_id: 0,
             batch_id: 0,
             org_id: org_id.to_string(),
             stream_type,
@@ -1613,6 +1616,7 @@ fn group_files_into_batches(
                 continue; // replace previous file with current file
             }
             batch_groups.push(MergeBatch {
+                job_id: 0,
                 batch_id: batch_groups.len(),
                 org_id: org_id.to_string(),
                 stream_type,
@@ -1634,6 +1638,7 @@ fn group_files_into_batches(
     // MIN_PARTIAL_FAN_IN files wide. The settled sweep-up seals whatever is left.
     if new_file_list.len() > 1 && (settled || new_file_list.len() >= MIN_PARTIAL_FAN_IN) {
         batch_groups.push(MergeBatch {
+            job_id: 0,
             batch_id: batch_groups.len(),
             org_id: org_id.to_string(),
             stream_type,
@@ -1763,6 +1768,7 @@ async fn prefetch_merge_inputs(
 // - retain_file_list: EXACTLY the input files whose rows made it into new_files — the only files
 //   the caller may delete. Inputs left out (size-budget cut, size-mismatch skip, dropped-invalid,
 //   lone survivor) are NOT in it: they stay live in the file_list and retry later.
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_files(
     thread_id: usize,
     org_id: &str,
@@ -1771,6 +1777,7 @@ pub async fn merge_files(
     prefix: &str,
     files_with_size: &[FileKey],
     cancel: &MergeCancellation,
+    diagnostics: Option<crate::service::vix::core_writer::MergeStartContext>,
 ) -> Result<(Vec<FileKey>, Vec<FileKey>), anyhow::Error> {
     let start = std::time::Instant::now();
     cancel.check("merge input planning")?;
@@ -1843,6 +1850,24 @@ pub async fn merge_files(
     if new_file_list.len() <= 1 && !is_match_downsampling_rule && !is_single_core_heal {
         return Ok((Vec::new(), Vec::new()));
     }
+
+    let cancel = cancel.with_diagnostics(diagnostics.map(|mut context| {
+        context.inputs = new_file_list.len();
+        context.original_size = new_file_size;
+        context.compressed_size = new_compressed_file_size;
+        context
+    }));
+    let cancel = &cancel;
+    cancel.log_start(
+        if is_single_core_heal {
+            "sidecar_preflight"
+        } else if is_core_group {
+            "core_preflight"
+        } else {
+            "flat_merge"
+        },
+        "pending",
+    );
 
     // get latest version of schema
     let settings = MergeStreamSettings::load(org_id, stream_name, stream_type).await?;
@@ -3564,6 +3589,7 @@ mod tests {
 
     fn indexed_trace_batch(batch_id: usize, keys: &[&str], size: i64) -> MergeBatch {
         MergeBatch {
+            job_id: 0,
             batch_id,
             org_id: "org".to_string(),
             stream_type: StreamType::Traces,
@@ -3938,6 +3964,7 @@ mod tests {
     async fn merge_batch_submission_stops_on_cancellation() {
         let cancel = MergeCancellation::default();
         let make_batch = |batch_id, cancel: MergeCancellation| MergeBatch {
+            job_id: 0,
             batch_id,
             org_id: "org".to_string(),
             stream_type: StreamType::Logs,

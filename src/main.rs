@@ -154,6 +154,7 @@ use tracing_subscriber::{
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:16\0";
 
 fn main() -> Result<(), anyhow::Error> {
+    infra::diagnostics::init_from_env().map_err(anyhow::Error::msg)?;
     create_main_runtime()?.block_on(run())
 }
 

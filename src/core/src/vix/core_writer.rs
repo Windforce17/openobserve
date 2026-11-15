@@ -279,7 +279,41 @@ pub struct MergePerfStats {
 /// orchestration. Cancellation is monotonic and checks are one relaxed
 /// atomic load at bounded merge boundaries (never per value).
 #[derive(Clone, Debug, Default)]
-pub struct VixMergeCancellation(Arc<AtomicBool>);
+pub struct VixMergeCancellation {
+    cancelled: Arc<AtomicBool>,
+    diagnostics: Option<Arc<MergeStartContext>>,
+}
+
+/// Immutable per-batch identity carried across blocking phases, never a global
+/// or thread-local "current job" (workers can migrate between OS threads).
+#[derive(Debug)]
+pub struct MergeStartContext {
+    pub job_id: i64,
+    pub batch_id: usize,
+    pub worker_id: usize,
+    pub stream: String,
+    pub hour: String,
+    pub inputs: usize,
+    pub original_size: i64,
+    pub compressed_size: i64,
+}
+
+impl std::fmt::Display for MergeStartContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[COMPACTOR:WORKER:{}] merge phase=start job_id={} batch_id={} stream={:?} hour={:?} inputs={} original_size={} compressed_size={}",
+            self.worker_id,
+            self.job_id,
+            self.batch_id,
+            self.stream,
+            self.hour,
+            self.inputs,
+            self.original_size,
+            self.compressed_size
+        )
+    }
+}
 
 impl VixMergeCancellation {
     pub fn new() -> Self {
@@ -287,19 +321,36 @@ impl VixMergeCancellation {
     }
 
     pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
-        Self(flag)
+        Self {
+            cancelled: flag,
+            diagnostics: None,
+        }
+    }
+
+    pub fn with_diagnostics(mut self, context: Option<MergeStartContext>) -> Self {
+        self.diagnostics = context.map(Arc::new);
+        self
+    }
+
+    pub fn log_start(&self, path: &str, docs: &str) {
+        if let Some(context) = &self.diagnostics {
+            log::info!(
+                "{context} path={path} docs={docs} tid={}",
+                infra::diagnostics::current_thread_id()
+            );
+        }
     }
 
     pub fn flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.0)
+        Arc::clone(&self.cancelled)
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, AtomicOrdering::Relaxed);
+        self.cancelled.store(true, AtomicOrdering::Relaxed);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(AtomicOrdering::Relaxed)
+        self.cancelled.load(AtomicOrdering::Relaxed)
     }
 
     fn check(&self, boundary: &str) -> Result<(), anyhow::Error> {
@@ -2381,6 +2432,7 @@ pub fn rebuild_core_file_sidecar_admitted_with_cancellation(
     permit: VixRebuildPermit,
 ) -> Result<SidecarHealOutcome, anyhow::Error> {
     let _permit = permit;
+    cancellation.log_start("sidecar_rebuild", "unchanged");
     rebuild_core_file_sidecar_with_caps_and_cancellation(
         stream_type,
         input,
@@ -3513,6 +3565,21 @@ fn merge_core_files_indexed(
         writer
             .check_merge_inputs(readers)
             .map_err(|reason| Fallback(anyhow::anyhow!(reason)))?;
+    }
+
+    if let Some(cancel) = &plan.cancellation {
+        cancel.log_start(
+            if plan.opts.index_enabled {
+                "dictionary_merge"
+            } else {
+                "no_index_merge"
+            },
+            if concat_order.is_some() || disjoint_passthrough {
+                "passthrough_candidate"
+            } else {
+                "row_interleave"
+            },
+        );
     }
 
     // merge the term dictionaries BEFORE any docs work: every index-side
@@ -5327,6 +5394,16 @@ fn rebuild_over_sources_admitted(
         natural_input_order.as_deref(),
         dropped_rows,
     ) {
+        if let Some(cancel) = &plan.cancellation {
+            cancel.log_start(
+                if plan.opts.index_enabled {
+                    "index_rebuild"
+                } else {
+                    "no_index_rebuild"
+                },
+                "passthrough",
+            );
+        }
         match rebuild_with_docs_passthrough(inputs, plan, &timestamps, heal) {
             Ok(result) => return Ok(result),
             // Fallback-silent-safe: the qualified attempt built nothing
@@ -5340,6 +5417,16 @@ fn rebuild_over_sources_admitted(
         }
     }
 
+    if let Some(cancel) = &plan.cancellation {
+        cancel.log_start(
+            if plan.opts.index_enabled {
+                "index_rebuild"
+            } else {
+                "no_index_rebuild"
+            },
+            "decode_reencode",
+        );
+    }
     // The standard rebuild: decode + re-encode every row in `order`. Under a
     // forced concatenation (#51c-c) the writer is stamped concat — its rows
     // are stored in concatenation order, NOT globally sorted.
@@ -8940,6 +9027,190 @@ mod tests {
             &fts,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn diagnostics_merge_is_reader_equivalent_and_keeps_cancellation() {
+        // Isolate the process-global logger and configuration from other tests.
+        if std::env::var_os("O2_MERGE_DIAGNOSTICS_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "vix::core_writer::tests::diagnostics_merge_is_reader_equivalent_and_keeps_cancellation", "--nocapture"])
+                .env("O2_MERGE_DIAGNOSTICS_CHILD", "1")
+                .env("ZO_VIX_INDEX_DISABLED_STREAM_TYPES", "metrics")
+                .output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let starts: Vec<_> = stderr
+                .lines()
+                .filter(|line| line.contains("merge phase=start job_id=12345"))
+                .collect();
+            assert_eq!(
+                starts.len(),
+                6,
+                "disabled merges must emit no starts: {stderr}"
+            );
+            for path in [
+                "dictionary_merge",
+                "no_index_merge",
+                "index_rebuild",
+                "no_index_rebuild",
+                "sidecar_rebuild",
+            ] {
+                assert!(
+                    starts
+                        .iter()
+                        .any(|line| line.contains(&format!("path={path} "))),
+                    "{path}: {stderr}"
+                );
+            }
+            for line in &starts {
+                assert!(line.contains("WORKER:3") && line.contains("batch_id=7"));
+                assert!(line.contains("inputs=2 original_size=4096 compressed_size=1024"));
+                assert!(line.contains("tid=") && line.contains("hour="));
+                eprintln!("{line}");
+            }
+            return;
+        }
+        static LOGGER: StderrLogger = StderrLogger;
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let inputs = vec![
+            (
+                "diag-a.vix".to_string(),
+                passthrough_file(&[1000, 900], "a"),
+            ),
+            ("diag-b.vix".to_string(), passthrough_file(&[800, 700], "b")),
+        ];
+        let schema = Schema::new(passthrough_fields());
+        let fts = vec!["log".to_string()];
+        let flag = Arc::new(AtomicBool::new(false));
+        for stream_type in [StreamType::Logs, StreamType::Metrics] {
+            let baseline =
+                merge_core_files(stream_type, &as_inputs(&inputs), &schema, &fts, &[]).unwrap();
+            let mut sidecar_baseline = None;
+            for enabled in [false, true] {
+                let token = VixMergeCancellation::from_flag(Arc::clone(&flag))
+                    .with_diagnostics(enabled.then(diagnostics_context));
+                let result = merge_core_files_with_cancellation(
+                    stream_type,
+                    &as_inputs(&inputs),
+                    &schema,
+                    &fts,
+                    &[],
+                    &token,
+                )
+                .unwrap();
+                assert_eq!(result.used_index_merge, baseline.used_index_merge);
+                assert_eq!(
+                    result.docs_passthrough_inputs,
+                    baseline.docs_passthrough_inputs
+                );
+                assert_diagnostics_equivalent(
+                    &open_merged(&result),
+                    &open_merged(&baseline),
+                    "merge diagnostics on/off",
+                );
+                assert_eq!(
+                    result.index, baseline.index,
+                    "diagnostics cannot change index bytes"
+                );
+                let rebuilt = merge_core_files_rebuild_with_cancellation(
+                    stream_type,
+                    &as_inputs(&inputs),
+                    &schema,
+                    &fts,
+                    &[],
+                    &token,
+                )
+                .unwrap();
+                assert_diagnostics_equivalent(
+                    &open_merged(&rebuilt),
+                    &open_merged(&baseline),
+                    "rebuild diagnostics on/off",
+                );
+                let permit = acquire_vix_rebuild_permit_with_cancellation(&token).unwrap();
+                let sidecar = rebuild_core_file_sidecar_admitted_with_cancellation(
+                    stream_type,
+                    &as_inputs(&inputs)[0],
+                    &schema,
+                    &fts,
+                    &[],
+                    &token,
+                    permit,
+                )
+                .unwrap();
+                let index = match sidecar {
+                    SidecarHealOutcome::Rebuilt { index, .. } => Some(index),
+                    SidecarHealOutcome::DropSidecar => None,
+                    SidecarHealOutcome::NeedsDocsRewrite(reason) => {
+                        panic!("unexpected rewrite: {reason}")
+                    }
+                };
+                if enabled {
+                    assert_eq!(
+                        Some(index),
+                        sidecar_baseline,
+                        "sidecar bytes must not change"
+                    );
+                } else {
+                    sidecar_baseline = Some(index);
+                }
+            }
+        }
+        let decorated = VixMergeCancellation::from_flag(Arc::clone(&flag))
+            .with_diagnostics(Some(diagnostics_context()));
+        decorated.cancel();
+        assert!(
+            flag.load(AtomicOrdering::Relaxed),
+            "diagnostics must retain the original cancellation flag"
+        );
+        assert!(decorated.clone().check("diagnostic test").is_err());
+    }
+
+    fn assert_diagnostics_equivalent(left: &VixReader, right: &VixReader, context: &str) {
+        assert_eq!(
+            left.docs_schema().unwrap(),
+            right.docs_schema().unwrap(),
+            "{context}"
+        );
+        assert_eq!(
+            docs_row_contents(left),
+            docs_row_contents(right),
+            "{context}"
+        );
+        if !left.term_field_names().is_empty() {
+            assert_core_files_equivalent_logical_docs(left, right, context);
+        }
+    }
+
+    fn diagnostics_context() -> MergeStartContext {
+        MergeStartContext {
+            job_id: 12345,
+            batch_id: 7,
+            worker_id: 3,
+            stream: "default/logs/default".into(),
+            hour: "files/default/logs/default/2026/11/15/07".into(),
+            inputs: 2,
+            original_size: 4096,
+            compressed_size: 1024,
+        }
+    }
+
+    #[test]
+    fn diagnostics_log_identity_is_complete_and_single_line() {
+        let mut context = diagnostics_context();
+        assert_eq!(
+            context.to_string(),
+            "[COMPACTOR:WORKER:3] merge phase=start job_id=12345 batch_id=7 stream=\"default/logs/default\" hour=\"files/default/logs/default/2026/11/15/07\" inputs=2 original_size=4096 compressed_size=1024"
+        );
+        context.stream = "untrusted\nstream\rname".into();
+        assert_eq!(context.to_string().lines().count(), 1);
+        assert!(context.to_string().contains("untrusted\\nstream\\rname"));
+        let token = VixMergeCancellation::new();
+        assert!(
+            token.diagnostics.is_none(),
+            "default must not emit start logs"
+        );
     }
 
     /// #51c differential (a): a disjoint merge (passthrough is the DEFAULT)
