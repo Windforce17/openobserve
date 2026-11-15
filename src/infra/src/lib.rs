@@ -21,6 +21,7 @@ pub mod client;
 pub mod cluster;
 pub mod coordinator;
 pub mod db;
+pub mod diagnostics;
 pub mod dist_lock;
 pub mod errors;
 pub mod file_list;

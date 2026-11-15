@@ -27,6 +27,7 @@ use tokio::sync::{
 
 #[derive(Clone)]
 pub struct MergeBatch {
+    pub job_id: i64,
     pub batch_id: usize,
     pub org_id: String,
     pub stream_type: StreamType,
@@ -61,6 +62,17 @@ impl MergeCancellation {
     }
 
     #[inline]
+    pub fn with_diagnostics(
+        &self,
+        context: Option<crate::service::vix::core_writer::MergeStartContext>,
+    ) -> Self {
+        Self(self.0.clone().with_diagnostics(context))
+    }
+
+    pub fn log_start(&self, path: &str, docs: &str) {
+        self.0.log_start(path, docs);
+    }
+
     pub fn vix_token(&self) -> crate::service::vix::core_writer::VixMergeCancellation {
         self.0.clone()
     }
@@ -1147,6 +1159,21 @@ impl MergeWorker {
                                 &msg.prefix,
                                 &msg.files,
                                 &msg.cancel,
+                                infra::diagnostics::merge_start_enabled().then(|| {
+                                    crate::service::vix::core_writer::MergeStartContext {
+                                        job_id: msg.job_id,
+                                        batch_id: msg.batch_id,
+                                        worker_id: thread_id,
+                                        stream: format!(
+                                            "{}/{}/{}",
+                                            msg.org_id, msg.stream_type, msg.stream_name
+                                        ),
+                                        hour: msg.prefix.clone(),
+                                        inputs: 0,
+                                        original_size: 0,
+                                        compressed_size: 0,
+                                    }
+                                }),
                             )
                             .await;
                             drop(permit);
