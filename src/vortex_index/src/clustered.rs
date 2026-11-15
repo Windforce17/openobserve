@@ -190,6 +190,7 @@ impl LayoutChildren for OwnedChildren {
 /// carries the pruning metadata).
 pub(crate) struct ClusteredDocsStrategy {
     compressor: Arc<dyn CompressorPlugin>,
+    source_compressor: Option<Arc<dyn CompressorPlugin>>,
     flat: BufferBoundedFlatStrategy,
     stripe_bytes: u64,
     coalesce_max_rows: usize,
@@ -202,6 +203,7 @@ impl ClusteredDocsStrategy {
     pub(crate) fn new<C: CompressorPlugin>(compressor: C) -> Self {
         Self {
             compressor: Arc::new(compressor),
+            source_compressor: None,
             flat: BufferBoundedFlatStrategy::default(),
             stripe_bytes: STRIPE_BYTES,
             coalesce_max_rows: COALESCE_MAX_ROWS,
@@ -209,6 +211,11 @@ impl ClusteredDocsStrategy {
             coalesce_total_bytes: COALESCE_TOTAL_BYTES,
             inflight_total_bytes: INFLIGHT_TOTAL_BYTES,
         }
+    }
+
+    pub(crate) fn with_source_compressor<C: CompressorPlugin>(mut self, compressor: C) -> Self {
+        self.source_compressor = Some(Arc::new(compressor));
+        self
     }
 
     /// Test hook: shrink the stripe/coalesce budgets so small fixtures
@@ -441,6 +448,8 @@ struct LeafWriter<'a> {
     ctx: &'a LayoutWriterContext,
     segment_sink: &'a SegmentSinkRef,
     compressor: &'a Arc<dyn CompressorPlugin>,
+    source_compressor: Option<&'a Arc<dyn CompressorPlugin>>,
+    source_index: Option<usize>,
     flat: &'a BufferBoundedFlatStrategy,
     ratio: &'a Arc<OutputRatio>,
     field_dtypes: &'a [DType],
@@ -474,7 +483,11 @@ impl LeafWriter<'_> {
             self.session,
             self.ctx,
             self.segment_sink,
-            self.compressor,
+            if self.source_index == Some(index) {
+                self.source_compressor.unwrap_or(self.compressor)
+            } else {
+                self.compressor
+            },
             self.flat,
             self.ratio,
             field_ptr,
@@ -594,6 +607,11 @@ impl LayoutStrategy for ClusteredDocsStrategy {
             ctx: &ctx,
             segment_sink: &segment_sink,
             compressor: &self.compressor,
+            source_compressor: self.source_compressor.as_ref(),
+            source_index: struct_dtype
+                .names()
+                .iter()
+                .position(|name| name.as_ref() == crate::writer::SOURCE_COL_NAME),
             flat: &self.flat,
             ratio: &ratio,
             field_dtypes: &field_dtypes,

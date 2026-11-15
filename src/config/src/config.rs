@@ -2260,6 +2260,12 @@ pub struct Common {
     )]
     pub vix_docs_chunk_max_rows: usize,
     #[env_config(
+        name = "ZO_VIX_SOURCE_FRAME_ROWS",
+        default = 8192,
+        help = "Zstd values per frame for _source only: 8192 preserves the existing writer;                 2048 rewrites _source with smaller frames, including passthrough merge outputs."
+    )]
+    pub vix_source_frame_rows: usize,
+    #[env_config(
         name = "ZO_VIX_DOCS_RESIDENT_BUDGET_MB",
         default = 1024,
         help = "Compaction merge docs writer: RESIDENT decoded bytes (MiB) the passthrough \
@@ -4752,6 +4758,12 @@ fn check_route_config(cfg: &Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    if !matches!(cfg.common.vix_source_frame_rows, 2048 | 8192) {
+        return Err(anyhow::anyhow!(
+            "ZO_VIX_SOURCE_FRAME_ROWS must be 2048 or 8192, got {}",
+            cfg.common.vix_source_frame_rows
+        ));
+    }
     if cfg.limit.file_push_interval == 0 {
         cfg.limit.file_push_interval = 60;
     }
@@ -7453,6 +7465,26 @@ mod tests {
         cfg.common.feature_bloom_filter_extra_fields = "trace_id".to_string();
         check_common_config(&mut cfg).unwrap();
         assert_eq!(cfg.common.feature_bloom_filter_extra_fields, "trace_id");
+    }
+
+    #[test]
+    fn test_check_common_config_source_frame_rows() {
+        assert_eq!(Config::init().unwrap().common.vix_source_frame_rows, 8192);
+        for rows in [2048, 8192] {
+            let mut cfg = Config::init().unwrap();
+            cfg.common.vix_source_frame_rows = rows;
+            check_common_config(&mut cfg).unwrap();
+        }
+        for rows in [0, 1, 2047, 4096, 8193, usize::MAX] {
+            let mut cfg = Config::init().unwrap();
+            cfg.common.vix_source_frame_rows = rows;
+            assert!(
+                check_common_config(&mut cfg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ZO_VIX_SOURCE_FRAME_ROWS")
+            );
+        }
     }
 
     #[test]

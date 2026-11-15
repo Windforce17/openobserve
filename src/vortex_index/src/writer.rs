@@ -741,6 +741,9 @@ pub struct VixWriterOptions {
     /// granule and one DECOMPRESSION unit per matched-row point read.
     /// Values below the 64-row floor are raised to the floor.
     pub docs_chunk_max_rows: usize,
+    /// Zstd values per frame for `_source`: 8192 preserves the existing writer,
+    /// 2048 also recompresses `_source` during passthrough merges.
+    pub source_frame_rows: usize,
     /// #51c passthrough layout writer: RESIDENT decoded bytes it may hold
     /// across ALL columns' open coalescing runs before closing the runs at
     /// or above a 1/(4n) share of it; closed runs are admitted to the CPU
@@ -934,6 +937,7 @@ impl Default for VixWriterOptions {
             row_group_size: 0,
             docs_chunk_bytes: DEFAULT_DOCS_CHUNK_BYTES,
             docs_chunk_max_rows: DEFAULT_DOCS_CHUNK_MAX_ROWS,
+            source_frame_rows: crate::source_frame::DEFAULT_SOURCE_FRAME_ROWS,
             docs_resident_budget: 0,
             min_token_len: 2,
             max_token_len: 64,
@@ -1310,6 +1314,9 @@ impl VixWriter {
 
         let mut partial_fields = BTreeSet::new();
         let mut init_error = None;
+        if !matches!(opts.source_frame_rows, 2048 | 8192) {
+            init_error = Some("source_frame_rows must be 2048 or 8192".to_string());
+        }
         // Field ids beyond the cap (0xFFFF is the reserved key marker) are
         // not an error: the overflowing fields are left out of the term
         // index and recorded in `partial_fields` (queries on them fall back
@@ -2604,6 +2611,7 @@ impl VixWriter {
             self.opts.docs_passthrough,
             Arc::clone(&self.docs_failopen_chunks),
             self.opts.docs_resident_budget,
+            self.opts.source_frame_rows,
         )?;
         for batch in std::mem::take(&mut self.sample_batches) {
             folder.fold(&batch)?;
