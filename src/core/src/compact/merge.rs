@@ -1646,6 +1646,7 @@ fn group_files_into_batches(
         new_file_list.push(file.clone());
         if new_file_list.len() > 1 && limits.reached(new_file_size, new_compressed_size) {
             batch_groups.push(MergeBatch {
+                job_id: 0,
                 batch_id: batch_groups.len(),
                 org_id: org_id.to_string(),
                 stream_type,
