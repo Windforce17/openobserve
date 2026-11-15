@@ -13446,6 +13446,7 @@ dependencies = [
  "log",
  "memchr",
  "parking_lot 0.12.5",
+ "prost 0.14.3",
  "puffin",
  "rand 0.10.3",
  "rapidhash",
@@ -13460,6 +13461,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "vortex",
+ "vortex-btrblocks",
+ "vortex-compressor",
  "zstd 0.13.3",
 ]
 

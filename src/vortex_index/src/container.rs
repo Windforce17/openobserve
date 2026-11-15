@@ -1778,6 +1778,7 @@ impl DocsBlobEncoder {
     /// here, since the passthrough strategy has no repartition step).
     /// `resident_budget` bounds that strategy's resident decoded bytes
     /// ([`crate::writer::VixWriterOptions::docs_resident_budget`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn(
         schema: Arc<Schema>,
         rows_per_chunk: usize,
@@ -1786,6 +1787,7 @@ impl DocsBlobEncoder {
         docs_passthrough: bool,
         fail_open: Arc<std::sync::atomic::AtomicU64>,
         resident_budget: u64,
+        source_frame_rows: usize,
     ) -> Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel(2);
         let handle = std::thread::Builder::new()
@@ -1799,6 +1801,7 @@ impl DocsBlobEncoder {
                     docs_passthrough,
                     fail_open,
                     resident_budget,
+                    source_frame_rows,
                     &rx,
                 )
             })
@@ -1887,6 +1890,7 @@ fn run_docs_encoder(
     docs_passthrough: bool,
     fail_open: Arc<std::sync::atomic::AtomicU64>,
     resident_budget: u64,
+    source_frame_rows: usize,
     rx: &std::sync::mpsc::Receiver<DocsEncodeMsg>,
 ) -> Result<(ContainerSink, u64)> {
     let runtime = SingleThreadRuntime::default();
@@ -1903,6 +1907,7 @@ fn run_docs_encoder(
                     docs_passthrough,
                     Arc::clone(&fail_open),
                     resident_budget,
+                    source_frame_rows,
                     rx,
                     &mut *buf,
                 )?;
@@ -1921,6 +1926,7 @@ fn run_docs_encoder(
                     docs_passthrough,
                     Arc::clone(&fail_open),
                     resident_budget,
+                    source_frame_rows,
                     rx,
                     &mut counting,
                 )?;
@@ -1952,6 +1958,7 @@ fn encode_docs_stream<W: std::io::Write + Unpin + Send>(
     docs_passthrough: bool,
     fail_open: Arc<std::sync::atomic::AtomicU64>,
     resident_budget: u64,
+    source_frame_rows: usize,
     rx: &std::sync::mpsc::Receiver<DocsEncodeMsg>,
     sink: &mut W,
 ) -> Result<()> {
@@ -1971,11 +1978,12 @@ fn encode_docs_stream<W: std::io::Write + Unpin + Send>(
             .with_strategy(docs_passthrough_strategy(
                 fail_open,
                 resident_budget,
+                source_frame_rows,
                 &session,
             ))
             .with_file_statistics(Vec::new());
     } else {
-        options = options.with_strategy(docs_strategy(rows_per_chunk, &session));
+        options = options.with_strategy(docs_strategy(rows_per_chunk, source_frame_rows, &session));
     }
     let mut writer = options.blocking(runtime).writer(&mut *sink, dtype);
     let mut finished = false;
@@ -2102,6 +2110,7 @@ pub(crate) fn compressed_strategy(row_block_size: usize) -> Result<Arc<dyn Layou
 /// multi-hundred-MB chunk). `0` keeps vortex's default.
 pub(crate) fn docs_strategy(
     row_block_size: usize,
+    source_frame_rows: usize,
     session: &VortexSession,
 ) -> Arc<dyn LayoutStrategy> {
     let mut builder = WriteStrategyBuilder::from_session(session)
@@ -2109,6 +2118,18 @@ pub(crate) fn docs_strategy(
         .with_btrblocks_builder(BtrBlocksCompressorBuilder::from_session(session).with_compact());
     if row_block_size > 0 {
         builder = builder.with_row_block_size(row_block_size);
+    }
+    if source_frame_rows == crate::source_frame::SMALL_SOURCE_FRAME_ROWS {
+        let mut source = WriteStrategyBuilder::from_session(session)
+            .with_flat_strategy(Arc::new(BufferBoundedFlatStrategy::default()))
+            .with_btrblocks_builder(crate::source_frame::compressor(session));
+        if row_block_size > 0 {
+            source = source.with_row_block_size(row_block_size);
+        }
+        builder = builder.with_field_writer(
+            vortex::dtype::FieldPath::from_name(crate::writer::SOURCE_COL_NAME),
+            source.build(),
+        );
     }
     builder.build()
 }
@@ -2208,6 +2229,7 @@ fn is_decoded_node(node: &ArrayRef) -> bool {
 pub(crate) fn docs_passthrough_strategy(
     fail_open: Arc<std::sync::atomic::AtomicU64>,
     resident_budget: u64,
+    source_frame_rows: usize,
     session: &VortexSession,
 ) -> Arc<dyn LayoutStrategy> {
     use vortex::array::{Canonical, ExecutionCtx, IntoArray};
@@ -2243,7 +2265,22 @@ pub(crate) fn docs_passthrough_strategy(
             let canonical = chunk.clone().execute::<Canonical>(ctx)?.into_array();
             compressor.compress(&canonical, ctx)
         };
-    let strategy = crate::clustered::ClusteredDocsStrategy::new(compress_or_pass);
+    let mut strategy = crate::clustered::ClusteredDocsStrategy::new(compress_or_pass);
+    if source_frame_rows == crate::source_frame::SMALL_SOURCE_FRAME_ROWS {
+        let source_compressor = crate::source_frame::compressor(session).build();
+        let write_session = session.clone();
+        strategy =
+            strategy.with_source_compressor(move |chunk: &ArrayRef, ctx: &mut ExecutionCtx| {
+                if crate::source_frame::has_small_frames(chunk)
+                    && is_ctx_serializable(chunk)
+                    && fits_flat_buffer_limit(chunk, &write_session)
+                {
+                    return Ok(chunk.clone());
+                }
+                let canonical = chunk.clone().execute::<Canonical>(ctx)?.into_array();
+                source_compressor.compress(&canonical, ctx)
+            });
+    }
     Arc::new(if resident_budget > 0 {
         // the in-flight admission is half the pending budget (one merge's
         // docs writer holds about 1.5x the knob)

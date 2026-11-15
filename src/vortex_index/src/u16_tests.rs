@@ -100,6 +100,7 @@ fn write_and_read(dict: ArrayRef, values: &BinaryViewArray, expected_fail_open: 
         true,
         Arc::clone(&fail_open),
         0,
+        crate::source_frame::DEFAULT_SOURCE_FRAME_ROWS,
     )
     .unwrap();
     encoder.push_encoded(root).unwrap();

@@ -432,6 +432,7 @@ fn core_writer_options_from_config(
         row_group_size: PARQUET_MAX_ROW_GROUP_SIZE,
         docs_chunk_bytes: cfg.common.vix_docs_chunk_bytes,
         docs_chunk_max_rows: cfg.common.vix_docs_chunk_max_rows,
+        source_frame_rows: cfg.common.vix_source_frame_rows,
         // #51c passthrough layout writer residency (ZO_VIX_DOCS_RESIDENT_
         // BUDGET_MB); 0 keeps the writer's built-in default
         docs_resident_budget: (cfg.common.vix_docs_resident_budget_mb as u64) << 20,

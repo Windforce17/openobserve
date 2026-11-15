@@ -90,6 +90,9 @@ mod repack;
 pub mod runtime_reclaim;
 pub mod sbbf;
 mod source;
+mod source_frame;
+#[cfg(test)]
+mod source_frame_tests;
 mod spill;
 #[doc(hidden)]
 mod stats;

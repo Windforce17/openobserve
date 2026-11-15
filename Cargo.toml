@@ -312,6 +312,8 @@ moka = { version = "0.12.16", default-features = false, features = ["sync"] }
 # on top of develop; vendored vortex-layout / vortex-pco patched below.
 vortex = { git = "https://github.com/vortex-data/vortex", rev = "a13851be9bd35a53dbb6886b285997673461dfb0", features = ["tokio", "object_store"] }
 vortex-datafusion = { git = "https://github.com/vortex-data/vortex", rev = "a13851be9bd35a53dbb6886b285997673461dfb0" }
+vortex-btrblocks = { git = "https://github.com/vortex-data/vortex", rev = "a13851be9bd35a53dbb6886b285997673461dfb0" }
+vortex-compressor = { git = "https://github.com/vortex-data/vortex", rev = "a13851be9bd35a53dbb6886b285997673461dfb0" }
 vortex_index = { path = "src/vortex_index" }
 aes-siv = "0.7.0"
 ahash = { version = "0.8", features = ["serde"] }

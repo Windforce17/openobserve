@@ -26,6 +26,7 @@ levenshtein_automata.workspace = true
 log.workspace = true
 memchr.workspace = true
 parking_lot.workspace = true
+prost.workspace = true
 roaring.workspace = true
 ryu = "1.0"
 serde.workspace = true
@@ -37,6 +38,8 @@ tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 vortex.workspace = true
+vortex-btrblocks.workspace = true
+vortex-compressor.workspace = true
 sonic-rs.workspace = true
 zstd = { workspace = true, features = ["experimental"] }
 
