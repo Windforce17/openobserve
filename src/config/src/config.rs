@@ -3391,6 +3391,12 @@ pub struct Limit {
     )]
     pub vix_topn_empty_filter_first_enabled: bool,
     #[env_config(
+        name = "ZO_VIX_ABSENT_OR_PRUNING_ENABLED",
+        default = false,
+        help = "Simplify positive equality/IN ORs per indexed file when its complete column list proves some fields absent and all remaining arms have raw-value term capability. No NOT, NULL tests, partial, token-only or bloom-only fields are rewritten. False preserves the original mixed-OR fallback; no writer or format change is required."
+    )]
+    pub vix_absent_or_pruning_enabled: bool,
+    #[env_config(
         name = "ZO_VIX_AGG_SELECTED_DICTIONARY_BUDGET_ENABLED",
         default = true,
         help = "Apply aggregate dictionary group and owned-key byte budgets after bitmap selection, not to unused dictionary entries. Decoded chunk bytes remain bounded by the existing read budget. False restores the pre-selection dictionary check."
@@ -7827,6 +7833,59 @@ mod empty_topn_config_tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod absent_or_config_tests {
+    use super::Config;
+
+    #[test]
+    fn absent_or_switch_is_strict_and_defaults_off() {
+        const KEY: &str = "ZO_VIX_ABSENT_OR_PRUNING_ENABLED";
+        const CHILD: &str = "OO_ABSENT_OR_CONFIG_EXPECTED";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(
+                Config::init().unwrap().limit.vix_absent_or_pruning_enabled,
+                expected == "true"
+            );
+            return;
+        }
+        for (value, expected) in [
+            (None, Some(false)),
+            (Some("true"), Some(true)),
+            (Some("false"), Some(false)),
+            (Some("TRUE"), Some(true)),
+            (Some("FALSE"), Some(false)),
+            (Some("1"), None),
+            (Some("yes"), None),
+            (Some(""), None),
+            (Some("invalid"), None),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "config::absent_or_config_tests::absent_or_switch_is_strict_and_defaults_off",
+                    "--nocapture",
+                ])
+                .env(CHILD, expected.unwrap_or(false).to_string())
+                .env_remove(KEY);
+            if let Some(value) = value {
+                child.env(KEY, value);
+            }
+            let output = child.output().unwrap();
+            assert_eq!(
+                output.status.success(),
+                expected.is_some(),
+                "{value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if expected.is_none() {
+                assert!(String::from_utf8_lossy(&output.stderr).contains(KEY));
+            }
         }
     }
 }

@@ -55,6 +55,7 @@
 //! concurrent followers; operation-owned cancellation and accounting remain
 //! separate from shared immutable readers.
 
+mod absent_or;
 mod aggregate_reject;
 pub mod cache;
 #[cfg(test)]
@@ -2321,6 +2322,12 @@ fn evaluate_vix_index(
     bitmap_cache_key: Option<String>,
     full_text_fields: Option<&[String]>,
 ) -> anyhow::Result<RawVixResult> {
+    let simplified = absent_or::simplify(
+        reader,
+        condition,
+        get_config().limit.vix_absent_or_pruning_enabled,
+    );
+    let condition = simplified.as_ref().unwrap_or(condition);
     evaluate_vix_index_with_empty_topn(
         trace_id,
         reader,
