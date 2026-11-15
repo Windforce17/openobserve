@@ -3673,6 +3673,12 @@ pub struct Compact {
     pub strategy: String,
     #[env_config(name = "ZO_COMPACT_FAST_MODE", default = false)]
     pub fast_mode: bool,
+    #[env_config(
+        name = "ZO_COMPACT_SETTLED_SMALL_FILES_QUIET_SECS",
+        default = 0,
+        help = "0 preserves legacy grouping. 60..86400 enables settled-hour coalescing: inputs older than this period close out independently of newer arrivals; other non-final groups must double their largest input. Each close-out input must cool down again before another close-out. Final files remain excluded. Unrecognized or future-dated file names retain legacy grouping."
+    )]
+    pub settled_small_files_quiet_secs: u64,
     #[env_config(name = "ZO_COMPACT_SYNC_TO_DB_INTERVAL", default = 600)] // seconds
     pub sync_to_db_interval: u64,
     #[env_config(name = "ZO_COMPACT_MAX_FILE_SIZE", default = 2048)] // MB
@@ -5590,6 +5596,11 @@ fn check_disk_cache_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_compact_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    if cfg.compact.settled_small_files_quiet_secs != 0
+        && !(60..=86_400).contains(&cfg.compact.settled_small_files_quiet_secs)
+    {
+        anyhow::bail!("ZO_COMPACT_SETTLED_SMALL_FILES_QUIET_SECS must be 0 or within 60..=86400");
+    }
     // M19: any retention >= 1 day is valid (0/negative = disabled). The old
     // 3-day floor predates the v2 era: the fleet runs engine-owned 1-day
     // retention as the PRIMARY row+object lifecycle, with the S3 lifecycle
@@ -7307,6 +7318,21 @@ mod tests {
         assert_eq!(cfg.compact.file_list_deleted_batch_size, 1000);
         assert_eq!(cfg.compact.batch_size, 100);
         assert_eq!(cfg.compact.pending_jobs_metric_interval, 300);
+    }
+
+    #[test]
+    fn test_settled_small_files_quiet_secs_validation() {
+        assert_eq!(Compact::default().settled_small_files_quiet_secs, 0);
+        for value in [0, 60, 3600, 86_400] {
+            let mut cfg = Config::default();
+            cfg.compact.settled_small_files_quiet_secs = value;
+            assert!(check_compact_config(&mut cfg).is_ok());
+        }
+        for value in [1, 59, 86_401, u64::MAX] {
+            let mut cfg = Config::default();
+            cfg.compact.settled_small_files_quiet_secs = value;
+            assert!(check_compact_config(&mut cfg).is_err());
+        }
     }
 
     #[test]
