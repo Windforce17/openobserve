@@ -42,6 +42,7 @@ mod index_coverage;
 pub mod merge;
 pub mod retention;
 pub mod segments_sweep;
+mod smallfiles;
 pub mod stats;
 pub mod worker;
 

@@ -801,6 +801,12 @@ pub async fn merge_by_stream(
                 downsampling,
                 &job_strategy,
                 super::index_coverage::enabled(stream_type),
+                (cfg.compact.settled_small_files_quiet_secs > 0).then(|| {
+                    super::smallfiles::Policy {
+                        now_micros: config::utils::time::now_micros(),
+                        quiet_secs: cfg.compact.settled_small_files_quiet_secs,
+                    }
+                }),
             );
             if batch_groups.is_empty()
                 && heal_candidates.is_empty()
@@ -1440,6 +1446,7 @@ fn plan_partition(
     downsampling: bool,
     job_strategy: &MergeStrategy,
     coverage_enabled: bool,
+    small_file_policy: Option<super::smallfiles::Policy>,
 ) -> PartitionPlan {
     let (core_files, flat_candidates): (Vec<FileKey>, Vec<FileKey>) = files_with_size
         .into_iter()
@@ -1487,6 +1494,26 @@ fn plan_partition(
         });
     }
     for files in [&flat_files, &plain_core, &indexed_core] {
+        if age.settled
+            && !age.open
+            && !downsampling
+            && let Some(policy) = small_file_policy
+            && let Some(groups) =
+                super::smallfiles::groups(files, max_file_size, merge_group_width(), policy)
+        {
+            for files in groups {
+                plan.batch_groups.push(MergeBatch {
+                    batch_id: plan.batch_groups.len(),
+                    org_id: org_id.to_string(),
+                    stream_type,
+                    stream_name: stream_name.to_string(),
+                    prefix: prefix.to_string(),
+                    files,
+                    cancel: MergeCancellation::default(),
+                });
+            }
+            continue;
+        }
         group_files_into_batches(
             &mut plan.batch_groups,
             files,
@@ -1548,6 +1575,16 @@ fn plan_partition(
 /// bounded by log₈ of their count and their bytes are negligible.
 const MIN_PARTIAL_FAN_IN: usize = 8;
 
+fn merge_group_width() -> usize {
+    let cfg = get_config();
+    match (cfg.compact.max_group_files, cfg.compact.max_file_count) {
+        (0, 0) => 0,
+        (g, 0) => g,
+        (0, c) => c as usize,
+        (g, c) => std::cmp::min(g, c as usize),
+    }
+}
+
 /// Cut `files` (already sorted by the job strategy) into merge batches
 /// bounded by `max_file_size` (one target for every class) and
 /// `compact.max_group_files`, appending them to `batch_groups`. A full group
@@ -1567,7 +1604,6 @@ fn group_files_into_batches(
     settled: bool,
     job_strategy: &MergeStrategy,
 ) {
-    let cfg = get_config();
     // M29: cut groups at max_file_count too — merge_files consumes at most
     // that many files per batch (#51 width cap), so a wider group's tail was
     // dispatched, dropped on the floor, and re-planned + re-queried on the
@@ -1575,12 +1611,7 @@ fn group_files_into_batches(
     // partial batches per 30m). Cutting here makes every dispatched batch
     // fully consumable in one pass; output sizes are unchanged (the consumer
     // sealed exactly this many files per output before as well).
-    let max_group_len = match (cfg.compact.max_group_files, cfg.compact.max_file_count) {
-        (0, 0) => 0,
-        (g, 0) => g,
-        (0, c) => c as usize,
-        (g, c) => std::cmp::min(g, c as usize),
-    };
+    let max_group_len = merge_group_width();
     let mut new_file_list: Vec<FileKey> = Vec::new();
     let mut new_file_size = 0;
     for file in files.iter() {
@@ -3530,6 +3561,10 @@ fn sort_by_time_range(mut file_list: Vec<FileKey>) -> Vec<FileKey> {
 }
 
 #[cfg(test)]
+#[path = "smallfiles_tests.rs"]
+mod smallfiles_tests;
+
+#[cfg(test)]
 mod tests {
     use std::future::ready;
 
@@ -4434,6 +4469,7 @@ mod tests {
             false,
             &MergeStrategy::FileTime,
             false,
+            None,
         )
     }
 
@@ -4475,6 +4511,7 @@ mod tests {
                 false,
                 &MergeStrategy::FileTime,
                 enabled,
+                None,
             )
         };
         for age in [OPEN, UNSETTLED] {
