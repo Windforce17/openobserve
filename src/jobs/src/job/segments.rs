@@ -2175,6 +2175,9 @@ async fn build_stream_files(
     }
     let merged = concat_batches(&union, homogenized.iter())
         .with_context(|| format!("{ctx}: concat homogenized batches"))?;
+    // The concatenated batch owns its buffers. Do not keep the per-schema
+    // inputs (including null padding) alive through sorting and file writing.
+    drop(homogenized);
 
     let (merged, dropped) = filter_degenerate_ts(merged, &ctx)?;
     if dropped > 0 {
@@ -2313,9 +2316,16 @@ fn homogenize_batch(
 ) -> Result<RecordBatch, anyhow::Error> {
     let rows = batch.num_rows();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(union.fields().len());
+    // All missing fields of the same type have identical immutable values
+    // and length. Share their padding instead of allocating once per field.
+    let mut nulls: HashMap<&DataType, ArrayRef> = HashMap::new();
     for field in union.fields() {
         let column = match batch.column_by_name(field.name()) {
-            None => new_null_array(field.data_type(), rows),
+            None => Arc::clone(
+                nulls
+                    .entry(field.data_type())
+                    .or_insert_with(|| new_null_array(field.data_type(), rows)),
+            ),
             Some(col) if col.data_type() == field.data_type() => Arc::clone(col),
             Some(col) => cast(col, field.data_type()).with_context(|| {
                 format!(
@@ -2951,6 +2961,53 @@ mod tests {
     }
 
     // ── schema homogenization ────────────────────────────────────────────
+
+    #[test]
+    fn homogenize_shares_missing_columns_by_complete_type() {
+        let batch = RecordBatch::try_new(
+            schema_of(vec![ts_field()]),
+            vec![Arc::new(Int64Array::from(vec![T0, T0 + 1, T0 + 2]))],
+        )
+        .unwrap();
+        let types = [
+            DataType::Int64,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::Utf8View,
+            DataType::Binary,
+            DataType::Boolean,
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            DataType::Struct(vec![Field::new("child", DataType::Utf8, true)].into()),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+        ];
+        let mut fields = vec![ts_field()];
+        for (i, data_type) in types.iter().enumerate() {
+            fields.push(Field::new(format!("a{i}"), data_type.clone(), true));
+            fields.push(Field::new(format!("b{i}"), data_type.clone(), true));
+        }
+        let union = schema_of(fields);
+        for batch in [batch.clone(), batch.slice(0, 0)] {
+            let padded = homogenize_batch(&batch, &union, "shared nulls").unwrap();
+            assert_eq!(padded.schema(), union);
+            assert!(Arc::ptr_eq(padded.column(0), batch.column(0)));
+            for (i, data_type) in types.iter().enumerate() {
+                let a = padded.column(1 + i * 2);
+                let b = padded.column(2 + i * 2);
+                assert!(
+                    Arc::ptr_eq(a, b),
+                    "missing {data_type} columns must share padding"
+                );
+                assert_eq!(
+                    a.to_data(),
+                    new_null_array(data_type, batch.num_rows()).to_data()
+                );
+                if i > 0 {
+                    assert!(!Arc::ptr_eq(a, padded.column(1 + (i - 1) * 2)));
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_union_schema_widens_type_flips_and_null_pads() {
