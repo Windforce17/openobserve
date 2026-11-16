@@ -14281,8 +14281,24 @@ fn m25_sparse_column_copy_does_not_bloat() {
             use vortex::array::arrays::{Struct, struct_::StructArraySlotsExt};
             let sa = chunk.array.as_typed::<Struct>().unwrap().clone();
             for field in sa.fields().iter() {
-                if crate::container::is_decoded_root(field)
-                    && !crate::container::is_decoded_family(field)
+                use vortex::{
+                    VortexSessionDefault,
+                    array::{Canonical, IntoArray, VortexSessionExecute},
+                };
+                let session = vortex::session::VortexSession::default();
+                let mut ctx = session.create_execution_ctx();
+                let resolved =
+                    if crate::deferred_canonical::DeferredCanonical::source(field).is_some() {
+                        field
+                            .clone()
+                            .execute::<Canonical>(&mut ctx)
+                            .unwrap()
+                            .into_array()
+                    } else {
+                        field.clone()
+                    };
+                if crate::container::is_decoded_root(&resolved)
+                    && !crate::container::is_decoded_family(&resolved)
                 {
                     mixed += 1;
                 }
@@ -15574,9 +15590,9 @@ fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
     let (data, _) = writer.finish().unwrap();
     let docs = VixDocs::open(Bytes::from(data)).unwrap();
 
-    // the copy: every yielded chunk is fully ctx-serializable, the guard
-    // canonicalized the misaligned column-windows (counted), and the
-    // write-side fail-open never fires
+    // The guard marks misaligned columns without expanding the queued
+    // window. Resolving each obligation must still make it serializable,
+    // and the write-side fail-open must never fire.
     let entries: Vec<crate::ZoneEntry> = docs
         .zone_chunks()
         .unwrap()
@@ -15604,17 +15620,40 @@ fn m18_sliced_scan_canonicalizes_and_copies_row_exact() {
     )
     .unwrap();
     let mut chunks = 0usize;
+    let mut deferred_columns = 0u64;
     let sliced_windows = docs
         .scan_docs_encoded_chunks(&mut |chunk| {
             chunks += 1;
-            assert!(
-                is_ctx_serializable(&chunk.array),
-                "the scan must never yield a chunk the write context cannot serialize"
-            );
+            use vortex::{
+                VortexSessionDefault,
+                array::{
+                    Canonical, IntoArray, VortexSessionExecute,
+                    arrays::struct_::StructArraySlotsExt,
+                },
+            };
+            let session = vortex::session::VortexSession::default();
+            let mut ctx = session.create_execution_ctx();
+            for field in chunk.array.as_typed::<Struct>().unwrap().fields().iter() {
+                if crate::deferred_canonical::DeferredCanonical::source(field).is_some() {
+                    deferred_columns += 1;
+                    let canonical = field
+                        .clone()
+                        .execute::<Canonical>(&mut ctx)
+                        .unwrap()
+                        .into_array();
+                    assert!(is_ctx_serializable(&canonical));
+                } else {
+                    assert!(is_ctx_serializable(field));
+                }
+            }
             out.push_docs_encoded_chunk(chunk)
         })
         .unwrap();
     assert!(chunks > 1, "the corpus must split into multiple windows");
+    assert_eq!(
+        deferred_columns, sliced_windows,
+        "slice guard expanded a queued column eagerly"
+    );
     assert!(
         sliced_windows > 0,
         "the coarse narrow columns must be detected as sliced (guard fired)"

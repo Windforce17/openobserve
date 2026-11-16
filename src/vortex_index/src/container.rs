@@ -2413,7 +2413,7 @@ pub(crate) fn scan_blob_encoded_chunks(
     on_chunk: &mut dyn FnMut(ArrayRef, usize) -> Result<()>,
 ) -> Result<u64> {
     use vortex::array::{
-        Canonical, IntoArray,
+        IntoArray,
         arrays::{
             Struct, StructArray,
             struct_::{StructArrayExt, StructArraySlotsExt},
@@ -2515,21 +2515,19 @@ pub(crate) fn scan_blob_encoded_chunks(
             on_chunk(array, len)?;
             continue;
         }
+        // Keep queued windows encoded. The clustered writer resolves one
+        // marked column at a time, before its original accounting snapshot.
         let resolved: std::result::Result<Vec<ArrayRef>, VixError> = fields
             .into_iter()
             .enumerate()
             .map(|(index, field)| {
                 if marks[index] {
-                    let mut ctx = session.create_execution_ctx();
-                    Ok(field
-                        .execute::<Canonical>(&mut ctx)
-                        .map_err(|e| {
-                            VixError::Malformed(format!(
-                                "canonicalize sliced docs column {:?}: {e}",
-                                names[index]
-                            ))
-                        })?
-                        .into_array())
+                    crate::deferred_canonical::DeferredCanonical::wrap(field).map_err(|e| {
+                        VixError::Malformed(format!(
+                            "defer sliced docs column {:?}: {e}",
+                            names[index]
+                        ))
+                    })
                 } else {
                     Ok(field)
                 }

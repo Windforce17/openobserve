@@ -308,6 +308,26 @@ impl ChunkWork {
     }
 }
 
+/// Resolve a slice-guard obligation under the same process admission as leaf
+/// compression. The caller must transfer the result to pending/leaf accounting
+/// and drop this permit BEFORE submitting a leaf (no recursive acquisition).
+async fn resolve_column(
+    field: &ArrayRef,
+    canonicalizer: &mut crate::slice_canonical::SliceCanonicalizer,
+    exec: &mut vortex::array::ExecutionCtx,
+    budget: &crate::merge_budget::MergeBudget,
+) -> VortexResult<(ArrayRef, Option<OwnedSemaphorePermit>)> {
+    let Some(source) = crate::deferred_canonical::DeferredCanonical::source(field) else {
+        return Ok((field.clone(), None));
+    };
+    let bytes = source
+        .nbytes()
+        .saturating_add(canonical_row_bytes(source.dtype(), source.len() as u64));
+    let permit = budget.acquire(bytes).await?;
+    let canonical = canonicalizer.canonicalize(source.clone(), exec)?;
+    Ok((canonical, Some(permit)))
+}
+
 fn admission_units(bytes: u64, capacity_units: u64) -> u32 {
     bytes.div_ceil(INFLIGHT_UNIT).clamp(1, capacity_units) as u32
 }
@@ -702,13 +722,17 @@ impl LayoutStrategy for ClusteredDocsStrategy {
             }
             total_rows += chunk.len() as u64;
             let mut pending_total: u64 = 0;
+            let mut canonicalizer = crate::slice_canonical::SliceCanonicalizer::default();
             for (index, field) in fields.iter().enumerate() {
+                let (field, expansion_permit) =
+                    resolve_column(field, &mut canonicalizer, &mut exec, leaf.shared_inflight)
+                        .await?;
                 column_rows[index] += field.len() as u64;
                 // M25: root-keyed like the routing below — a decoded root
                 // over borrowed encoded buffers is decoded transit, and its
                 // output estimate must ride the observed decoded ratio, not
                 // count its materialized-views nbytes as if it were output.
-                if is_decoded_root(field) {
+                if is_decoded_root(&field) {
                     stripe_decoded_raw += field.nbytes();
                 } else {
                     stripe_encoded += field.nbytes();
@@ -719,6 +743,10 @@ impl LayoutStrategy for ClusteredDocsStrategy {
                     self.coalesce_max_bytes,
                     &mut exec,
                 );
+                // Ownership has moved to the existing bounded pending/leaf
+                // path. Release the temporary expanded input before waiting.
+                drop(field);
+                drop(expansion_permit);
                 for (work, resident) in works.into_iter().flatten() {
                     leaf.submit(
                         index,
@@ -833,6 +861,136 @@ mod tests {
 
     use super::*;
     use crate::container::{BlobHandle, RowSelection, scan_blob};
+
+    #[tokio::test]
+    async fn deferred_column_waits_for_budget_before_materializing() {
+        use futures::FutureExt;
+        use vortex::{
+            array::arrays::ConstantArray,
+            dtype::Nullability,
+            layout::arrays::shared::{Shared, SharedArrayExt},
+            scalar::Scalar,
+        };
+        let session = VortexSession::default();
+        let mut exec = session.create_execution_ctx();
+        let source = Shared::new(
+            ConstantArray::new(Scalar::null(DType::Utf8(Nullability::Nullable)), 8192).into_array(),
+        );
+        let deferred =
+            crate::deferred_canonical::DeferredCanonical::wrap(source.clone().into_array())
+                .unwrap();
+        let budget = crate::merge_budget::shared().unwrap();
+        let held = budget.acquire(u64::MAX).await.unwrap();
+        let mut canonicalizer = crate::slice_canonical::SliceCanonicalizer::default();
+        let mut resolve = Box::pin(resolve_column(
+            &deferred,
+            &mut canonicalizer,
+            &mut exec,
+            budget,
+        ));
+        assert!(resolve.as_mut().now_or_never().is_none());
+        assert!(
+            source.current_array_ref().as_constant().is_some(),
+            "expanded before admission"
+        );
+        drop(held);
+        let (canonical, permit) = resolve.await.unwrap();
+        assert!(canonical.nbytes() >= 8192 * 16);
+        // Admission is still owned while the caller accounts for the result.
+        let mut exclusive = Box::pin(budget.acquire(u64::MAX));
+        assert!(exclusive.as_mut().now_or_never().is_none());
+        drop((canonical, permit));
+        drop(exclusive.await.unwrap());
+    }
+
+    #[test]
+    fn deferred_columns_preserve_eager_bytes_and_leaf_boundaries() {
+        use vortex::{
+            array::{
+                arrays::{ConstantArray, PrimitiveArray, VarBinViewArray},
+                validity::Validity,
+            },
+            compressor::BtrBlocksCompressorBuilder,
+            dtype::{FieldNames, Nullability},
+            encodings::sparse::Sparse,
+            file::VortexWriteOptions,
+            scalar::Scalar,
+        };
+        let runtime = SingleThreadRuntime::default();
+        use vortex::io::session::RuntimeSessionExt;
+        let session = VortexSession::default().with_handle(runtime.handle());
+        let mut exec = session.create_execution_ctx();
+        let null = Scalar::null(DType::Utf8(Nullability::Nullable));
+        let sparse = Sparse::try_new(
+            PrimitiveArray::from_iter([17u32, 8193]).into_array(),
+            VarBinViewArray::from_iter(
+                [Some("rare"), Some("longer than inline")],
+                null.dtype().clone(),
+            )
+            .into_array(),
+            16384,
+            null.clone(),
+            &mut exec,
+        )
+        .unwrap()
+        .into_array();
+        let fields = [
+            ConstantArray::new(null, 8192).into_array(),
+            ConstantArray::new(Scalar::utf8("present", Nullability::Nullable), 8192).into_array(),
+            sparse.slice(3..8195).unwrap(),
+        ];
+        let names = FieldNames::from(["null", "constant", "sparse"]);
+        let write = |deferred: bool| {
+            let compressor = BtrBlocksCompressorBuilder::from_session(&session)
+                .with_compact()
+                .build();
+            let strategy = ClusteredDocsStrategy::new(
+                move |chunk: &ArrayRef, ctx: &mut vortex::array::ExecutionCtx| {
+                    compressor.compress(chunk, ctx)
+                },
+            )
+            .with_budgets(64 * 1024, 16384, 512 * 1024)
+            .with_resident_budgets(256 * 1024, INFLIGHT_UNIT);
+            let mut exec = session.create_execution_ctx();
+            let chunks: Vec<_> = (0..5)
+                .map(|_| {
+                    let fields: Vec<_> = fields
+                        .iter()
+                        .map(|field| {
+                            if deferred {
+                                crate::deferred_canonical::DeferredCanonical::wrap(field.clone())
+                                    .unwrap()
+                            } else {
+                                field
+                                    .clone()
+                                    .execute::<Canonical>(&mut exec)
+                                    .unwrap()
+                                    .into_array()
+                            }
+                        })
+                        .collect();
+                    StructArray::try_new(names.clone(), fields, 8192, Validity::NonNullable)
+                        .unwrap()
+                        .into_array()
+                })
+                .collect();
+            let mut bytes = Vec::new();
+            let mut writer = VortexWriteOptions::new(session.clone())
+                .with_strategy(Arc::new(strategy))
+                .with_file_statistics(Vec::new())
+                .blocking(&runtime)
+                .writer(&mut bytes, chunks[0].dtype().clone());
+            for chunk in chunks {
+                writer.push(chunk).unwrap();
+            }
+            writer.finish().unwrap();
+            bytes
+        };
+        let eager = write(false);
+        let deferred = write(true);
+        assert_eq!(column_leaf_extents(&eager), column_leaf_extents(&deferred));
+        assert_eq!(eager, deferred, "lazy scan changed the written bytes");
+    }
 
     #[test]
     fn canonical_admission_accounts_for_expansion_and_validity() {
