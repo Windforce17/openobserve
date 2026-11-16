@@ -942,15 +942,16 @@ pub fn sort_record_batch_by_column(
         limit,
     )?;
 
-    // Apply indices to all columns
-    let sorted_columns: Result<Vec<_>, _> = batch
-        .columns()
-        .iter()
-        .map(|col| arrow::compute::take(col, &indices, None))
+    // Consume columns so each source is released after its take, rather
+    // than retaining the entire input alongside the growing sorted output.
+    let (schema, columns, _) = batch.into_parts();
+    let sorted_columns: Result<Vec<_>, _> = columns
+        .into_iter()
+        .map(|col| arrow::compute::take(&col, &indices, None))
         .collect();
 
     // Create new RecordBatch with sorted data
-    RecordBatch::try_new(batch.schema(), sorted_columns?).map_err(|e| e.into())
+    RecordBatch::try_new(schema, sorted_columns?).map_err(|e| e.into())
 }
 
 pub fn convert_json_to_record_batch(
@@ -1563,6 +1564,95 @@ mod test {
 | Bob     | 30  | London   |
 | Charlie | 35  | Paris    |
 +---------+-----+----------+"
+        );
+    }
+
+    #[test]
+    fn sort_releases_each_source_before_taking_the_next_column() {
+        use std::sync::{
+            Weak,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        use arrow::{
+            array::{Array, ArrayData},
+            buffer::NullBuffer,
+        };
+
+        // Delegating every Arrow operation keeps the underlying BooleanArray
+        // representation intact; only the downcast observes source ownership.
+        #[derive(Debug)]
+        struct ObserveTake {
+            values: BooleanArray,
+            previous: Weak<dyn Array>,
+            armed: Arc<AtomicBool>,
+        }
+
+        // SAFETY: All Arrow operations delegate to a valid BooleanArray,
+        // including as_any, which exposes that same underlying representation.
+        unsafe impl Array for ObserveTake {
+            fn as_any(&self) -> &dyn std::any::Any {
+                if self.armed.load(Ordering::Relaxed) {
+                    assert!(
+                        self.previous.upgrade().is_none(),
+                        "previous source column is still retained during take"
+                    );
+                }
+                self.values.as_any()
+            }
+            fn to_data(&self) -> ArrayData {
+                self.values.to_data()
+            }
+            fn into_data(self) -> ArrayData {
+                self.values.into_data()
+            }
+            fn data_type(&self) -> &DataType {
+                self.values.data_type()
+            }
+            fn slice(&self, offset: usize, length: usize) -> ArrayRef {
+                Arc::new(self.values.slice(offset, length))
+            }
+            fn len(&self) -> usize {
+                self.values.len()
+            }
+            fn is_empty(&self) -> bool {
+                self.values.is_empty()
+            }
+            fn offset(&self) -> usize {
+                self.values.offset()
+            }
+            fn nulls(&self) -> Option<&NullBuffer> {
+                self.values.nulls()
+            }
+            fn get_buffer_memory_size(&self) -> usize {
+                self.values.get_buffer_memory_size()
+            }
+            fn get_array_memory_size(&self) -> usize {
+                self.values.get_array_memory_size()
+            }
+        }
+
+        let first: ArrayRef = Arc::new(Int64Array::from(vec![3, 1, 2]));
+        let armed = Arc::new(AtomicBool::new(false));
+        let second: ArrayRef = Arc::new(ObserveTake {
+            values: BooleanArray::from(vec![Some(true), None, Some(false)]),
+            previous: Arc::downgrade(&first),
+            armed: Arc::clone(&armed),
+        });
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("key", DataType::Int64, false),
+            arrow_schema::Field::new("value", DataType::Boolean, true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![first, second]).unwrap();
+        armed.store(true, Ordering::Relaxed);
+        let sorted = sort_record_batch_by_column(batch, "key", false, None).unwrap();
+        assert_eq!(
+            sorted.column(0).to_data(),
+            Int64Array::from(vec![1, 2, 3]).to_data()
+        );
+        assert_eq!(
+            sorted.column(1).to_data(),
+            BooleanArray::from(vec![None, Some(false), Some(true)]).to_data()
         );
     }
 
