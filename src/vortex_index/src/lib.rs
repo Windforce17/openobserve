@@ -81,6 +81,7 @@ mod error;
 mod flat;
 mod merge;
 mod numeric;
+mod owned_constants;
 pub mod postings;
 mod query;
 mod reader;

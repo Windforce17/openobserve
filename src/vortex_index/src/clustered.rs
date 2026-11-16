@@ -536,6 +536,7 @@ fn spawn_chunk_write(
                     }
                 };
                 let out = compressor.compress_chunk(&chunk, &mut exec)?;
+                let out = crate::owned_constants::detach_constant_scalars(out)?;
                 Ok((out, decoded_raw.unwrap_or(0)))
             })
             .await?;
