@@ -80,6 +80,7 @@ mod docs_footer;
 mod error;
 mod flat;
 mod merge;
+mod merge_budget;
 mod numeric;
 mod owned_constants;
 pub mod postings;

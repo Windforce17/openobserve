@@ -37,6 +37,7 @@ pub mod search_admission;
 pub mod stats;
 pub mod text_tokenizer;
 pub mod utils;
+pub mod vix_merge_budget;
 
 pub use config::*;
 

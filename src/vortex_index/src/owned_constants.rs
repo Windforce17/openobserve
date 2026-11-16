@@ -129,6 +129,60 @@ mod tests {
         }
     }
 
+    fn wire_bytes(array: &ArrayRef, session: &VortexSession) -> Vec<u8> {
+        array
+            .serialize(
+                &vortex::array::ArrayContext::empty(),
+                session,
+                &vortex::array::serde::SerializeOptions::default(),
+            )
+            .unwrap()
+            .into_iter()
+            .flat_map(|buffer| buffer.as_ref().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn detached_compression_is_byte_identical() {
+        let session = VortexSession::default();
+        let mut ctx = session.create_execution_ctx();
+        let compressor = BtrBlocksCompressorBuilder::from_session(&session)
+            .with_compact()
+            .build();
+        for dtype in [
+            vortex::dtype::DType::Utf8(Nullability::Nullable),
+            vortex::dtype::DType::Binary(Nullability::Nullable),
+        ] {
+            for value in [
+                "",
+                "short",
+                "a long value exceeding the twelve-byte inline limit",
+            ] {
+                for stride in [1, 1000, usize::MAX] {
+                    let input = VarBinViewArray::from_iter(
+                        (0..4096).map(|row| (row % stride == 0).then_some(value)),
+                        dtype.clone(),
+                    )
+                    .into_array();
+                    let compressed = compressor.compress(&input, &mut ctx).unwrap();
+                    let before = wire_bytes(&compressed, &session);
+                    let detached = detach_constant_scalars(compressed).unwrap();
+                    assert_eq!(
+                        wire_bytes(&detached, &session),
+                        before,
+                        "{dtype:?} {value:?} stride={stride}"
+                    );
+                }
+            }
+            let null = ConstantArray::new(Scalar::null(dtype), 4096).into_array();
+            let before = wire_bytes(&null, &session);
+            assert_eq!(
+                wire_bytes(&detach_constant_scalars(null).unwrap(), &session),
+                before
+            );
+        }
+    }
+
     #[test]
     fn compressed_mostly_null_string_does_not_borrow_views() {
         let session = VortexSession::default();

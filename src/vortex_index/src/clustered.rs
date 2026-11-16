@@ -150,7 +150,7 @@ pub(crate) const COALESCE_TOTAL_BYTES: u64 = 512 << 20;
 pub(crate) const INFLIGHT_TOTAL_BYTES: u64 = 512 << 20;
 
 /// [`INFLIGHT_TOTAL_BYTES`] is accounted in permits of this many bytes.
-const INFLIGHT_UNIT: u64 = 64 * 1024;
+const INFLIGHT_UNIT: u64 = crate::merge_budget::UNIT;
 
 /// In-memory [`LayoutChildren`] over an owned child vec (vortex's own
 /// `OwnedLayoutChildren` is crate-private).
@@ -502,6 +502,7 @@ struct LeafWriter<'a> {
     field_dtypes: &'a [DType],
     inflight: Arc<Semaphore>,
     inflight_units: u64,
+    shared_inflight: &'static Arc<crate::merge_budget::MergeBudget>,
 }
 
 impl LeafWriter<'_> {
@@ -524,6 +525,9 @@ impl LeafWriter<'_> {
             .acquire_many_owned(units)
             .await
             .map_err(|_| vortex_err!("in-flight leaf budget closed"))?;
+        // Acquire writer-local before process-wide, consistently for every
+        // writer. Neither permit waits on ordered segment emission.
+        let permit = (permit, self.shared_inflight.acquire(bytes).await?);
         tasks.push(spawn_chunk_write(
             self.handle,
             self.session,
@@ -559,7 +563,7 @@ fn spawn_chunk_write(
     field_ptr: &mut SequencePointer,
     field_dtype: &DType,
     work: ChunkWork,
-    permit: OwnedSemaphorePermit,
+    permit: (OwnedSemaphorePermit, OwnedSemaphorePermit),
 ) -> vortex::io::runtime::Task<VortexResult<LayoutRef>> {
     let mut chunk_ptr = field_ptr.advance().descend();
     let sequence_id = chunk_ptr.advance();
@@ -660,6 +664,7 @@ impl LayoutStrategy for ClusteredDocsStrategy {
             field_dtypes: &field_dtypes,
             inflight: Arc::new(Semaphore::new(inflight_units as usize)),
             inflight_units,
+            shared_inflight: crate::merge_budget::shared()?,
         };
 
         // Open stripe: the first pushed chunk's sequence id is descended
@@ -881,6 +886,29 @@ mod tests {
         assert!(budget.clone().try_acquire_owned().is_err());
         drop(exclusive);
         assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[test]
+    fn admission_budget_does_not_change_output_bytes() {
+        let schema = fixture_schema();
+        let batches = fixture_batches(8, 1000);
+        let write = |inflight| {
+            let strategy: Arc<dyn LayoutStrategy> = Arc::new(
+                ClusteredDocsStrategy::new(
+                    |chunk: &ArrayRef,
+                     _ctx: &mut vortex::array::ExecutionCtx|
+                     -> VortexResult<ArrayRef> { Ok(chunk.clone()) },
+                )
+                .with_budgets(u64::MAX, 2000, u64::MAX)
+                .with_resident_budgets(COALESCE_TOTAL_BYTES, inflight),
+            );
+            crate::container::write_vortex_blob(&schema, &batches, strategy, 0).unwrap()
+        };
+        let normal = write(INFLIGHT_TOTAL_BYTES);
+        // Every leaf is oversized at one unit: this also verifies progress
+        // without holding permits while the sink waits for sequence order.
+        assert_eq!(normal, write(INFLIGHT_UNIT));
+        assert_roundtrip(&normal, &batches);
     }
 
     fn fixture_schema() -> Schema {

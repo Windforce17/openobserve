@@ -4766,6 +4766,8 @@ fn check_route_config(cfg: &Config) -> Result<(), anyhow::Error> {
 }
 
 fn check_common_config(cfg: &mut Config) -> Result<(), anyhow::Error> {
+    // Validate process-wide VIX admission before any role starts serving work.
+    crate::vix_merge_budget::from_env()?;
     if cfg.limit.file_push_interval == 0 {
         cfg.limit.file_push_interval = 60;
     }
