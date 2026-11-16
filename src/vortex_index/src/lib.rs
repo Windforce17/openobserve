@@ -74,6 +74,7 @@ mod clustered;
 mod container;
 mod conversion;
 mod cpu_executor;
+mod deferred_canonical;
 mod dict_blocks;
 mod docs;
 mod docs_footer;
@@ -90,6 +91,7 @@ mod reader_compact;
 mod repack;
 pub mod runtime_reclaim;
 pub mod sbbf;
+mod slice_canonical;
 mod source;
 mod spill;
 #[doc(hidden)]
