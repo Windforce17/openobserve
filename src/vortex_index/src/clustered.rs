@@ -74,7 +74,7 @@ use vortex::{
         arrays::{ChunkedArray, StructArray, struct_::StructArraySlotsExt},
     },
     dtype::DType,
-    error::{VortexExpect, VortexResult, vortex_bail, vortex_err},
+    error::{VortexResult, vortex_bail, vortex_err},
     io::{runtime::Handle, session::RuntimeSessionExt},
     layout::{
         LayoutChildren, LayoutRef, LayoutStrategy, LayoutWriterContext,
@@ -142,10 +142,11 @@ pub(crate) const COALESCE_MAX_ENCODED_BYTES: u64 = 16 * 1024;
 /// [`INFLIGHT_TOTAL_BYTES`], so the storm drains at the pool's pace.
 pub(crate) const COALESCE_TOTAL_BYTES: u64 = 512 << 20;
 
-/// Writer-wide cap on the RESIDENT bytes of closed runs still waiting for
-/// (or inside) their concat+compress on the CPU pool. Admission awaits
-/// here, so a close storm drains at the pool's pace instead of queueing
-/// every part at once; released when the CPU leaf returns.
+/// Writer-wide admission budget for estimated canonical bytes plus resident
+/// input bytes of closed runs waiting for (or inside) concat+compress. Released
+/// only after constant scalars have been detached from canonical allocations.
+/// This is not an RSS cap: compressor scratch, pending runs and ordered output
+/// are separate, and a single oversized work is allowed to proceed alone.
 pub(crate) const INFLIGHT_TOTAL_BYTES: u64 = 512 << 20;
 
 /// [`INFLIGHT_TOTAL_BYTES`] is accounted in permits of this many bytes.
@@ -256,6 +257,61 @@ enum ChunkWork {
     Concat(Vec<ArrayRef>, u64),
 }
 
+/// Row storage of a canonical array, before variable payload bytes. Saturating
+/// arithmetic makes an unrepresentable estimate request the whole budget rather
+/// than wrap to a tiny charge. Variable/nested payload is covered only by the
+/// resident input allowance; this is an estimate, not a decoder allocation cap.
+fn canonical_row_bytes(dtype: &DType, rows: u64) -> u64 {
+    let values = match dtype {
+        DType::Null => return 0,
+        DType::Bool(_) => rows.div_ceil(8),
+        DType::Primitive(ptype, _) => rows.saturating_mul(ptype.byte_width() as u64),
+        DType::Decimal(decimal, _) => {
+            rows.saturating_mul(decimal.canonical_values_type().byte_width() as u64)
+        }
+        DType::Utf8(_) | DType::Binary(_) => rows.saturating_mul(16),
+        DType::Struct(fields, _) => fields.fields().fold(0u64, |sum, field| {
+            sum.saturating_add(canonical_row_bytes(&field, rows))
+        }),
+        DType::FixedSizeList(element, size, _) => {
+            canonical_row_bytes(element, rows.saturating_mul(u64::from(*size)))
+        }
+        DType::Extension(ext) => return canonical_row_bytes(ext.storage_dtype(), rows),
+        // ListView offsets/sizes, union tags/offsets and variant views. The
+        // element count cannot in general be inferred from the outer row count.
+        DType::List(..) | DType::Map(..) | DType::Union(..) | DType::Variant(..) => {
+            rows.saturating_mul(16)
+        }
+    };
+    values.saturating_add(if dtype.is_nullable() {
+        rows.div_ceil(8)
+    } else {
+        0
+    })
+}
+
+impl ChunkWork {
+    fn admission_bytes(&self, dtype: &DType, resident: u64) -> u64 {
+        let rows = match self {
+            // Encoded passthrough leaves do not expand. Equal constants also
+            // stay constant, but a decoded constant may be canonicalized by a
+            // compressor, so it is conservatively charged by row count.
+            Self::Ready(chunk, _) if !is_decoded_root(chunk) => return resident,
+            Self::Ready(chunk, _) => chunk.len() as u64,
+            Self::Concat(parts, _) => parts
+                .iter()
+                .fold(0u64, |rows, part| rows.saturating_add(part.len() as u64)),
+        };
+        // Source parts coexist with the destination during concatenation. For
+        // strings this also allows for their payload, not only 16-byte views.
+        resident.saturating_add(canonical_row_bytes(dtype, rows))
+    }
+}
+
+fn admission_units(bytes: u64, capacity_units: u64) -> u32 {
+    bytes.div_ceil(INFLIGHT_UNIT).clamp(1, capacity_units) as u32
+}
+
 /// Per-column open coalescing run. Each pending entry carries its AS-PUSHED
 /// nbytes and decoded-ness snapshot — the resident array may since have been
 /// compacted, and the [`OutputRatio`] observation must keep seeing the exact
@@ -275,8 +331,8 @@ struct ColumnState {
 }
 
 impl ColumnState {
-    /// Close the run: the work plus its RESIDENT bytes (the in-flight
-    /// admission charge).
+    /// Close the run: the work plus its resident input bytes. Admission adds
+    /// the canonical expansion estimate without changing run boundaries.
     fn take_pending(&mut self) -> Option<(ChunkWork, u64)> {
         self.pending_rows = 0;
         self.pending_bytes = 0;
@@ -449,7 +505,7 @@ struct LeafWriter<'a> {
 }
 
 impl LeafWriter<'_> {
-    /// Admit `resident` bytes against the in-flight budget (awaiting CPU
+    /// Admit resident inputs plus estimated canonical storage (awaiting CPU
     /// leaves to return when it is spent; one work is never charged more
     /// than the whole budget, so an oversized chunk still proceeds alone),
     /// then spawn the leaf write in row order behind the column's earlier
@@ -462,11 +518,10 @@ impl LeafWriter<'_> {
         work: ChunkWork,
         resident: u64,
     ) -> VortexResult<()> {
-        let units = resident
-            .div_ceil(INFLIGHT_UNIT)
-            .clamp(1, self.inflight_units);
+        let bytes = work.admission_bytes(&self.field_dtypes[index], resident);
+        let units = admission_units(bytes, self.inflight_units);
         let permit = Arc::clone(&self.inflight)
-            .acquire_many_owned(u32::try_from(units).vortex_expect("in-flight units fit u32"))
+            .acquire_many_owned(units)
             .await
             .map_err(|_| vortex_err!("in-flight leaf budget closed"))?;
         tasks.push(spawn_chunk_write(
@@ -489,7 +544,9 @@ impl LeafWriter<'_> {
 /// Concatenate/compress one chunk on the CPU pool, then write it as one
 /// flat leaf under the pre-minted stripe-ordered sequence id. `permit` is
 /// the work's in-flight admission; it rides into the CPU leaf and drops
-/// with the parts once the compressed chunk exists.
+/// with the parts only after compressed constant scalars own their storage.
+/// Do not hold it across the ordered sink: the producer must be able to submit
+/// earlier columns and release their sequence branches to unblock that sink.
 #[allow(clippy::too_many_arguments)]
 fn spawn_chunk_write(
     handle: &Handle,
@@ -537,6 +594,8 @@ fn spawn_chunk_write(
                 };
                 let out = compressor.compress_chunk(&chunk, &mut exec)?;
                 let out = crate::owned_constants::detach_constant_scalars(out)?;
+                drop(chunk);
+                drop(exec);
                 Ok((out, decoded_raw.unwrap_or(0)))
             })
             .await?;
@@ -588,7 +647,8 @@ impl LayoutStrategy for ClusteredDocsStrategy {
         let mut column_rows: Vec<u64> = vec![0; nfields];
         let mut columns: Vec<ColumnState> = (0..nfields).map(|_| ColumnState::default()).collect();
         let mut total_rows: u64 = 0;
-        let inflight_units = (self.inflight_total_bytes / INFLIGHT_UNIT).max(1);
+        let inflight_units =
+            (self.inflight_total_bytes / INFLIGHT_UNIT).clamp(1, u64::from(u32::MAX));
         let leaf = LeafWriter {
             handle: &handle,
             session,
@@ -768,6 +828,60 @@ mod tests {
 
     use super::*;
     use crate::container::{BlobHandle, RowSelection, scan_blob};
+
+    #[test]
+    fn canonical_admission_accounts_for_expansion_and_validity() {
+        use vortex::{
+            array::arrays::ConstantArray,
+            dtype::{Nullability, PType},
+            scalar::Scalar,
+        };
+        let nullable = Nullability::Nullable;
+        assert_eq!(
+            canonical_row_bytes(&DType::Utf8(nullable), 128 * 1024),
+            2 * 1024 * 1024 + 16 * 1024
+        );
+        assert_eq!(canonical_row_bytes(&DType::Binary(nullable), 9), 146);
+        assert_eq!(
+            canonical_row_bytes(&DType::Primitive(PType::I64, nullable), 9),
+            74
+        );
+        assert_eq!(canonical_row_bytes(&DType::Bool(nullable), 9), 4);
+        assert_eq!(canonical_row_bytes(&DType::Null, 1000), 0);
+        assert_eq!(
+            canonical_row_bytes(&DType::Utf8(nullable), u64::MAX),
+            u64::MAX
+        );
+        let dtype = DType::Utf8(nullable);
+        let part = ConstantArray::new(Scalar::null(dtype.clone()), 64 * 1024).into_array();
+        let work = ChunkWork::Concat(vec![part.clone(), part], 0);
+        assert_eq!(
+            work.admission_bytes(&dtype, 32),
+            2 * 1024 * 1024 + 16 * 1024 + 32
+        );
+        assert_eq!(admission_units(0, 8), 1);
+        assert_eq!(admission_units(INFLIGHT_UNIT + 1, 8), 2);
+        assert_eq!(admission_units(u64::MAX, 8), 8);
+    }
+
+    #[tokio::test]
+    async fn oversized_admission_waits_and_then_runs_alone() {
+        use futures::FutureExt;
+        let budget = Arc::new(Semaphore::new(8));
+        let first = budget.clone().acquire_owned().await.unwrap();
+        let mut oversized = Box::pin(
+            budget
+                .clone()
+                .acquire_many_owned(admission_units(u64::MAX, 8)),
+        );
+        assert!(oversized.as_mut().now_or_never().is_none());
+        drop(first);
+        let exclusive = oversized.await.unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        assert!(budget.clone().try_acquire_owned().is_err());
+        drop(exclusive);
+        assert_eq!(budget.available_permits(), 8);
+    }
 
     fn fixture_schema() -> Schema {
         Schema::new(vec![
